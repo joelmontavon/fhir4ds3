@@ -1,0 +1,176 @@
+[
+  {
+    "name": "Patient.birthDate",
+    "expression": "Patient.birthDate",
+    "resource_type": "Patient",
+    "expected_row_count": 100,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "1971-02-02",
+      "1972-03-03",
+      "1973-04-04"
+    ]
+  },
+  {
+    "name": "Patient.gender",
+    "expression": "Patient.gender",
+    "resource_type": "Patient",
+    "expected_row_count": 100,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "female",
+      "other",
+      "unknown"
+    ]
+  },
+  {
+    "name": "Patient.active",
+    "expression": "Patient.active",
+    "resource_type": "Patient",
+    "expected_row_count": 100,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "true",
+      "false"
+    ]
+  },
+  {
+    "name": "Patient.name",
+    "expression": "Patient.name",
+    "resource_type": "Patient",
+    "expected_row_count": 200,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      {
+        "use": "nickname",
+        "family": "NickFamily1",
+        "given": [
+          "Nick1"
+        ]
+      },
+      {
+        "use": "official",
+        "family": "Family1",
+        "given": [
+          "Given1",
+          "Alias1"
+        ]
+      },
+      {
+        "use": "nickname",
+        "family": "NickFamily2",
+        "given": [
+          "Nick2"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Patient.name.given",
+    "expression": "Patient.name.given",
+    "resource_type": "Patient",
+    "expected_row_count": 300,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "Alias1",
+      "Given1",
+      "Nick1"
+    ]
+  },
+  {
+    "name": "Patient.name.family",
+    "expression": "Patient.name.family",
+    "resource_type": "Patient",
+    "expected_row_count": 200,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "Family1",
+      "NickFamily1",
+      "Family2"
+    ]
+  },
+  {
+    "name": "Patient.telecom",
+    "expression": "Patient.telecom",
+    "resource_type": "Patient",
+    "expected_row_count": 200,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      {
+        "system": "email",
+        "value": "patient1@example.com"
+      },
+      {
+        "system": "phone",
+        "value": "555-0101"
+      },
+      {
+        "system": "email",
+        "value": "patient2@example.com"
+      }
+    ]
+  },
+  {
+    "name": "Patient.identifier",
+    "expression": "Patient.identifier",
+    "resource_type": "Patient",
+    "expected_row_count": 200,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      {
+        "system": "http://hospital.org/mrn",
+        "value": "MRN0001"
+      },
+      {
+        "system": "http://insurance.org/mid",
+        "value": "MID0001"
+      },
+      {
+        "system": "http://hospital.org/mrn",
+        "value": "MRN0002"
+      }
+    ]
+  },
+  {
+    "name": "Patient.address",
+    "expression": "Patient.address",
+    "resource_type": "Patient",
+    "expected_row_count": 100,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      {
+        "line": [
+          "101 Main St",
+          "Suite 1"
+        ],
+        "city": "City1"
+      },
+      {
+        "line": [
+          "102 Main St",
+          "Suite 2"
+        ],
+        "city": "City2"
+      },
+      {
+        "line": [
+          "103 Main St",
+          "Suite 3"
+        ],
+        "city": "City3"
+      }
+    ]
+  },
+  {
+    "name": "Patient.address.line",
+    "expression": "Patient.address.line",
+    "resource_type": "Patient",
+    "expected_row_count": 200,
+    "expected_unique_ids": 100,
+    "expected_sample_values": [
+      "101 Main St",
+      "Suite 1",
+      "102 Main St"
+    ]
+  }
+]

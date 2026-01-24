@@ -1,0 +1,146 @@
+{
+  "total_tests": 934,
+  "passed_tests": 395,
+  "failed_tests": 539,
+  "compliance_percentage": 42.29122055674518,
+  "execution_time_total_ms": 295810.5263710022,
+  "execution_time_average_ms": 316.689929563943,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2025-11-06T21:42:35.118520",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 13,
+      "failed": 19
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 10,
+      "failed": 62
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 8,
+      "failed": 2
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 1,
+      "failed": 4
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 30,
+      "failed": 86
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 32,
+      "failed": 109
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 36,
+      "failed": 77
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 195,
+      "failed": 143
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 2,
+      "failed": 4
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 41,
+      "failed": 24
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 20,
+      "failed": 8
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.021219253540039062,
+    "max_execution_time_ms": 848.9627838134766,
+    "median_execution_time_ms": 397.8116512298584,
+    "std_dev_execution_time_ms": 171.1108054703719
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testComment7",
+      "expression": "2 + 2 /",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 351.0551452636719
+    },
+    {
+      "name": "testComment8",
+      "expression": "2 + 2 /* not finished",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 0.021219253540039062
+    },
+    {
+      "name": "testPolymorphismA",
+      "expression": "Observation.value.unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 399.7166156768799
+    },
+    {
+      "name": "testPolymorphismIsA1",
+      "expression": "Observation.value.is(Quantity)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 361.84191703796387
+    },
+    {
+      "name": "testPolymorphismIsA2",
+      "expression": "Observation.value is Quantity",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 362.9801273345947
+    },
+    {
+      "name": "testPolymorphismIsA3",
+      "expression": "Observation.issued is instant",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 389.51635360717773
+    },
+    {
+      "name": "testPolymorphismAsA",
+      "expression": "Observation.value.as(Quantity).unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 379.05025482177734
+    },
+    {
+      "name": "testPolymorphismAsAFunction",
+      "expression": "(Observation.value as Quantity).unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 371.6316223144531
+    },
+    {
+      "name": "testPolymorphismAsBFunction",
+      "expression": "Observation.value.as(Period).start",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 357.7384948730469
+    },
+    {
+      "name": "testDollarThis2",
+      "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 401.8421173095703
+    }
+  ]
+}

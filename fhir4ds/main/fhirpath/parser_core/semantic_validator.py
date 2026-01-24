@@ -1,0 +1,658 @@
+"""
+Semantic validation utilities for FHIRPath expressions.
+
+Provides lightweight semantic checks ahead of full evaluator integration to
+prevent invalid expressions from being treated as successful parses. The
+validator focuses on the scenarios uncovered in Sprint 008 investigations:
+
+- Prevent direct access to choice-type aliases like ``valueQuantity``
+- Detect invalid identifier suffixes such as ``given1``
+- Enforce context resource consistency (e.g., Encounter expressions on Patient data)
+- Guard against invalid property access following ``as(Period)``
+"""
+
+from __future__ import annotations
+
+import difflib
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from ..exceptions import FHIRPathParseError
+from ..types import FHIRTypeSystem, get_type_registry
+from .ast_extensions import EnhancedASTNode
+
+_ESCAPED_SEGMENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+_ABSOLUTE_ROOT_SEGMENT = r"(?:`[^`]+`|[A-Z][A-Za-z0-9_]*)"
+_RELATIVE_ROOT_SEGMENT = r"(?:`[^`]+`|[a-z_][A-Za-z0-9_]*)"
+_ABSOLUTE_PATH_REGEX = re.compile(rf"\b({_ABSOLUTE_ROOT_SEGMENT}(?:\.{_ESCAPED_SEGMENT})+)")
+_RELATIVE_PATH_REGEX = re.compile(rf"\b({_RELATIVE_ROOT_SEGMENT}(?:\.{_ESCAPED_SEGMENT})+)")
+
+# Standard FHIRPath built-in functions
+# This list is maintained separately from the SQL translator to support semantic validation
+_FHIRPATH_BUILTIN_FUNCTIONS = {
+    # Collection operations
+    'where', 'select', 'all', 'any', 'exists', 'empty', 'count', 'distinct',
+    'combine', 'first', 'last', 'tail', 'skip', 'take', 'single', 'iif',
+    # Type conversion functions
+    'convertsToBoolean', 'toBoolean', 'convertsToInteger', 'toInteger',
+    'convertsToDecimal', 'toDecimal', 'convertsToString', 'toString',
+    'convertsToQuantity', 'toQuantity', 'convertsToDateTime', 'toDateTime',
+    'convertsToTime', 'toTime',
+    # String functions
+    'startsWith', 'endsWith', 'contains', 'substring', 'length', 'upper',
+    'lower', 'matches', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',
+    'toChars',
+    # Math functions
+    'abs', 'ceiling', 'floor', 'round', 'sqrt', 'ln', 'log', 'power',
+    # Type functions
+    'is', 'as', 'ofType', 'conformsTo',
+    # Date/time functions
+    'now', 'today',
+    # Additional functions not in base FunctionLibrary
+    'exclude', 'isDistinct', 'intersect', 'repeat', 'aggregate',
+    'extension', 'allTrue', 'anyTrue', 'allFalse', 'anyFalse',
+    'sum', 'average', 'subsetOf', 'supersetOf',
+}
+
+
+@dataclass
+class SemanticValidator:
+    """
+    Lightweight semantic validator for parsed FHIRPath expressions.
+
+    The validator focuses on high-impact failure modes identified during
+    SP-008 investigations. It is *not* a full StructureDefinition driven
+    validator yet, but it blocks the incorrect success paths that masked
+    compliance failures in the official test suite.
+    """
+
+    _choice_type_suffixes: Sequence[str] = field(default_factory=list)
+    _period_properties: Set[str] = field(default_factory=lambda: {"start", "end"})
+
+    _alias_pattern_template: str = ".value{suffix}"
+    _identifier_with_digit_rgx: re.Pattern[str] = field(
+        default_factory=lambda: re.compile(r"\.([A-Za-z_]+[0-9]+)(?=[^A-Za-z0-9_]|$)")
+    )
+    _period_function_rgx: re.Pattern[str] = field(
+        default_factory=lambda: re.compile(r"\.as\(Period\)\.([A-Za-z_][A-Za-z0-9_]*)")
+    )
+    _period_cast_rgx: re.Pattern[str] = field(
+        default_factory=lambda: re.compile(r"asPeriod\)\.([A-Za-z_][A-Za-z0-9_]*)")
+    )
+    _absolute_path_rgx: re.Pattern[str] = field(default=_ABSOLUTE_PATH_REGEX, init=False, repr=False)
+    _relative_path_rgx: re.Pattern[str] = field(default=_RELATIVE_PATH_REGEX, init=False, repr=False)
+    _special_operation_names: Set[str] = field(
+        default_factory=lambda: {"as", "is", "oftype", "not"}
+    )
+
+    _type_registry: "TypeRegistry" = field(init=False)
+    _valid_functions: Set[str] = field(default_factory=set)
+    _valid_functions_lower: Dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Warm up choice-type suffix list from the global type registry."""
+        self._type_registry = get_type_registry()
+
+        if not self._choice_type_suffixes:
+            # Choice-type aliases follow the FHIR [x] naming convention where
+            # the suffix is a FHIR data type with an initial uppercase letter.
+            self._choice_type_suffixes = tuple(
+                name for name in self._type_registry.get_all_type_names()
+                if name and name[0].isupper()
+            )
+
+        if not self._valid_functions:
+            # Use static function list instead of importing from evaluator
+            self._valid_functions = set(_FHIRPATH_BUILTIN_FUNCTIONS)
+            # Normalise for case-insensitive lookups while preserving canonical casing
+            self._valid_functions_lower = {
+                func.lower(): func for func in self._valid_functions
+            }
+            self._special_operation_names = {name.lower() for name in self._special_operation_names}
+
+    def validate(
+        self,
+        raw_expression: str,
+        parsed_expression: Optional["FHIRPathExpressionWrapper"] = None,
+        context: Optional[Dict[str, object]] = None,
+    ) -> None:
+        """
+        Execute semantic validation rules.
+
+        Args:
+            raw_expression: Original FHIRPath expression text.
+            parsed_expression: Optional parsed expression wrapper (provides AST access).
+            context: Optional evaluation context metadata (expects ``resourceType``).
+
+        Raises:
+            FHIRPathParseError: When a semantic rule is violated.
+        """
+        collapsed = re.sub(r"\s+", "", raw_expression or "")
+
+        self._validate_context_root(raw_expression, context)
+        self._validate_choice_aliases(collapsed)
+        self._validate_identifier_suffixes(raw_expression)
+        self._validate_period_property_access(collapsed)
+
+        masked_expression = self._mask_expression(raw_expression or "")
+        masked_with_backticks = self._mask_expression(raw_expression or "", preserve_backticks=True)
+        snippet_state: Dict[str, int] = {}
+
+        if parsed_expression is not None and parsed_expression.ast is not None:
+            self._validate_function_definitions(
+                raw_expression,
+                parsed_expression,
+                masked_expression,
+                snippet_state
+            )
+            self._validate_numeric_operations(
+                parsed_expression.ast,
+                raw_expression,
+                masked_expression,
+                snippet_state
+            )
+            self._validate_element_access(
+                raw_expression,
+                parsed_expression,
+                context,
+                masked_expression,
+                masked_with_backticks,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Individual rule implementations
+    # ------------------------------------------------------------------ #
+
+    def _validate_context_root(
+        self, expression: str, context: Optional[Dict[str, object]]
+    ) -> None:
+        """Ensure that absolute expressions match the provided resource context."""
+        if not context:
+            return
+
+        resource_type = context.get("resourceType")
+        if not isinstance(resource_type, str) or not resource_type:
+            return
+
+        root_identifier = self._extract_root_identifier(expression)
+        if not root_identifier or not root_identifier[0].isupper():
+            # Relative or function-based paths are evaluated relative to context
+            return
+
+        if root_identifier != resource_type:
+            raise FHIRPathParseError(
+                f"Expression root '{root_identifier}' is invalid for resource type "
+                f"'{resource_type}'."
+            )
+
+    def _validate_choice_aliases(self, collapsed_expression: str) -> None:
+        """Disallow direct access to [x] choice aliases such as valueQuantity."""
+        for suffix in self._choice_type_suffixes:
+            alias = self._alias_pattern_template.format(suffix=suffix)
+            if alias in collapsed_expression:
+                raise FHIRPathParseError(
+                    f"Direct access to choice-type alias '{alias.lstrip('.')}' is not "
+                    "supported. Use type functions like value.as(Quantity) instead."
+                )
+
+    def _validate_identifier_suffixes(self, expression: str) -> None:
+        """Detect identifiers that end with digits (e.g., given1)."""
+        for match in self._identifier_with_digit_rgx.finditer(expression):
+            identifier = match.group(1)
+            raise FHIRPathParseError(
+                f"Invalid element name '{identifier}'. FHIR element names do not end with digits."
+            )
+
+    def _validate_period_property_access(self, collapsed_expression: str) -> None:
+        """
+        Ensure that Period casts only access supported properties (start, end).
+        """
+        for regex in (self._period_function_rgx, self._period_cast_rgx):
+            for match in regex.finditer(collapsed_expression):
+                property_name = match.group(1)
+                if property_name not in self._period_properties:
+                    raise FHIRPathParseError(
+                        f"Property '{property_name}' is invalid for Period. "
+                        "Allowed properties are: start, end."
+                    )
+
+    @staticmethod
+    def _extract_root_identifier(expression: str) -> Optional[str]:
+        """Extract the leading identifier before the first path separator."""
+        if not expression:
+            return None
+
+        trimmed = expression.lstrip()
+        # Remove balanced leading parentheses to reach the underlying identifier.
+        while trimmed.startswith("("):
+            trimmed = trimmed[1:].lstrip()
+
+        match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", trimmed)
+        return match.group(1) if match else None
+
+    # ------------------------------------------------------------------ #
+    # Internal helper utilities
+    # ------------------------------------------------------------------ #
+
+    def _mask_expression(self, expression: str, *, preserve_backticks: bool = False) -> str:
+        """Replace strings and comments with spaces to simplify substring searches."""
+        if not expression:
+            return ""
+
+        chars = list(expression)
+        length = len(chars)
+        index = 0
+        in_single_quote = False
+        in_double_quote = False
+        in_backtick = False
+        block_depth = 0
+
+        while index < length:
+            current = expression[index]
+            next_char = expression[index + 1] if index + 1 < length else ""
+
+            if block_depth > 0:
+                chars[index] = " "
+                if current == "/" and next_char == "*":
+                    chars[index + 1] = " "
+                    block_depth += 1
+                    index += 2
+                    continue
+                if current == "*" and next_char == "/":
+                    chars[index + 1] = " "
+                    block_depth -= 1
+                    index += 2
+                    continue
+                index += 1
+                continue
+
+            if in_single_quote:
+                chars[index] = " "
+                if current == "\\" and index + 1 < length:
+                    chars[index + 1] = " "
+                    index += 2
+                    continue
+                if current == "'":
+                    in_single_quote = False
+                index += 1
+                continue
+
+            if in_double_quote:
+                chars[index] = " "
+                if current == "\\" and index + 1 < length:
+                    chars[index + 1] = " "
+                    index += 2
+                    continue
+                if current == '"':
+                    in_double_quote = False
+                index += 1
+                continue
+
+            if in_backtick:
+                if not preserve_backticks:
+                    chars[index] = " "
+                if current == "\\" and index + 1 < length:
+                    if not preserve_backticks:
+                        chars[index + 1] = " "
+                    index += 2
+                    continue
+                if current == "`":
+                    in_backtick = False
+                index += 1
+                continue
+
+            if current == "'":
+                chars[index] = " "
+                in_single_quote = True
+                index += 1
+                continue
+
+            if current == '"':
+                chars[index] = " "
+                in_double_quote = True
+                index += 1
+                continue
+
+            if current == "`":
+                if not preserve_backticks:
+                    chars[index] = " "
+                in_backtick = True
+                index += 1
+                continue
+
+            if current == "/" and next_char == "/":
+                chars[index] = chars[index + 1] = " "
+                index += 2
+                while index < length:
+                    next_current = expression[index]
+                    if next_current in ("\n", "\r"):
+                        break
+                    chars[index] = " "
+                    index += 1
+                continue
+
+            if current == "/" and next_char == "*":
+                chars[index] = chars[index + 1] = " "
+                block_depth = 1
+                index += 2
+                continue
+
+            index += 1
+
+        return "".join(chars)
+
+    @staticmethod
+    def _compute_position(expression: str, index: int) -> Tuple[int, int]:
+        """Compute 1-based line and column numbers for a character index."""
+        if index <= 0:
+            return 1, 1
+
+        line = 1
+        column = 1
+        cursor = 0
+        length = min(index, len(expression))
+
+        while cursor < length:
+            char = expression[cursor]
+
+            if char == "\r":
+                if cursor + 1 < len(expression) and expression[cursor + 1] == "\n":
+                    cursor += 1
+                line += 1
+                column = 1
+            elif char == "\n":
+                line += 1
+                column = 1
+            else:
+                column += 1
+
+            cursor += 1
+
+        return line, column
+
+    @staticmethod
+    def _iterate_nodes(root: EnhancedASTNode) -> List[EnhancedASTNode]:
+        """Depth-first traversal yielding all nodes."""
+        nodes: List[EnhancedASTNode] = []
+        stack = [root]
+
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            stack.extend(reversed(node.children))
+
+        return nodes
+
+    def _infer_literal_type(self, node: EnhancedASTNode) -> Optional[str]:
+        """Infer the literal type (string, number, boolean) if node contains a literal."""
+        literal_node = self._find_literal_node(node)
+        if literal_node is None:
+            return None
+
+        token = literal_node.text.strip()
+        if not token:
+            return None
+
+        if token[0] in {"'", '"'} and token[-1] == token[0]:
+            return "string"
+
+        if re.fullmatch(r"-?\d+(\.\d+)?", token):
+            return "number"
+
+        if token.lower() in {"true", "false"}:
+            return "boolean"
+
+        if token.startswith("@"):
+            return "temporal"
+
+        return "unknown"
+
+    def _find_literal_node(self, node: EnhancedASTNode) -> Optional[EnhancedASTNode]:
+        """Find the first descendant literal node."""
+        if node.node_type == "literal":
+            return node
+
+        for child in node.children:
+            result = self._find_literal_node(child)
+            if result is not None:
+                return result
+
+        return None
+
+    def _is_known_function(self, name: str) -> bool:
+        """Check whether a function or operation name is recognised."""
+        if not name:
+            return False
+
+        lowered = name.lower()
+        return (
+            lowered in self._valid_functions_lower
+            or lowered in self._special_operation_names
+        )
+
+    def _suggest_function(self, name: str) -> Optional[str]:
+        """Return the closest known function name for suggestion purposes."""
+        possibilities = list(self._valid_functions) + [
+            op for op in {"as", "is", "ofType"}
+        ]
+        matches = difflib.get_close_matches(name, possibilities, n=1, cutoff=0.6)
+        return matches[0] if matches else None
+
+    def _next_snippet_index(
+        self,
+        masked_expression: str,
+        snippet: str,
+        state: Dict[str, int]
+    ) -> Optional[int]:
+        """Locate the next occurrence of snippet outside strings/comments."""
+        if not snippet:
+            return None
+
+        start = state.get(snippet, 0)
+        index = masked_expression.find(snippet, start)
+
+        if index == -1:
+            index = masked_expression.find(snippet)
+            if index == -1:
+                return None
+
+        state[snippet] = index + len(snippet)
+        return index
+
+    # ------------------------------------------------------------------ #
+    # Enhanced validation routines
+    # ------------------------------------------------------------------ #
+
+    def _validate_function_definitions(
+        self,
+        expression: str,
+        parsed_expression: "FHIRPathExpressionWrapper",
+        masked_expression: str,
+        snippet_state: Dict[str, int]
+    ) -> None:
+        """Ensure all function invocations reference known functions."""
+        for function_call in parsed_expression.functions:
+            name = function_call.split("(", 1)[0].strip()
+            if not name or self._is_known_function(name):
+                continue
+
+            snippet = f"{name}("
+            index = self._next_snippet_index(masked_expression, snippet, snippet_state)
+            if index is None:
+                index = expression.find(name)
+
+            line, column = self._compute_position(expression, index)
+            suggestion = self._suggest_function(name)
+
+            message = (
+                f"Unknown function '{name}' at line {line}, column {column}."
+            )
+            if suggestion:
+                message += f" Did you mean '{suggestion}'?"
+            else:
+                message += " Refer to the FHIRPath specification for supported functions."
+
+            raise FHIRPathParseError(message)
+
+    def _validate_numeric_operations(
+        self,
+        ast: EnhancedASTNode,
+        expression: str,
+        masked_expression: str,
+        snippet_state: Dict[str, int]
+    ) -> None:
+        """Detect clearly invalid literal arithmetic operations."""
+        for node in self._iterate_nodes(ast):
+            if node.node_type not in {"AdditiveExpression", "MultiplicativeExpression"}:
+                continue
+
+            operator = node.text.strip()
+            if operator not in {"+", "-", "*", "/"}:
+                continue
+
+            if len(node.children) < 2:
+                continue
+
+            left_type = self._infer_literal_type(node.children[0])
+            right_type = self._infer_literal_type(node.children[1])
+
+            # Restrict to literal-literal checks to avoid false positives on dynamic paths
+            if left_type is None or right_type is None:
+                continue
+
+            if "string" not in {left_type, right_type}:
+                continue
+
+            index = self._next_snippet_index(masked_expression, operator, snippet_state)
+            if index is None:
+                index = expression.find(operator)
+
+            line, column = self._compute_position(expression, index)
+            raise FHIRPathParseError(
+                f"Operator '{operator}' does not support string literals at line {line}, column {column}. "
+                "Use '&' for string concatenation or cast values to numbers."
+            )
+
+    def _validate_element_access(
+        self,
+        expression: str,
+        parsed_expression: "FHIRPathExpressionWrapper",
+        context: Optional[Dict[str, object]],
+        masked_expression: str,
+        masked_with_backticks: str,
+    ) -> None:
+        """Validate element navigation against the type registry."""
+        # Absolute paths (Patient.name.given)
+        for match in self._absolute_path_rgx.finditer(masked_with_backticks):
+            path = match.group(1)
+            self._validate_path_segments(
+                expression,
+                path,
+                match.start(1),
+                root_override=None
+            )
+
+        # Relative paths when a resource type context is supplied
+        resource_type = None
+        if context and isinstance(context.get("resourceType"), str):
+            resource_type = context["resourceType"]
+
+        if resource_type:
+            for match in self._relative_path_rgx.finditer(masked_with_backticks):
+                path = match.group(1)
+                # Avoid re-validating absolute paths that start with uppercase identifiers
+                if path and path[0].isupper():
+                    continue
+                self._validate_path_segments(
+                    expression,
+                    path,
+                    match.start(1),
+                    root_override=resource_type
+                )
+
+    def _validate_path_segments(
+        self,
+        expression: str,
+        path: str,
+        path_start_index: int,
+        root_override: Optional[str]
+    ) -> None:
+        """Validate a dot-delimited path sequence against the type registry."""
+        if not path:
+            return
+
+        segments = path.split(".")
+        if not segments:
+            return
+
+        registry = self._type_registry
+
+        if root_override:
+            current_type = registry.get_canonical_name(root_override)
+            segment_range = range(0, len(segments))
+        else:
+            root_type = segments[0]
+            if not registry.is_registered_type(root_type):
+                return
+            current_type = registry.get_canonical_name(root_type)
+            segment_range = range(1, len(segments))
+
+        for idx in segment_range:
+            raw_segment = segments[idx]
+            if self._is_known_function(raw_segment):
+                break
+
+            segment = raw_segment.strip("`")
+            if not segment:
+                continue
+
+            element_type = registry.get_element_type(current_type, segment)
+            if element_type is None:
+                if current_type in {"BackboneElement", "Element"}:
+                    # BackboneElement slots are often expanded dynamically (e.g., value[x])
+                    return
+                available_elements = registry.get_element_names(current_type)
+                choice_candidate = f"{segment}[x]"
+                if choice_candidate in available_elements:
+                    # Choice-type placeholder (e.g., value → value[x]); type will be refined by casts.
+                    continue
+
+                offset = sum(len(segments[i]) for i in range(idx)) + idx
+                if not root_override:
+                    # Account for the root segment and dot when computing offsets
+                    offset += len(segments[0]) + 1
+                segment_index = path_start_index + offset
+                line, column = self._compute_position(expression, segment_index)
+
+                suggestions = available_elements
+                hint = ""
+                if suggestions:
+                    close_matches = difflib.get_close_matches(segment, suggestions, n=3, cutoff=0.5)
+                    if close_matches:
+                        hint = f" Did you mean: {', '.join(close_matches)}?"
+
+                raise FHIRPathParseError(
+                    f"Unknown element '{segment}' on type '{current_type}' at line {line}, column {column}.{hint}"
+                )
+
+            current_type = registry.get_canonical_name(element_type)
+
+
+class FHIRPathExpressionWrapper:
+    """
+    Minimal wrapper interface for semantic validation compatibility.
+
+    Allows the validator to access AST information without importing the
+    heavier `FHIRPathExpression` implementation (avoids circular imports).
+    """
+
+    def __init__(
+        self,
+        ast: Optional[EnhancedASTNode],
+        functions: Optional[List[str]] = None,
+        path_components: Optional[List[str]] = None
+    ):
+        self.ast = ast
+        self.functions = functions or []
+        self.path_components = path_components or []
