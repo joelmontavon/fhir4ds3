@@ -6,7 +6,7 @@
 **Situation**: Full automated sprint workflow from gap analysis to completion
 **Usage**: Include sprint name and focus area (e.g., "autopilot sprint SP-026 architectural gaps")
 
-Fully automated sprint workflow that identifies architectural gaps or bugs, prioritizes work, creates sprint plan and tasks, executes work in parallel using ultrapilot, reviews/approves, and closes out the sprint with proper git workflow.
+Fully automated ultra fast sprint workflow that identifies architectural gaps or bugs, prioritizes work, creates sprint plan and tasks, executes work in parallel using ultrapilot, reviews/approves, and closes out the sprint with proper git workflow.
 
 ## Overview
 
