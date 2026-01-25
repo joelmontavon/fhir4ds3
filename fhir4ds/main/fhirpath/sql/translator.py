@@ -705,9 +705,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # SP-022-015: Check for pending fragment result FIRST from invocation chain
             # This handles expressions like (1|2|3).aggregate() where the union result
             # is a complete expression that should take priority over pending_literal_value.
-            # The pending_fragment_result contains the full SQL for the target expression.
+            # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
             if self.context.pending_fragment_result is not None:
-                target_expression = self.context.pending_fragment_result
+                target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
+                # If the pending fragment is from a multi-item collection, this is an error for iif()
+                # We need to pass this information to the caller
+                # Store this in a temporary attribute for _translate_iif to check
+                self._pending_target_is_multi_item = is_multi_item_collection
                 # Clear both pending values after consuming (fragment result takes priority)
                 self.context.pending_fragment_result = None
                 self.context.pending_literal_value = None
@@ -874,12 +878,55 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
     # Visitor methods for each node type
     # These are stubs that will be implemented in subsequent tasks
 
+    def _is_empty_collection_literal(self, node) -> bool:
+        """Check if node represents empty collection literal {}.
+
+        SP-100-003: Empty collections are represented as string literals with
+        text value '{}'. We need to detect them to apply proper semantics.
+
+        Args:
+            node: AST node to check
+
+        Returns:
+            True if node is an empty collection literal
+        """
+        if isinstance(node, LiteralNode):
+            # Check for empty collection marker: text is '{}' or value is {}
+            return (node.text == '{}' or
+                    (isinstance(node.value, str) and node.value == '{}'))
+        return False
+
+    def _translate_empty_collection(self, context: str = "default") -> str:
+        """Generate SQL for empty collection handling.
+
+        SP-100-003: Empty collections have special semantics in FHIRPath:
+        - Boolean context: Returns FALSE (empty collections are falsy)
+        - Comparison context: Returns NULL (won't match anything)
+        - Default: Returns empty JSON array
+
+        Args:
+            context: Translation context ('boolean', 'comparison', 'default')
+
+        Returns:
+            SQL expression for empty collection in given context
+        """
+        if context == "boolean":
+            return "FALSE"
+        elif context == "comparison":
+            return "NULL"
+        else:
+            # Default empty collection representation as JSON array
+            return "[]"
+
     def visit_literal(self, node: LiteralNode) -> SQLFragment:
         """Translate literal values to SQL.
 
         Converts literal values (strings, numbers, booleans, dates) to their SQL
         representations. Handles proper escaping and type conversion. For date and
         datetime literals, delegates to dialect methods for database-specific syntax.
+
+        SP-100-003: Empty collections {} are handled specially - they are detected
+        and translated based on context (boolean FALSE, comparison NULL, etc.)
 
         SQL Escaping Rules:
             - Strings: Single quotes escaped by doubling ('John''s' for "John's")
@@ -920,8 +967,36 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             >>> fragment = translator.visit_literal(node)
             >>> fragment.expression
             "DATE '2024-01-01'"
+
+            Empty collection (SP-100-003):
+            >>> node = LiteralNode(value="{}", literal_type="string")
+            >>> node.text = "{}"
+            >>> fragment = translator.visit_literal(node)
+            >>> fragment.metadata["is_empty_collection"]
+            True
         """
-        logger.debug(f"Translating literal: type={node.literal_type}, value={node.value}")
+        logger.debug(f"Translating literal: type={node.literal_type}, value={node.value}, text={node.text}")
+
+        # SP-100-003: Check for empty collection literal before type-based handling
+        if self._is_empty_collection_literal(node):
+            logger.debug("Detected empty collection literal {}")
+
+            # Store empty collection marker in context for functions
+            self.context.pending_literal_value = ("{}[]", "[]")
+
+            # Return SQL fragment marked as empty collection
+            # The actual SQL expression depends on context (handled by consumers)
+            return SQLFragment(
+                expression="NULL",  # Default - consumers will override
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                metadata={
+                    "literal_type": "empty_collection",
+                    "is_literal": True,
+                    "is_empty_collection": True
+                }
+            )
 
         # Handle different literal types
         if node.literal_type == "string":
@@ -1683,7 +1758,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # SP-022-009: Store the fragment result for the next child in the chain
                     # This enables expressions like '1.1'.toInteger().empty() where the result
                     # of toInteger() needs to flow to the subsequent empty() function call
-                    self.context.pending_fragment_result = fragment.expression
+                    # SP-100-002: Only set pending values for non-function-call children
+                    # Function calls should consume pending values, not overwrite them
+                    if not hasattr(child, 'node_type') or child.node_type not in ('function_call', 'functionCall'):
+                        # SP-100-002: Check if this child is a multi-item collection (e.g., union operator)
+                        is_multi_item = self._is_multi_item_collection(child)
+                        # Store as tuple (expression, parent_path, is_multi_item) for cardinality validation
+                        self.context.pending_fragment_result = (
+                            fragment.expression,
+                            self.context.parent_path.copy(),
+                            is_multi_item
+                        )
 
             return last_fragment
 
@@ -1832,10 +1917,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_any_false(node)
         elif function_name == "aggregate":
             return self._translate_aggregate(node)
-        elif function_name in ["sum", "avg", "min", "max"]:
-            raise NotImplementedError(
-                f"Function '{node.function_name}' implementation pending in future tasks"
-            )
+        elif function_name == "sum":
+            return self._translate_sum(node)
+        elif function_name == "avg":
+            return self._translate_avg(node)
+        elif function_name == "min":
+            return self._translate_min(node)
+        elif function_name == "max":
+            return self._translate_max(node)
         # Type functions (temporary handlers until AST adapter is fixed in SP-007-XXX)
         elif function_name == "is":
             return self._translate_is_from_function_call(node)
@@ -2535,8 +2624,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 right_metadata = getattr(right_fragment, "metadata", {}) or {}
                 left_is_collection = left_metadata.get("is_collection") is True
                 right_is_collection = right_metadata.get("is_collection") is True
+                left_is_empty = left_metadata.get("is_empty_collection") is True
+                right_is_empty = right_metadata.get("is_empty_collection") is True
 
-                if operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
+                # SP-100-003: Handle empty collections in comparisons
+                # Empty collections don't match anything in comparisons
+                if left_is_empty or right_is_empty:
+                    # Empty collections compared with anything return FALSE
+                    # {} = 5 -> FALSE, {} = {} -> FALSE, 5 = {} -> FALSE
+                    sql_expr = "FALSE"
+                elif operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
                     sql_expr = self._generate_collection_comparison(
                         left_fragment.expression,
                         right_fragment.expression,
@@ -4336,6 +4433,369 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         finally:
             self._restore_context(snapshot)
 
+    def _translate_sum(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate sum() aggregation function to SQL.
+
+        Generates SQL for summing numeric values in a collection.
+        Handles empty collections and null values per FHIRPath spec.
+
+        Args:
+            node: FunctionCallNode representing sum() function call
+
+        Returns:
+            SQLFragment with sum aggregation SQL and is_aggregate=True
+
+        Raises:
+            ValueError: If target expression cannot be resolved
+        """
+        value_expr, dependencies, literal_value, snapshot, target_ast, target_path = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+        try:
+            # Handle literal values
+            if literal_value is not None:
+                if literal_value is None or isinstance(literal_value, (list, tuple)) and len(literal_value) == 0:
+                    return SQLFragment(
+                        expression="0",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "sum", "result_type": "decimal"}
+                    )
+                if isinstance(literal_value, (list, tuple, set)):
+                    # Sum numeric values in the list
+                    total = sum(v for v in literal_value if isinstance(v, (int, float)) and v is not None)
+                    return SQLFragment(
+                        expression=str(total),
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "sum", "result_type": "decimal"}
+                    )
+                if isinstance(literal_value, (int, float)):
+                    return SQLFragment(
+                        expression=str(literal_value),
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "sum", "result_type": "decimal"}
+                    )
+
+            if not value_expr and not target_path:
+                raise ValueError("sum() requires a resolvable target expression")
+
+            # Get JSON path from context (for chained expressions like Patient.name.given.sum())
+            json_path = self.context.get_json_path()
+            field_expr = self.dialect.extract_json_field(
+                column=source_table,
+                path=json_path
+            )
+
+            # Cast to DECIMAL for numeric aggregation
+            field_expr = f"CAST({field_expr} AS DECIMAL)"
+
+            # Generate sum() SQL
+            sql_expr = self.dialect.generate_aggregate_function(
+                function_name="sum",
+                expression=field_expr,
+                filter_condition=None,
+                distinct=False
+            )
+
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=True,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "sum", "result_type": "decimal"}
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_avg(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate avg() aggregation function to SQL.
+
+        Generates SQL for averaging numeric values in a collection.
+        Handles empty collections and null values per FHIRPath spec.
+
+        Args:
+            node: FunctionCallNode representing avg() function call
+
+        Returns:
+            SQLFragment with avg aggregation SQL and is_aggregate=True
+
+        Raises:
+            ValueError: If target expression cannot be resolved
+        """
+        value_expr, dependencies, literal_value, snapshot, target_ast, target_path = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+        try:
+            # Handle literal values
+            if literal_value is not None:
+                if literal_value is None or isinstance(literal_value, (list, tuple)) and len(literal_value) == 0:
+                    return SQLFragment(
+                        expression="0",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "avg", "result_type": "decimal"}
+                    )
+                if isinstance(literal_value, (list, tuple, set)):
+                    # Average numeric values in the list
+                    numeric_values = [v for v in literal_value if isinstance(v, (int, float)) and v is not None]
+                    if numeric_values:
+                        avg = sum(numeric_values) / len(numeric_values)
+                        return SQLFragment(
+                            expression=str(avg),
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=list(dict.fromkeys(dependencies)),
+                            metadata={"function": "avg", "result_type": "decimal"}
+                        )
+                    return SQLFragment(
+                        expression="0",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "avg", "result_type": "decimal"}
+                    )
+                if isinstance(literal_value, (int, float)):
+                    return SQLFragment(
+                        expression=str(literal_value),
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "avg", "result_type": "decimal"}
+                    )
+
+            if not value_expr and not target_path:
+                raise ValueError("avg() requires a resolvable target expression")
+
+            # Get JSON path from context (for chained expressions like Patient.name.given.avg())
+            json_path = self.context.get_json_path()
+            field_expr = self.dialect.extract_json_field(
+                column=source_table,
+                path=json_path
+            )
+
+            # Cast to DECIMAL for numeric aggregation
+            field_expr = f"CAST({field_expr} AS DECIMAL)"
+
+            # Generate avg() SQL
+            sql_expr = self.dialect.generate_aggregate_function(
+                function_name="avg",
+                expression=field_expr,
+                filter_condition=None,
+                distinct=False
+            )
+
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=True,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "avg", "result_type": "decimal"}
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_min(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate min() aggregation function to SQL.
+
+        Generates SQL for finding minimum value in a collection.
+        Handles empty collections and null values per FHIRPath spec.
+
+        Args:
+            node: FunctionCallNode representing min() function call
+
+        Returns:
+            SQLFragment with min aggregation SQL and is_aggregate=True
+
+        Raises:
+            ValueError: If target expression cannot be resolved
+        """
+        value_expr, dependencies, literal_value, snapshot, target_ast, target_path = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+        try:
+            # Handle literal values
+            if literal_value is not None:
+                if literal_value is None or isinstance(literal_value, (list, tuple)) and len(literal_value) == 0:
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "min", "result_type": "any"}
+                    )
+                if isinstance(literal_value, (list, tuple, set)):
+                    # Find minimum value in the list
+                    valid_values = [v for v in literal_value if v is not None]
+                    if valid_values:
+                        min_val = min(valid_values)
+                        return SQLFragment(
+                            expression=f"'{min_val}'" if isinstance(min_val, str) else str(min_val),
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=list(dict.fromkeys(dependencies)),
+                            metadata={"function": "min", "result_type": "any"}
+                        )
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "min", "result_type": "any"}
+                    )
+                return SQLFragment(
+                    expression=f"'{literal_value}'" if isinstance(literal_value, str) else str(literal_value),
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=list(dict.fromkeys(dependencies)),
+                    metadata={"function": "min", "result_type": "any"}
+                )
+
+            if not value_expr and not target_path:
+                raise ValueError("min() requires a resolvable target expression")
+
+            # Get JSON path from context (for chained expressions like Patient.name.given.min())
+            json_path = self.context.get_json_path()
+            field_expr = self.dialect.extract_json_field(
+                column=source_table,
+                path=json_path
+            )
+
+            # Generate min() SQL
+            sql_expr = self.dialect.generate_aggregate_function(
+                function_name="min",
+                expression=field_expr,
+                filter_condition=None,
+                distinct=False
+            )
+
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=True,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "min", "result_type": "any"}
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_max(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate max() aggregation function to SQL.
+
+        Generates SQL for finding maximum value in a collection.
+        Handles empty collections and null values per FHIRPath spec.
+
+        Args:
+            node: FunctionCallNode representing max() function call
+
+        Returns:
+            SQLFragment with max aggregation SQL and is_aggregate=True
+
+        Raises:
+            ValueError: If target expression cannot be resolved
+        """
+        value_expr, dependencies, literal_value, snapshot, target_ast, target_path = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+        try:
+            # Handle literal values
+            if literal_value is not None:
+                if literal_value is None or isinstance(literal_value, (list, tuple)) and len(literal_value) == 0:
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "max", "result_type": "any"}
+                    )
+                if isinstance(literal_value, (list, tuple, set)):
+                    # Find maximum value in the list
+                    valid_values = [v for v in literal_value if v is not None]
+                    if valid_values:
+                        max_val = max(valid_values)
+                        return SQLFragment(
+                            expression=f"'{max_val}'" if isinstance(max_val, str) else str(max_val),
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=list(dict.fromkeys(dependencies)),
+                            metadata={"function": "max", "result_type": "any"}
+                        )
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata={"function": "max", "result_type": "any"}
+                    )
+                return SQLFragment(
+                    expression=f"'{literal_value}'" if isinstance(literal_value, str) else str(literal_value),
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=list(dict.fromkeys(dependencies)),
+                    metadata={"function": "max", "result_type": "any"}
+                )
+
+            if not value_expr and not target_path:
+                raise ValueError("max() requires a resolvable target expression")
+
+            # Get JSON path from context (for chained expressions like Patient.name.given.max())
+            json_path = self.context.get_json_path()
+            field_expr = self.dialect.extract_json_field(
+                column=source_table,
+                path=json_path
+            )
+
+            # Generate max() SQL
+            sql_expr = self.dialect.generate_aggregate_function(
+                function_name="max",
+                expression=field_expr,
+                filter_condition=None,
+                distinct=False
+            )
+
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=True,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "max", "result_type": "any"}
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _get_json_path_from_target(self, target_path: Optional[List[str]]) -> str:
+        """Helper method to construct JSON path from target path list.
+
+        Args:
+            target_path: List of path components
+
+        Returns:
+            JSON path string (e.g., "$.name.given")
+        """
+        if not target_path:
+            return "$"
+        return "$." + ".".join(target_path)
+
     def _translate_converts_to_function(self, node: FunctionCallNode, target_type: str) -> SQLFragment:
         """Translate convertsTo*() functions to SQL boolean expressions."""
         value_expr, dependencies, literal_value, snapshot, _, _ = self._resolve_function_target(node)
@@ -4592,10 +5052,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # If iif is called on a collection (e.g., collection.iif(...)), validate cardinality
             # The collection must have 0 or 1 items (execution validation - testIif10)
-            if target_expr and target_ast:
+            if target_expr and (target_ast is not None or target_path is not None or hasattr(self, '_pending_target_is_multi_item')):
                 # Check if target is a multi-item literal union (e.g., 'item1' | 'item2')
-                # This can be detected at translation time
-                if self._is_multi_item_collection(target_ast):
+                # This can be detected at translation time or from pending fragment
+                is_multi_target = False
+                if target_ast and self._is_multi_item_collection(target_ast):
+                    is_multi_target = True
+                elif hasattr(self, '_pending_target_is_multi_item') and self._pending_target_is_multi_item:
+                    is_multi_target = True
+                    # Clear the flag after checking
+                    self._pending_target_is_multi_item = False
+
+                if is_multi_target:
                     raise FHIRPathEvaluationError(
                         "iif() cannot be called on a collection with multiple items"
                     )
@@ -4799,6 +5267,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             True if node represents a multi-item collection (e.g., literal union), False otherwise
         """
         # Check for union operator (|) which creates multi-item collections
+        # The parser creates a UnionExpression node with node_type='UnionExpression'
+        if hasattr(node, 'node_type') and node.node_type == "UnionExpression":
+            # Union operator - check if both sides are single items
+            # If both are single literals, this is a multi-item collection
+            left = node.children[0] if hasattr(node, 'children') and len(node.children) > 0 else None
+            right = node.children[1] if hasattr(node, 'children') and len(node.children) > 1 else None
+
+            if left and right:
+                # Both sides exist - this is definitely a multi-item collection
+                return True
+
+        # Also check for legacy operator node type
         if hasattr(node, 'node_type') and node.node_type == "operator":
             if hasattr(node, 'operator') and node.operator == '|':
                 # Union operator - check if both sides are single items
@@ -4808,6 +5288,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
                 if left and right:
                     # Both sides exist - this is definitely a multi-item collection
+                    return True
+
+        # SP-100-002: Recursively check children for union expressions
+        # This handles cases like ('a' | 'b') where the union is nested inside
+        # wrapper nodes like TermExpression, ParenthesizedTerm, etc.
+        if hasattr(node, 'children'):
+            for child in node.children:
+                if self._is_multi_item_collection(child):
                     return True
 
         # Empty collection literal {}
@@ -7979,6 +8467,19 @@ GROUP BY {old_table}.id, {old_table}.resource"""
                 f"got {len(node.arguments)}"
             )
 
+        # SP-100-003: Check if target is an empty collection literal directly
+        if hasattr(node, 'target') and self._is_empty_collection_literal(node.target):
+            # Empty collections don't exist: {}.exists() -> FALSE
+            logger.debug("Empty collection literal target - exists() returns FALSE")
+            return SQLFragment(
+                expression="FALSE",
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=[],
+                metadata={"function": "exists", "result_type": "boolean"}
+            )
+
         # COMPOSITIONAL DESIGN: Check if target is a function call (e.g., .where())
         # If so, translate it first and detect if it returns a subquery
         if hasattr(node, 'target') and isinstance(node.target, FunctionCallNode):
@@ -7986,6 +8487,20 @@ GROUP BY {old_table}.id, {old_table}.resource"""
 
             # Translate target function first
             target_fragment = self.visit(node.target)
+
+            # SP-100-003: Check if target is an empty collection literal
+            target_metadata = getattr(target_fragment, "metadata", {}) or {}
+            if target_metadata.get("is_empty_collection"):
+                # Empty collections don't exist: {}.exists() -> FALSE
+                logger.debug("Empty collection literal - exists() returns FALSE")
+                return SQLFragment(
+                    expression="FALSE",
+                    source_table=target_fragment.source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=target_fragment.dependencies,
+                    metadata={"function": "exists", "result_type": "boolean"}
+                )
 
             # Check if target returned a subquery (starts with opening parenthesis)
             if target_fragment.expression.strip().startswith('('):
@@ -8170,6 +8685,19 @@ END"""
                 f"empty() function requires 0 arguments, got {len(node.arguments)}"
             )
 
+        # SP-100-003: Check if target is an empty collection literal directly
+        if hasattr(node, 'target') and self._is_empty_collection_literal(node.target):
+            # Empty collections are empty: {}.empty() -> TRUE
+            logger.debug("Empty collection literal target - empty() returns TRUE")
+            return SQLFragment(
+                expression="TRUE",
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=[],
+                metadata={"function": "empty", "result_type": "boolean"}
+            )
+
         # COMPOSITIONAL DESIGN: Check if target is a function call (e.g., .where())
         # If so, translate it first and detect if it returns a subquery
         if hasattr(node, 'target') and isinstance(node.target, FunctionCallNode):
@@ -8177,6 +8705,20 @@ END"""
 
             # Translate target function first
             target_fragment = self.visit(node.target)
+
+            # SP-100-003: Check if target is an empty collection literal
+            target_metadata = getattr(target_fragment, "metadata", {}) or {}
+            if target_metadata.get("is_empty_collection"):
+                # Empty collections are empty: {}.empty() -> TRUE
+                logger.debug("Empty collection literal - empty() returns TRUE")
+                return SQLFragment(
+                    expression="TRUE",
+                    source_table=target_fragment.source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=target_fragment.dependencies,
+                    metadata={"function": "empty", "result_type": "boolean"}
+                )
 
             # Check if target returned a subquery (starts with opening parenthesis)
             # SP-021-010: Stricter check to avoid treating (CASE ... END) as subquery
@@ -8208,11 +8750,15 @@ END"""
             if literal_value is not None:
                 # FHIRPath empty() semantics:
                 # - NULL → TRUE (empty)
+                # - Empty collection {} → TRUE (empty)
                 # - Empty collection [] → TRUE (empty)
                 # - Single value (not a collection) → FALSE ({value} has 1 element)
                 # - Collection with elements → FALSE
                 if isinstance(literal_value, (list, tuple, set)):
                     is_empty = len(literal_value) == 0
+                elif literal_value == "{}[]" or literal_value == "[]":
+                    # SP-100-003: Empty collection literal marker
+                    is_empty = True
                 else:
                     # Single value is treated as a singleton collection {value}
                     # which is NOT empty

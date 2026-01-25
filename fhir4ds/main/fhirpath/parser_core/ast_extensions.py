@@ -192,11 +192,17 @@ class EnhancedASTNode:
                         """Parse literal value, type, and temporal info from text.
 
                         SP-023-006: Enhanced to handle FHIR temporal literals.
+                        SP-100-003: Enhanced to handle empty collection literals.
                         """
                         if not text:
                             return None, "unknown", None
 
                         text = text.strip()
+
+                        # SP-100-003: Handle empty collection literal {}
+                        if text == "{}":
+                            # Empty collection marker - use special value to signal empty collection
+                            return "{}[]", "empty_collection", None
 
                         # Handle FHIR temporal literals
                         temporal_info = self._parse_temporal_literal(text)

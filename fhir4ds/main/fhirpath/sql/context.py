@@ -149,7 +149,9 @@ class TranslationContext:
     # SP-022-009: Track pending fragment result from previous step in invocation chain
     # Used for expressions like '1.1'.toInteger().empty() where the result of toInteger()
     # needs to flow to the subsequent empty() function call
-    pending_fragment_result: Optional[str] = None  # SQL expression from previous fragment
+    # SP-100-002: Now stores a tuple (expression, parent_path, is_multi_item_collection)
+    # for cardinality validation
+    pending_fragment_result: Optional[tuple] = None  # (sql_expression, parent_path, is_multi_item) from previous fragment
 
     def __post_init__(self) -> None:
         """Initialise variable scope stack after dataclass creation."""
