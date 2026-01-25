@@ -152,6 +152,11 @@ class TranslationContext:
     # SP-100-002: Now stores a tuple (expression, parent_path, is_multi_item_collection)
     # for cardinality validation
     pending_fragment_result: Optional[tuple] = None  # (sql_expression, parent_path, is_multi_item) from previous fragment
+    # SP-101-002: CTE column alias registry for tracking column renames in CTE chains
+    # Maps logical column names (like "result") to actual column aliases in CTE output
+    # This is critical for chained operations like Patient.name.first().given where
+    # the CTE outputs a column named "name_item" but subsequent code references "result"
+    cte_column_aliases: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Initialise variable scope stack after dataclass creation."""
@@ -483,3 +488,53 @@ class TranslationContext:
         self.current_element_type = None
         self.pending_literal_value = None
         self.pending_fragment_result = None
+        self.cte_column_aliases.clear()
+
+    def register_column_alias(self, logical_name: str, actual_column: str) -> None:
+        """Register a CTE column alias mapping.
+
+        SP-101-002: When a CTE is generated, the output column may have a specific
+        alias (e.g., "name_item") that needs to be tracked so subsequent operations
+        can reference it correctly.
+
+        Args:
+            logical_name: The logical column name (e.g., "result")
+            actual_column: The actual column alias in the CTE output (e.g., "name_item")
+
+        Example:
+            >>> context = TranslationContext()
+            >>> context.register_column_alias("result", "name_item")
+            >>> context.resolve_column_alias("result")
+            'name_item'
+        """
+        self.cte_column_aliases[logical_name] = actual_column
+
+    def resolve_column_alias(self, column_name: str) -> str:
+        """Resolve a column name through the alias registry.
+
+        SP-101-002: When accessing a column that may have been aliased in a CTE,
+        this method returns the actual column name to use.
+
+        Args:
+            column_name: The column name to resolve (may be logical or actual)
+
+        Returns:
+            The actual column name to use in SQL generation
+
+        Example:
+            >>> context = TranslationContext()
+            >>> context.register_column_alias("result", "name_item")
+            >>> context.resolve_column_alias("result")
+            'name_item'
+            >>> context.resolve_column_alias("other_column")
+            'other_column'
+        """
+        return self.cte_column_aliases.get(column_name, column_name)
+
+    def clear_column_aliases(self) -> None:
+        """Clear all registered column aliases.
+
+        SP-101-002: Called when starting a new translation or when aliases
+        from a previous expression should not propagate.
+        """
+        self.cte_column_aliases.clear()
