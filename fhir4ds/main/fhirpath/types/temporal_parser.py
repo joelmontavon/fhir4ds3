@@ -118,6 +118,12 @@ class FHIRTemporalParser:
         r'^@(?P<year>\d{4})(?:-(?P<month>\d{2}))?(?:-(?P<day>\d{2}))?$'
     )
 
+    # Partial DateTime: @YYYYT, @YYYY-MMT, @YYYY-MM-DDT (no time components, just T suffix)
+    # These are DateTime literals (not Date) because they have the 'T' suffix
+    PARTIAL_DATETIME_PATTERN = re.compile(
+        r'^@(?P<year>\d{4})(?:-(?P<month>\d{2}))?(?:-(?P<day>\d{2}))?T$'
+    )
+
     # DateTime: @YYYY-MM-DDTHH:MM:SS.sss±HH:MM
     DATETIME_PATTERN = re.compile(
         r'^@(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})'
@@ -161,10 +167,16 @@ class FHIRTemporalParser:
         if not temporal_literal or not temporal_literal.startswith('@'):
             return None
 
-        # Try DateTime pattern first (most specific)
+        # Try DateTime pattern first (most specific - full date with time)
         match = self.DATETIME_PATTERN.match(temporal_literal)
         if match:
             return self._parse_datetime(temporal_literal, match)
+
+        # Try Partial DateTime pattern (date components with 'T' suffix but no time)
+        # SP-101-003: Handle @YYYYT, @YYYY-MMT, @YYYY-MM-DDT as partial DateTime
+        match = self.PARTIAL_DATETIME_PATTERN.match(temporal_literal)
+        if match:
+            return self._parse_partial_datetime(temporal_literal, match)
 
         # Try Time pattern
         match = self.TIME_PATTERN.match(temporal_literal)
@@ -189,6 +201,33 @@ class FHIRTemporalParser:
             year=int(groups['year']),
             month=int(groups['month']) if groups.get('month') else None,
             day=int(groups['day']) if groups.get('day') else None
+        )
+
+    def _parse_partial_datetime(self, original: str, match: re.Match) -> ParsedTemporal:
+        """Parse a partial DateTime literal (date components with 'T' suffix).
+
+        SP-101-003: FHIRPath allows partial DateTime literals like:
+        - @2015T (year-only DateTime)
+        - @2015-02T (year-month DateTime)
+        - @2015-02-04T (year-month-day DateTime with no time)
+
+        These are distinct from Date literals because they include the 'T' suffix,
+        indicating they are DateTime types (even though time components are omitted).
+        """
+        groups = match.groupdict()
+
+        return ParsedTemporal(
+            original=original,
+            temporal_type='DateTime',  # DateTime type, not Date
+            year=int(groups['year']),
+            month=int(groups['month']) if groups.get('month') else None,
+            day=int(groups['day']) if groups.get('day') else None,
+            # No time components in partial DateTime
+            hour=None,
+            minute=None,
+            second=None,
+            millisecond=None,
+            timezone_offset=None
         )
 
     def _parse_datetime(self, original: str, match: re.Match) -> ParsedTemporal:
@@ -241,6 +280,7 @@ class FHIRTemporalParser:
         if temporal_literal.startswith('@T'):
             return 'Time'
         elif 'T' in temporal_literal:
+            # SP-101-003: Any 'T' in the literal (excluding @T prefix) indicates DateTime
             return 'DateTime'
         else:
             return 'Date'

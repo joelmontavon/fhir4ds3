@@ -5620,15 +5620,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if target_type == "DateTime":
             if isinstance(value, str):
                 stripped = value.strip()
-                # Basic ISO 8601 pattern check
-                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2}(T.*)?)?)?$', stripped))
+                # SP-101-003: Support partial DateTime formats
+                # Accepts: YYYY, YYYY-MM, YYYY-MM-DD, YYYYT, YYYY-MMT, YYYY-MM-DDT, YYYY-MM-DDTHH:MM:SS...
+                # Pattern: Year required, month/day optional, 'T' suffix optional (with or without time)
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)?T?.*$', stripped))
             return False
 
         if target_type == "Time":
             if isinstance(value, str):
                 stripped = value.strip()
-                # Basic ISO 8601 time pattern check (HH:MM:SS or HH:MM)
-                return bool(re.match(r'^\d{2}:\d{2}(:\d{2})?$', stripped))
+                # SP-101-003: Support hour-only format and standard time formats
+                # Accepts: HH, HH:MM, HH:MM:SS, HH:MM:SS.sss
+                return bool(re.match(r'^\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?$', stripped))
             return False
 
         raise ValueError(f"Unsupported convertsTo target type: {target_type}")
@@ -5715,16 +5718,42 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return "FALSE"
 
     def _build_converts_to_datetime_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToDateTime() checks."""
-        # Use dialect-specific datetime casting
-        datetime_cast = self.dialect.generate_type_cast(value_expr, "DateTime")
-        return f"CASE WHEN {datetime_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
+        """Generate SQL for convertsToDateTime() checks.
+
+        SP-101-003: Use regex pattern matching instead of casting to support
+        partial DateTime formats like '2015', '2015-02', '2015-02-04'.
+
+        FHIRPath spec allows convertsToDateTime() to return true for strings that
+        match the DateTime format, even if they're partial dates.
+        """
+        # First, try to cast as string
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        # Use regex to check if it matches a DateTime pattern
+        # Pattern: YYYY(-MM(-DD(T(HH(:MM(:SS)?)?)?)?)?
+        # Matches: 2015, 2015-02, 2015-02-04, 2015T, 2015-02T, 2015-02-04T, 2015-02-04T10:00:00
+        return (
+            f"CASE "
+            f"WHEN {string_cast} IS NULL THEN FALSE "
+            f"WHEN REGEXP_MATCHES({string_cast}, '^[0-9]{{4}}(-[0-9]{{2}})?(-[0-9]{{2}})?(T([0-9]{{2}}(:[0-9]{{2}})?(:[0-9]{{2}})?)?)?$') THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _build_converts_to_time_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToTime() checks."""
-        # Use dialect-specific time casting
-        time_cast = self.dialect.generate_type_cast(value_expr, "Time")
-        return f"CASE WHEN {time_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
+        """Generate SQL for convertsToTime() checks.
+
+        SP-101-003: Use regex pattern matching to support hour-only time format.
+        """
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        # Pattern: HH(:MM(:SS(.sss)?)?)?
+        # Note: Use single backslash for dot to match literal period in SQL regex
+        return (
+            f"CASE "
+            f"WHEN {string_cast} IS NULL THEN FALSE "
+            f"WHEN REGEXP_MATCHES({string_cast}, '^[0-9]{{2}}(:[0-9]{{2}}(:[0-9]{{2}}(\\.[0-9]+)?)?)?$') THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _translate_to_boolean(self, node: FunctionCallNode) -> SQLFragment:
         """Translate toBoolean() function to SQL conversion."""
