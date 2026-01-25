@@ -1031,8 +1031,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         elif node.literal_type == "empty_collection":
             # Empty collection literal {} - generate SQL for empty JSON array
             # SP-100-003: Empty collections are represented as empty JSON arrays
+            # SP-100-003-fix: Removed inline comment that caused syntax errors
             # Use dialect-agnostic SQL for empty array
-            sql_expr = "'[]'  # Empty JSON array literal"
+            sql_expr = "'[]'"
 
         else:
             # Unknown or unsupported literal type
