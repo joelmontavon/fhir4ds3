@@ -4835,18 +4835,39 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             self._restore_context(snapshot)
 
     def _translate_extension_function(self, node: FunctionCallNode) -> SQLFragment:
-        """Translate extension(url) function to SQL array filtering."""
+        """Translate extension(url) function to SQL array filtering.
+
+        SP-100-EXT: Enhanced to handle EnhancedASTNode arguments that haven't
+        been converted to LiteralNode yet. The parser creates a nested structure:
+        TermExpression > literal > literal for string arguments.
+        """
         if len(node.arguments) != 1:
             raise ValueError(
                 "extension() function requires exactly 1 argument (extension URL)"
             )
 
         url_arg = node.arguments[0]
+
+        # SP-100-EXT: Try to extract URL from various node types
+        extension_url = None
+
+        # Case 1: Already converted LiteralNode
         if isinstance(url_arg, LiteralNode) and isinstance(url_arg.value, str):
             extension_url = url_arg.value
+        # Case 2: IdentifierNode
         elif isinstance(url_arg, IdentifierNode) and url_arg.identifier:
             extension_url = url_arg.identifier.strip('`')
-        else:
+        # Case 3: EnhancedASTNode - extract from nested structure
+        elif hasattr(url_arg, 'text'):
+            # The text contains the URL with quotes, e.g., "'http://example.com/test'"
+            text = url_arg.text.strip()
+            # Remove surrounding quotes
+            if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                extension_url = text[1:-1]
+            else:
+                extension_url = text
+
+        if not extension_url:
             raise ValueError("extension() argument must be a string literal or identifier")
 
         (
