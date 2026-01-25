@@ -730,6 +730,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         column=self.context.current_table,
                         path=json_path
                     )
+                    # SP-101-002: Set target_path from current context when using context path
+                    # This allows first(), last(), etc. to work on the current path
+                    target_path = self.context.parent_path.copy()
                 else:
                     target_expression = self.context.current_table
         elif isinstance(target_ast, LiteralNode):
@@ -1294,11 +1297,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
                 self.fragments.append(fragment)
                 last_fragment = fragment
+
+                # SP-101-002: Register the column alias for CTE output tracking
+                # The CTE will output the column as 'result_alias' (e.g., "name_item")
+                # but subsequent operations may reference it as "result" or by logical name
+                self.context.register_column_alias(result_alias, result_alias)
+
                 current_source = result_alias
                 relative_components = []
 
                 logger.debug(
-                    "Detected array path '%s'; generated fragment with alias '%s'",
+                    "SP-101-002: Detected array path '%s'; generated fragment with alias '%s'",
                     source_path,
                     result_alias,
                 )
@@ -1505,13 +1514,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # When current_element_column is set, we're accessing a field on an extracted
         # element (e.g., .family after Patient.name.first()). In this case, extract
         # from the element column, not from the original resource JSON.
+        # SP-101-002: Resolve the column name through the alias registry to handle
+        # CTE column renames (e.g., "result" -> "name_item")
         if self.context.current_element_column:
             # Build JSON path for field access on the element
             # The element is already a JSON object, so we just need $.field
             field_name = ".".join(components)
             element_path = "$." + field_name
+
+            # SP-101-002: Resolve the column alias to get the actual column name
+            actual_element_column = self.context.resolve_column_alias(
+                self.context.current_element_column
+            )
+
             logger.debug(
-                f"Extracting from element column '{self.context.current_element_column}': {element_path}"
+                f"SP-101-002: Extracting from element column '{self.context.current_element_column}' "
+                f"(resolved to '{actual_element_column}'): {element_path}"
             )
 
             # Use the element type if available, otherwise fall back to current resource type
@@ -1531,7 +1549,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # Build array extraction path with [*] for unnesting
                 array_path = element_path + "[*]"
                 array_column = self.dialect.extract_json_object(
-                    column=self.context.current_element_column,
+                    column=actual_element_column,
                     path=array_path
                 )
 
@@ -1581,12 +1599,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Generate JSON extraction from the element column
             if is_primitive:
                 sql_expr = self.dialect.extract_primitive_value(
-                    column=self.context.current_element_column,
+                    column=actual_element_column,
                     path=element_path
                 )
             else:
                 sql_expr = self.dialect.extract_json_field(
-                    column=self.context.current_element_column,
+                    column=actual_element_column,
                     path=element_path
                 )
 
@@ -3756,36 +3774,63 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         right_node: FHIRPathASTNode,
         sql_operator: str,
     ) -> str:
-        """Generate SQL for arithmetic operators with type coercion and safety checks."""
+        """Generate SQL for arithmetic operators with FHIRPath spec-compliant type coercion.
+
+        SP-101-001: Implements proper type promotion rules per FHIRPath specification:
+        - Addition/Subtraction/Multiplication: integer+integer=integer, integer+decimal=decimal
+        - Division (/): Always returns decimal
+        - Integer Division (div): Truncates to integer
+        - Modulo (mod): integer mod integer = integer, otherwise decimal
+
+        Args:
+            operator: FHIRPath operator (+, -, *, /, div, mod)
+            left_fragment: Left operand SQL fragment
+            right_fragment: Right operand SQL fragment
+            left_node: Left operand AST node
+            right_node: Right operand AST node
+            sql_operator: SQL operator symbol
+
+        Returns:
+            SQL expression for the arithmetic operation
+        """
         left_expr = left_fragment.expression
         right_expr = right_fragment.expression
 
+        # Infer operand types using enhanced type inference
         left_type = self._infer_numeric_type(left_node)
         right_type = self._infer_numeric_type(right_node)
 
+        # Division (/) always returns decimal per FHIRPath spec
         if operator == "/":
             numerator = self._ensure_decimal_expression(left_expr, left_type)
             denominator = self._ensure_decimal_expression(right_expr, right_type)
             division_expr = self.dialect.generate_decimal_division(numerator, denominator)
             return self._wrap_division_expression(numerator, denominator, division_expr)
 
+        # Integer division (div) truncates to integer
         if operator == "div":
+            # Both operands cast to decimal first, then result truncated
             numerator = self._ensure_decimal_expression(left_expr, left_type)
             denominator = self._ensure_decimal_expression(right_expr, right_type)
             division_expr = self.dialect.generate_integer_division(numerator, denominator)
             return self._wrap_division_expression(numerator, denominator, division_expr)
 
+        # Modulo operator: integer mod integer = integer, otherwise decimal
         if operator == "mod":
             prefers_decimal = "decimal" in {left_type, right_type}
-            left_numeric = (
-                self._ensure_decimal_expression(left_expr, left_type) if prefers_decimal else left_expr
-            )
-            right_numeric = (
-                self._ensure_decimal_expression(right_expr, right_type) if prefers_decimal else right_expr
-            )
+            if prefers_decimal:
+                left_numeric = self._ensure_decimal_expression(left_expr, left_type)
+                right_numeric = self._ensure_decimal_expression(right_expr, right_type)
+            else:
+                left_numeric = left_expr
+                right_numeric = right_expr
             modulo_expr = self.dialect.generate_modulo(left_numeric, right_numeric)
             return self._wrap_modulo_expression(left_numeric, right_numeric, modulo_expr)
 
+        # Addition, subtraction, multiplication: apply type promotion
+        # integer op integer = integer
+        # integer op decimal = decimal
+        # decimal op decimal = decimal
         prefers_decimal = "decimal" in {left_type, right_type}
         if prefers_decimal:
             left_numeric = self._ensure_decimal_expression(left_expr, left_type)
@@ -3819,22 +3864,34 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _infer_numeric_type(self, node: Optional[FHIRPathASTNode]) -> str:
-        """Infer numeric type (integer/decimal) from AST node metadata and value."""
+        """Infer numeric type (integer/decimal) from AST node metadata and value.
+
+        SP-101-001: Enhanced type inference for FHIRPath spec-compliant arithmetic.
+        Handles multiple sources of type information:
+        1. Explicit literal_type attribute on LiteralNode
+        2. Python value type (Decimal, float, int)
+        3. SQL data type metadata
+        4. FHIR type information
+        5. Literal text analysis (fallback for numeric literals)
+        """
         if node is None:
             return "unknown"
 
+        # Check for explicit literal_type attribute (from LiteralNode)
         literal_type = getattr(node, "literal_type", None)
         if literal_type == "decimal":
             return "decimal"
         if literal_type == "integer":
             return "integer"
 
+        # Check Python value type
         value = getattr(node, "value", None)
         if isinstance(value, Decimal) or isinstance(value, float):
             return "decimal"
         if isinstance(value, int) and not isinstance(value, bool):
             return "integer"
 
+        # Check SQL data type from metadata
         sql_data_type = (
             node.get_sql_data_type() if hasattr(node, "get_sql_data_type") else SQLDataType.UNKNOWN
         )
@@ -3843,6 +3900,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if sql_data_type == SQLDataType.INTEGER:
             return "integer"
 
+        # Check FHIR type information
         metadata = getattr(node, "metadata", None)
         type_info = getattr(metadata, "type_info", None) if metadata else None
         if type_info and getattr(type_info, "fhir_type", None):
@@ -3852,10 +3910,55 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if fhir_type in {"integer", "positiveint", "unsignedint"}:
                 return "integer"
 
+        # SP-101-001: Fallback to text analysis for numeric literals ONLY
+        # This handles cases where the parser hasn't set proper metadata on literals.
+        # IMPORTANT: Only apply text-based inference to literal nodes to avoid
+        # incorrectly typing column references as integers/decimals based on name.
+        if getattr(node, "node_type", None) == "literal":
+            text = getattr(node, "text", "").strip()
+            if text and self._is_numeric_literal(text):
+                if "." in text or "e" in text.lower():
+                    return "decimal"
+                return "integer"
+
         return "unknown"
 
+    def _is_numeric_literal(self, text: str) -> bool:
+        """Check if text represents a numeric literal.
+
+        Handles integers (123, -456) and decimals (1.5, -0.25, 3.14e-10).
+
+        Args:
+            text: The text to check
+
+        Returns:
+            True if text is a valid numeric literal, False otherwise
+        """
+        if not text:
+            return False
+
+        # Remove leading/trailing whitespace
+        text = text.strip()
+
+        # Check for numeric pattern: optional minus, digits, optional decimal, optional exponent
+        # Pattern matches: 123, -456, 1.5, -0.25, 3.14e-10, -1E5
+        return bool(re.fullmatch(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", text))
+
     def _ensure_decimal_expression(self, expression: str, inferred_type: str) -> str:
-        """Cast expression to decimal when required for arithmetic operations."""
+        """Cast expression to decimal when required for arithmetic operations.
+
+        SP-101-001: Enhanced casting for FHIRPath spec-compliant type coercion.
+        - If type is decimal, use expression as-is
+        - If type is integer or unknown, cast to decimal
+        - Uses TRY_CAST for safe conversion (returns NULL on failure)
+
+        Args:
+            expression: SQL expression to cast
+            inferred_type: Inferred type ("integer", "decimal", or "unknown")
+
+        Returns:
+            SQL expression that evaluates to a decimal value
+        """
         if inferred_type == "decimal":
             return expression
         return self.dialect.generate_type_cast(expression, "Decimal")
@@ -5502,15 +5605,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if target_type == "DateTime":
             if isinstance(value, str):
                 stripped = value.strip()
-                # Basic ISO 8601 pattern check
-                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2}(T.*)?)?)?$', stripped))
+                # SP-101-003: Support partial DateTime formats
+                # Accepts: YYYY, YYYY-MM, YYYY-MM-DD, YYYYT, YYYY-MMT, YYYY-MM-DDT, YYYY-MM-DDTHH:MM:SS...
+                # Pattern: Year required, month/day optional, 'T' suffix optional (with or without time)
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)?T?.*$', stripped))
             return False
 
         if target_type == "Time":
             if isinstance(value, str):
                 stripped = value.strip()
-                # Basic ISO 8601 time pattern check (HH:MM:SS or HH:MM)
-                return bool(re.match(r'^\d{2}:\d{2}(:\d{2})?$', stripped))
+                # SP-101-003: Support hour-only format and standard time formats
+                # Accepts: HH, HH:MM, HH:MM:SS, HH:MM:SS.sss
+                return bool(re.match(r'^\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?$', stripped))
             return False
 
         raise ValueError(f"Unsupported convertsTo target type: {target_type}")
@@ -5597,16 +5703,44 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return "FALSE"
 
     def _build_converts_to_datetime_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToDateTime() checks."""
-        # Use dialect-specific datetime casting
-        datetime_cast = self.dialect.generate_type_cast(value_expr, "DateTime")
-        return f"CASE WHEN {datetime_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
+        """Generate SQL for convertsToDateTime() checks.
+
+        SP-101-003: Use regex pattern matching instead of casting to support
+        partial DateTime formats like '2015', '2015-02', '2015-02-04'.
+
+        FHIRPath spec allows convertsToDateTime() to return true for strings that
+        match the DateTime format, even if they're partial dates.
+        """
+        # First, try to cast as string
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        # Use regex to check if it matches a DateTime pattern
+        # Pattern: YYYY(-MM(-DD(T(HH(:MM(:SS)?)?)?)?)?
+        # Matches: 2015, 2015-02, 2015-02-04, 2015T, 2015-02T, 2015-02-04T, 2015-02-04T10:00:00
+        datetime_pattern = r"'^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?(T([0-9]{2}(:[0-9]{2})?(:[0-9]{2})?)?)?$'"
+        return (
+            f"CASE "
+            f"WHEN {string_cast} IS NULL THEN FALSE "
+            f"WHEN {self.dialect.generate_regex_match(string_cast, datetime_pattern)} THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _build_converts_to_time_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToTime() checks."""
-        # Use dialect-specific time casting
-        time_cast = self.dialect.generate_type_cast(value_expr, "Time")
-        return f"CASE WHEN {time_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
+        """Generate SQL for convertsToTime() checks.
+
+        SP-101-003: Use regex pattern matching to support hour-only time format.
+        """
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        # Pattern: HH(:MM(:SS(.sss)?)?)?
+        # Note: Use escaped backslash for literal period in regex
+        time_pattern = r"'^[0-9]{2}(:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?$'"
+        return (
+            f"CASE "
+            f"WHEN {string_cast} IS NULL THEN FALSE "
+            f"WHEN {self.dialect.generate_regex_match(string_cast, time_pattern)} THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _translate_to_boolean(self, node: FunctionCallNode) -> SQLFragment:
         """Translate toBoolean() function to SQL conversion."""
@@ -8398,6 +8532,12 @@ GROUP BY {old_table}.id, {old_table}.resource"""
             # (like count()) operate on the filtered result
             self.fragments.append(first_fragment)
 
+            # SP-101-002: Register column alias for CTE output
+            # The CTE builder will output this as "result" column, but we need to track
+            # that the actual data comes from result_col (e.g., "name_item")
+            # This allows subsequent field access to properly reference the column
+            self.context.register_column_alias("result", result_col)
+
             # SP-022-004: Update context for subsequent field access
             # After first() on UNNEST, subsequent field access should:
             # 1. Use the "result" column (the filtered element), not the original resource
@@ -8411,10 +8551,17 @@ GROUP BY {old_table}.id, {old_table}.resource"""
             return first_fragment
 
         # No UNNEST - use JSON path indexing as before
+        # SP-101-002: Determine if we're working on the current context path
+        # If the snapshot has a non-empty parent_path, it means the caller set up
+        # a path before calling first(), and we should preserve our modifications
+        working_on_context_path = bool(snapshot.get("parent_path"))
+
         try:
-            if not collection_expr and not target_path:
-                # Fallback to context path
-                current_path = self.context.get_json_path()
+            if working_on_context_path:
+                # SP-101-002: Build path without [*] markers for first() indexing
+                # get_json_path() adds [*] for arrays, but first() needs [0] indexing
+                # So we build the path manually without [*]
+                current_path = "$." + ".".join(self.context.parent_path) if self.context.parent_path else "$"
             else:
                 # Build path from target
                 current_path = self._build_json_path_from_components(target_path or [])
@@ -8438,7 +8585,10 @@ GROUP BY {old_table}.id, {old_table}.resource"""
                 metadata={"function": "first"}
             )
         finally:
-            self._restore_context(snapshot)
+            # SP-101-002: Only restore context if we're not working on the current context path
+            # When working on context path, we want to preserve the path modifications
+            if not working_on_context_path:
+                self._restore_context(snapshot)
 
     def _translate_exists(self, node: FunctionCallNode) -> SQLFragment:
         """Translate exists() function to SQL for existence checking.
@@ -9165,6 +9315,9 @@ END"""
 
             self.fragments.append(last_fragment)
 
+            # SP-101-002: Register column alias for CTE output
+            self.context.register_column_alias("result", result_col)
+
             # Update context for subsequent field access
             self.context.current_element_column = "result"
             self.context.current_element_type = element_type
@@ -9294,6 +9447,9 @@ END"""
 
             self.fragments.append(skip_result_fragment)
 
+            # SP-101-002: Register column alias for CTE output
+            self.context.register_column_alias("result", result_col)
+
             # SP-022-004: Update context for subsequent field access
             # Even though skip returns a collection, each row has an element in
             # the "result" column, so field access should extract from that
@@ -9413,6 +9569,9 @@ END"""
             )
 
             self.fragments.append(tail_result_fragment)
+
+            # SP-101-002: Register column alias for CTE output
+            self.context.register_column_alias("result", result_col)
 
             # SP-022-004: Update context for subsequent field access
             self.context.current_element_column = "result"
@@ -9726,6 +9885,9 @@ END"""
             )
 
             self.fragments.append(take_result_fragment)
+
+            # SP-101-002: Register column alias for CTE output
+            self.context.register_column_alias("result", result_col)
 
             # SP-022-004: Update context for subsequent field access
             self.context.current_element_column = "result"

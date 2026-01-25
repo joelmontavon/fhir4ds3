@@ -1,0 +1,1337 @@
+{
+  "total_failures": 470,
+  "patterns": [
+    {
+      "pattern": "result_logic: none_result",
+      "count": 185,
+      "error_types": {
+        "ConversionException": 26,
+        "parse": 126,
+        "ParserException": 12,
+        "translator_unsupported": 10,
+        "semantic": 1,
+        "execution": 2,
+        "InvalidInputException": 6,
+        "ValueError": 2
+      },
+      "examples": [
+        {
+          "name": "testLiteralTimeHour",
+          "expression": "@T14.is(Time)",
+          "error": "Conversion Error: time field value out of range: \"14\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"
+        },
+        {
+          "name": "testDateNotEqualTimeSecond",
+          "expression": "Patient.birthDate != @T12:14:15",
+          "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)"
+        },
+        {
+          "name": "testDateNotEqualTimeMinute",
+          "expression": "Patient.birthDate != @T12:14",
+          "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)"
+        }
+      ],
+      "test_names": [
+        "testLiteralTimeHour",
+        "testDateNotEqualTimeSecond",
+        "testDateNotEqualTimeMinute",
+        "testStringYearConvertsToDate",
+        "testStringMonthConvertsToDate",
+        "testStringDayConvertsToDate",
+        "testExists4",
+        "testAllTrue1",
+        "testAllTrue2",
+        "testSubSetOf3",
+        "testCollectionBoolean2",
+        "testCollectionBoolean4",
+        "testDistinct2",
+        "testDistinct3",
+        "testDistinct5",
+        "testDistinct6",
+        "testRepeat3",
+        "testRepeat4",
+        "testRepeat5",
+        "testIndexer1",
+        "testSkip3",
+        "testIif3",
+        "testIif4",
+        "testIif9",
+        "testIif11",
+        "testToChars1",
+        "testMatchesEmpty",
+        "testMatchesEmpty3",
+        "testMatchesFullWithinUrl1",
+        "testMatchesFullWithinUrl3",
+        "testMatchesFullWithinUrl4",
+        "testMatchesFullWithinUrl1a",
+        "testMatchesFullWithinUrl2",
+        "testReplaceMatches5",
+        "testEncodeBase64A",
+        "testEncodeHex",
+        "testEncodeBase64B",
+        "testEncodeUrlBase64",
+        "testDecodeBase64A",
+        "testDecodeHex",
+        "testDecodeBase64B",
+        "testDecodeUrlBase64",
+        "testEscapeHtml",
+        "testEscapeJson",
+        "testUnescapeHtml",
+        "testUnescapeJson",
+        "testTrim1",
+        "testTrim2",
+        "testTrim3",
+        "testTrim4",
+        "testTrim5",
+        "testTrim6",
+        "testSplit3",
+        "testTrace1",
+        "testTrace2",
+        "testSort1",
+        "testSort2",
+        "testSort3",
+        "testSort4",
+        "testSort5",
+        "testSort6",
+        "testSort7",
+        "testSort8",
+        "testSort9",
+        "testSort10",
+        "testEquivalent3",
+        "testNotEquivalent3",
+        "testCombine1",
+        "testCombine3",
+        "testUnion4",
+        "testUnion5",
+        "testUnion8",
+        "testUnion9",
+        "testUnion10",
+        "testUnion11",
+        "testBooleanLogicAnd3",
+        "testBooleanLogicAnd7",
+        "testBooleanLogicAnd8",
+        "testBooleanLogicAnd9",
+        "testBooleanLogicOr6",
+        "testBooleanLogicOr7",
+        "testBooleanLogicOr8",
+        "testBooleanLogicOr9",
+        "testBooleanLogicXOr1",
+        "testBooleanLogicXOr2",
+        "testBooleanLogicXOr3",
+        "testBooleanLogicXOr4",
+        "testBooleanLogicXOr5",
+        "testBooleanLogicXOr6",
+        "testBooleanLogicXOr7",
+        "testBooleanLogicXOr8",
+        "testBooleanLogicXOr9",
+        "testBooleanImplies3",
+        "testBooleanImplies6",
+        "testBooleanImplies7",
+        "testBooleanImplies8",
+        "testBooleanImplies9",
+        "testPlus4",
+        "testExp1",
+        "testExp2",
+        "testExp3",
+        "testPower1",
+        "testPower2",
+        "testTruncate1",
+        "testTruncate2",
+        "testTruncate3",
+        "testPrecedence6",
+        "testType1",
+        "testType1a",
+        "testType2",
+        "testType2a",
+        "testType3",
+        "testType4",
+        "testType9",
+        "testType10",
+        "testType15",
+        "testType16",
+        "testType20",
+        "testType21",
+        "testType23",
+        "testTypeA1",
+        "testTypeA2",
+        "testTypeA3",
+        "testTypeA4",
+        "testTypeA",
+        "testConformsTo1",
+        "testConformsTo2",
+        "LowBoundaryDecimalDefault",
+        "LowBoundaryDecimal1",
+        "LowBoundaryDecimal2",
+        "LowBoundaryDecimal4",
+        "LowBoundaryNegDecimalDefault",
+        "LowBoundaryNegDecimal1",
+        "LowBoundaryNegDecimal2",
+        "LowBoundaryNegDecimal4",
+        "LowBoundaryDecimal7",
+        "LowBoundaryDecimal8",
+        "LowBoundaryDecimal9",
+        "LowBoundaryDecimal10",
+        "LowBoundaryDecimal11",
+        "LowBoundaryDecimal12",
+        "LowBoundaryDecimal13",
+        "LowBoundaryDecimal14",
+        "LowBoundaryDecimal15",
+        "LowBoundaryQuantity",
+        "LowBoundaryDateMonth",
+        "LowBoundaryDateTimeMillisecond1",
+        "LowBoundaryDateTimeMillisecond2",
+        "LowBoundaryDateTimeMillisecond3",
+        "LowBoundaryTimeMillisecond",
+        "HighBoundaryDecimalDefault",
+        "HighBoundaryDecimal1",
+        "HighBoundaryDecimal2",
+        "HighBoundaryDecimal4",
+        "HighBoundaryDecimal5",
+        "HighBoundaryDecimal6",
+        "HighBoundaryDecimal8",
+        "HighBoundaryDecimal9",
+        "HighBoundaryDecimal10",
+        "HighBoundaryDecimal11",
+        "HighBoundaryDecimal12",
+        "HighBoundaryDecimal13",
+        "HighBoundaryDecimal14",
+        "HighBoundaryDecimal15",
+        "HighBoundaryDecimal16",
+        "HighBoundaryDecimal",
+        "HighBoundaryQuantity",
+        "HighBoundaryDateMonth",
+        "HighBoundaryDateTimeMillisecond1",
+        "HighBoundaryDateTimeMillisecond2",
+        "HighBoundaryDateTimeMillisecond3",
+        "HighBoundaryTimeMillisecond",
+        "Comparable1",
+        "Comparable2",
+        "Comparable3",
+        "PrecisionDecimal",
+        "PrecisionYear",
+        "PrecisionDateTimeMilliseconds",
+        "PrecisionTimeMinutes",
+        "PrecisionTimeMilliseconds",
+        "from-zulip-1",
+        "testPeriodInvariantOld",
+        "testPeriodInvariantNew",
+        "testFHIRPathAsFunction17",
+        "testContainedId"
+      ]
+    },
+    {
+      "pattern": "result_logic: single_value_instead_of_empty",
+      "count": 92,
+      "error_types": {
+        "null": 92
+      },
+      "examples": [
+        {
+          "name": "testLiteralDateTimeYear",
+          "expression": "@2015T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testLiteralDateTimeMonth",
+          "expression": "@2015-02T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testLiteralDateTimeDay",
+          "expression": "@2015-02-04T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testLiteralDateTimeYear",
+        "testLiteralDateTimeMonth",
+        "testLiteralDateTimeDay",
+        "testLiteralDateTimeUTC",
+        "testLiteralDateTimeTimezoneOffset",
+        "testLiteralQuantityDecimal",
+        "testLiteralQuantityInteger",
+        "testLiteralQuantityDay",
+        "testLiteralIntegerGreaterThan",
+        "testLiteralDateTimeTZGreater",
+        "testLiteralDateTimeTZLess",
+        "testLiteralDateTimeTZEqualTrue",
+        "testLiteralUnicode",
+        "testExpressionsEqual",
+        "testIntegerBooleanNotTrue",
+        "testStringYearConvertsToDateTime",
+        "testStringMonthConvertsToDateTime",
+        "testStringHourConvertsToDateTime",
+        "testStringHourConvertsToTime",
+        "testStringDecimalConvertsToIntegerFalse",
+        "testDecimalLiteralToIntegerIsEmpty",
+        "testIntegerLiteralConvertsToQuantity",
+        "testDecimalLiteralConvertsToQuantity",
+        "testStringIntegerLiteralConvertsToQuantity",
+        "testStringQuantityLiteralConvertsToQuantity",
+        "testStringQuantityWeekConvertsToQuantity",
+        "testStringDecimalLiteralConvertsToQuantity",
+        "testBooleanLiteralConvertsToQuantity",
+        "testStringDecimalLiteralToQuantity",
+        "testStringLiteralToString",
+        "testBooleanLiteralToString",
+        "testQuantityLiteralWkToString",
+        "testQuantityLiteralWeekToString",
+        "testExists2",
+        "testExists5",
+        "testQuantity1",
+        "testQuantity2",
+        "testQuantity4",
+        "testQuantity5",
+        "testQuantity6",
+        "testQuantity7",
+        "testSelect1",
+        "testSelect2",
+        "testRepeat1",
+        "testIndexer2",
+        "testToInteger4",
+        "testStartsWith8",
+        "testStartsWith9",
+        "testEndsWith8",
+        "testEndsWith9",
+        "testContainsString8",
+        "testContainsString9",
+        "testMatchesCaseSensitive1",
+        "testMatchesEmpty2",
+        "testMatchesSingleLineMode1",
+        "testMatchesWithinUrl2",
+        "testMatchesWithinUrl1a",
+        "testReplaceMatches1",
+        "testReplaceMatches2",
+        "testReplaceMatches3",
+        "testReplaceMatches4",
+        "testReplaceMatches6",
+        "testReplaceMatches7",
+        "testEquality24",
+        "testEquality28",
+        "testNEquality18",
+        "testEquivalent11",
+        "testEquivalent22",
+        "testEquivalent23",
+        "testLessThan22",
+        "testLessOrEqual22",
+        "testUnion2",
+        "testUnion3",
+        "testBooleanLogicAnd4",
+        "testBooleanLogicAnd5",
+        "testBooleanLogicAnd6",
+        "testBooleanImplies2",
+        "testBooleanImplies4",
+        "testConcatenate2",
+        "testConcatenate3",
+        "testPrecedence4",
+        "testVariables1",
+        "testVariables2",
+        "testVariables3",
+        "testVariables4",
+        "testType11",
+        "testType13",
+        "testType22",
+        "testPolymorphicsA",
+        "testFHIRPathIsFunction3",
+        "testFHIRPathIsFunction5",
+        "testFHIRPathIsFunction7"
+      ]
+    },
+    {
+      "pattern": "binder: column_not_found_in_from",
+      "count": 65,
+      "error_types": {
+        "BinderException": 65
+      },
+      "examples": [
+        {
+          "name": "testDollarThis1",
+          "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
+          "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_ex"
+        },
+        {
+          "name": "testDollarThis2",
+          "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
+          "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_ex"
+        },
+        {
+          "name": "testDollarOrderAllowed",
+          "expression": "Patient.name.skip(1).given",
+          "error": "Binder Error: Referenced column \"name_item\" not found in FROM clause!\nCandidate bindings: \"cte_1_order\", \"result\"\n\nLINE 13:     FROM cte_2, LATERAL UNNEST(json_extract(name_item, '$.given[*]')) AS giv"
+        }
+      ],
+      "test_names": [
+        "testDollarThis1",
+        "testDollarThis2",
+        "testDollarOrderAllowed",
+        "testDollarOrderAllowedA",
+        "testCollectionNotEqualEmpty",
+        "testAllTrue3",
+        "testAllTrue4",
+        "testSubSetOf1",
+        "testSubSetOf2",
+        "testSuperSetOf1",
+        "testSuperSetOf2",
+        "testRepeat2",
+        "testFirstLast1",
+        "testFirstLast2",
+        "testTail2",
+        "testSkip4",
+        "testTake3",
+        "testTake4",
+        "testTake5",
+        "testTake6",
+        "testTake7",
+        "testIndexOf1",
+        "testIndexOf2",
+        "testIndexOf3",
+        "testIndexOf5",
+        "testIndexOf4",
+        "testIndexOf6",
+        "testSubstring1",
+        "testSubstring2",
+        "testSubstring3",
+        "testSubstring4",
+        "testSubstring5",
+        "testSubstring7",
+        "testSubstring8",
+        "testSubstring9",
+        "testReplace1",
+        "testReplace2",
+        "testReplace3",
+        "testReplace4",
+        "testReplace5",
+        "testReplace6",
+        "testLength1",
+        "testLength2",
+        "testLength3",
+        "testLength4",
+        "testLength5",
+        "testLength6",
+        "testSplit1",
+        "testSplit2",
+        "testSplit4",
+        "testEquality26",
+        "testEquality27",
+        "testNEquality20",
+        "testNEquality21",
+        "testEquivalent20",
+        "testEquivalent21",
+        "testNotEquivalent20",
+        "testNotEquivalent21",
+        "testCombine2",
+        "testExtension1",
+        "testExtension2",
+        "testExtension3",
+        "testFHIRPathIsFunction8",
+        "testFHIRPathIsFunction9",
+        "testFHIRPathIsFunction10"
+      ]
+    },
+    {
+      "pattern": "binder: other",
+      "count": 26,
+      "error_types": {
+        "BinderException": 26
+      },
+      "examples": [
+        {
+          "name": "testExpressions",
+          "expression": "Patient.name.select(given | family).distinct()",
+          "error": "Binder Error: In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list"
+        },
+        {
+          "name": "testQuantity9",
+          "expression": "2.0 'cm' * 2.0 'm' = 0.040 'm2'",
+          "error": "Binder Error: Could not choose a best candidate function for the function call \"*(STRING_LITERAL, STRING_LITERAL)\". In order to select one, please add explicit type casts.\n\tCandidate functions:\n\t*(SMA"
+        },
+        {
+          "name": "testCollectionBoolean5",
+          "expression": "iif(true, true, 1/0)",
+          "error": "Binder Error: Cannot mix values of type DOUBLE and BOOLEAN in CASE expression - an explicit cast is required\n\nLINE 3:     SELECT resource.id, resource, CASE WHEN TRUE IS NULL THEN NULL WHEN TRUE THEN "
+        }
+      ],
+      "test_names": [
+        "testExpressions",
+        "testQuantity9",
+        "testCollectionBoolean5",
+        "testCollectionBoolean6",
+        "testPlusDate1",
+        "testPlusDate2",
+        "testPlusDate3",
+        "testPlusDate4",
+        "testPlusDate5",
+        "testPlusDate6",
+        "testPlusDate7",
+        "testPlusDate8",
+        "testPlusDate9",
+        "testPlusDate10",
+        "testPlusDate11",
+        "testPlusDate12",
+        "testPlusDate13",
+        "testPlusDate15",
+        "testPlusDate18",
+        "testPlusDate19",
+        "testPlusDate20",
+        "testPlusDate21",
+        "testPlusDate22",
+        "testMinus5",
+        "testAbs3",
+        "testIndex"
+      ]
+    },
+    {
+      "pattern": "semantic_validation: should_fail_but_passes",
+      "count": 25,
+      "error_types": {
+        "ValueError": 1,
+        "parse": 2,
+        "BinderException": 7,
+        "null": 5,
+        "ConversionException": 3,
+        "ParserException": 1,
+        "translator_unsupported": 3,
+        "InvalidInputException": 1,
+        "FHIRPathTranslationError": 2
+      },
+      "examples": [
+        {
+          "name": "testComment7",
+          "expression": "2 + 2 /",
+          "error": "Unknown unary operator: /"
+        },
+        {
+          "name": "testComment8",
+          "expression": "2 + 2 /* not finished",
+          "error": "Unterminated block comment starting at line 1, column 7."
+        },
+        {
+          "name": "testLiteralIntegerNegative1Invalid",
+          "expression": "-1.convertsToInteger()",
+          "error": "Binder Error: No function matches the given name and argument types '-(BOOLEAN)'. You might need to add explicit type casts.\n\tCandidate functions:\n\t-(TINYINT) -> TINYINT\n\t-(TINYINT, TINYINT) -> TINYIN"
+        }
+      ],
+      "test_names": [
+        "testComment7",
+        "testComment8",
+        "testLiteralIntegerNegative1Invalid",
+        "testLiteralDecimalNegative01Invalid",
+        "testLiteralTimeUTC",
+        "testLiteralTimeTimezoneOffset",
+        "testLiteralDecimalLessThanInvalid",
+        "testNotInvalid",
+        "testSingle2",
+        "testStartsWithNonString1",
+        "testEndsWithNonString1",
+        "testContainsNonString1",
+        "testPlusDate14",
+        "testPlusDate16",
+        "testPlusDate17",
+        "testPlus6",
+        "testConcatenate4",
+        "testMinus4",
+        "testMinus6",
+        "testPrecedence1",
+        "testConformsTo3",
+        "from-zulip-2",
+        "testFHIRPathAsFunction21",
+        "testFHIRPathAsFunction23",
+        "testFHIRPathAsFunction24"
+      ]
+    },
+    {
+      "pattern": "result_logic: got_0_values",
+      "count": 23,
+      "error_types": {
+        "null": 23
+      },
+      "examples": [
+        {
+          "name": "testEmpty",
+          "expression": "Patient.link.empty()",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testIntegerLiteralToQuantity",
+          "expression": "1.toQuantity() = 1 '1'",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testDecimalLiteralToQuantity",
+          "expression": "1.0.toQuantity() = 1.0 '1'",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testEmpty",
+        "testIntegerLiteralToQuantity",
+        "testDecimalLiteralToQuantity",
+        "testStringIntegerLiteralToQuantity",
+        "testStringQuantityLiteralToQuantity",
+        "testStringQuantityDayLiteralToQuantity",
+        "testStringQuantityWeekLiteralToQuantity",
+        "testQuantity10",
+        "testQuantity11",
+        "testWhere2",
+        "testWhere3",
+        "testWhere4",
+        "testJoin",
+        "testIn1",
+        "testIn2",
+        "testIn3",
+        "testIn4",
+        "testContainsCollection1",
+        "testContainsCollection2",
+        "testContainsCollection3",
+        "testContainsCollection4",
+        "testPrecedence5",
+        "testFHIRPathAsFunction19"
+      ]
+    },
+    {
+      "pattern": "empty_result: None_instead_of_empty",
+      "count": 18,
+      "error_types": {
+        "null": 18
+      },
+      "examples": [
+        {
+          "name": "testPolymorphismIsA3",
+          "expression": "Observation.issued is instant",
+          "error": "Expected valid expression with empty result set."
+        },
+        {
+          "name": "testDateNotEqual",
+          "expression": "Patient.birthDate != @1974-12-25T12:34:00",
+          "error": "Expected valid expression with empty result set."
+        },
+        {
+          "name": "testDateTimeGreaterThanDate2",
+          "expression": "now() > today()",
+          "error": "Expected valid expression with empty result set."
+        }
+      ],
+      "test_names": [
+        "testPolymorphismIsA3",
+        "testDateNotEqual",
+        "testDateTimeGreaterThanDate2",
+        "testEquality2",
+        "testEquality19",
+        "testNEquality2",
+        "testNEquality13",
+        "testLessThan24",
+        "testLessThan25",
+        "testLessOrEqual24",
+        "testLessOrEqual25",
+        "testGreatorOrEqual24",
+        "testGreatorOrEqual25",
+        "testGreaterThan24",
+        "testGreaterThan25",
+        "testFHIRPathAsFunction11",
+        "testFHIRPathAsFunction13",
+        "testFHIRPathAsFunction15"
+      ]
+    },
+    {
+      "pattern": "empty_result: parse_instead_of_empty",
+      "count": 7,
+      "error_types": {
+        "parse": 7
+      },
+      "examples": [
+        {
+          "name": "LowBoundaryDecimal3",
+          "expression": "1.587.lowBoundary(-1)",
+          "error": "Unknown function 'lowBoundary' at line 1, column 7. Refer to the FHIRPath specification for supported functions."
+        },
+        {
+          "name": "LowBoundaryDecimal5",
+          "expression": "1.587.lowBoundary(32)",
+          "error": "Unknown function 'lowBoundary' at line 1, column 7. Refer to the FHIRPath specification for supported functions."
+        },
+        {
+          "name": "LowBoundaryNegDecimal3",
+          "expression": "(-1.587).lowBoundary(-1)",
+          "error": "Unknown function 'lowBoundary' at line 1, column 10. Refer to the FHIRPath specification for supported functions."
+        }
+      ],
+      "test_names": [
+        "LowBoundaryDecimal3",
+        "LowBoundaryDecimal5",
+        "LowBoundaryNegDecimal3",
+        "LowBoundaryNegDecimal5",
+        "LowBoundaryDecimal6",
+        "HighBoundaryDecimal3",
+        "HighBoundaryDecimal7"
+      ]
+    },
+    {
+      "pattern": "conversion: other",
+      "count": 6,
+      "error_types": {
+        "ConversionException": 6
+      },
+      "examples": [
+        {
+          "name": "testEquality23",
+          "expression": "@2012-04-15T15:00:00Z = @2012-04-15T10:00:00",
+          "error": "Conversion Error: invalid timestamp field format: \"@2012-04-15T15:00:00Z\", expected format is (YYYY-MM-DD HH:MM:SS[.US][\u00b1HH[:MM[:SS]]| ZONE])\n\nLINE 3:     SELECT resource.id, resource, ('@2012-04-15T1"
+        },
+        {
+          "name": "testNEquality17",
+          "expression": "@2012-04-15T15:00:00Z != @2012-04-15T10:00:00",
+          "error": "Conversion Error: invalid timestamp field format: \"@2012-04-15T15:00:00Z\", expected format is (YYYY-MM-DD HH:MM:SS[.US][\u00b1HH[:MM[:SS]]| ZONE])\n\nLINE 3:     SELECT resource.id, resource, ('@2012-04-15T1"
+        },
+        {
+          "name": "testLessThan23",
+          "expression": "@2018-03 < @2018-03-01",
+          "error": "Conversion Error: invalid date field format: \"2018-03\", expected format is (YYYY-MM-DD)\n\nLINE 3:     SELECT resource.id, resource, ('2018-03' < DATE '2018-03-01') AS result\n                           "
+        }
+      ],
+      "test_names": [
+        "testEquality23",
+        "testNEquality17",
+        "testLessThan23",
+        "testLessOrEqual23",
+        "testGreatorOrEqual23",
+        "testGreaterThan23"
+      ]
+    },
+    {
+      "pattern": "invalid_input: malformed_json",
+      "count": 5,
+      "error_types": {
+        "InvalidInputException": 5
+      },
+      "examples": [
+        {
+          "name": "testDateNotEqualTimezoneOffsetBefore",
+          "expression": "Patient.birthDate != @1974-12-25T12:34:00-10:00",
+          "error": "Invalid Input Error: Malformed JSON at byte 4 of input: unexpected content after document.  Input: \"1974-12-25\""
+        },
+        {
+          "name": "testDateNotEqualTimezoneOffsetAfter",
+          "expression": "Patient.birthDate != @1974-12-25T12:34:00+10:00",
+          "error": "Invalid Input Error: Malformed JSON at byte 4 of input: unexpected content after document.  Input: \"1974-12-25\""
+        },
+        {
+          "name": "testDateNotEqualUTC",
+          "expression": "Patient.birthDate != @1974-12-25T12:34:00Z",
+          "error": "Invalid Input Error: Malformed JSON at byte 4 of input: unexpected content after document.  Input: \"1974-12-25\""
+        }
+      ],
+      "test_names": [
+        "testDateNotEqualTimezoneOffsetBefore",
+        "testDateNotEqualTimezoneOffsetAfter",
+        "testDateNotEqualUTC",
+        "testFHIRPathAsFunction16",
+        "testFHIRPathAsFunction18"
+      ]
+    },
+    {
+      "pattern": "result_logic: got_3_values",
+      "count": 4,
+      "error_types": {
+        "null": 4
+      },
+      "examples": [
+        {
+          "name": "testNotEmpty",
+          "expression": "Patient.name.empty().not()",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testIif1",
+          "expression": "iif(Patient.name.exists(), 'named', 'unnamed') = 'named'",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testIif2",
+          "expression": "iif(Patient.name.empty(), 'unnamed', 'named') = 'named'",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testNotEmpty",
+        "testIif1",
+        "testIif2",
+        "testFHIRPathAsFunction22"
+      ]
+    },
+    {
+      "pattern": "result_logic: got_9_values",
+      "count": 4,
+      "error_types": {
+        "null": 4
+      },
+      "examples": [
+        {
+          "name": "testEquality25",
+          "expression": "name = name",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testNEquality19",
+          "expression": "name != name",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testEquivalent19",
+          "expression": "name ~ name",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testEquality25",
+        "testNEquality19",
+        "testEquivalent19",
+        "testNotEquivalent19"
+      ]
+    },
+    {
+      "pattern": "result_logic: got_2_values",
+      "count": 3,
+      "error_types": {
+        "null": 3
+      },
+      "examples": [
+        {
+          "name": "testTail1",
+          "expression": "(0 | 1 | 2).tail() = 1 | 2",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testSkip1",
+          "expression": "(0 | 1 | 2).skip(1) = 1 | 2",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testTake2",
+          "expression": "(0 | 1 | 2).take(2) = 0 | 1",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testTail1",
+        "testSkip1",
+        "testTake2"
+      ]
+    },
+    {
+      "pattern": "result_logic: got_5_values",
+      "count": 2,
+      "error_types": {
+        "null": 2
+      },
+      "examples": [
+        {
+          "name": "testPolarityPrecedence",
+          "expression": "-Patient.name.given.count() = -5",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testCollectionNotEmpty",
+          "expression": "Patient.name.given.empty().not()",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testPolarityPrecedence",
+        "testCollectionNotEmpty"
+      ]
+    },
+    {
+      "pattern": "conversion: type_conversion_failed",
+      "count": 2,
+      "error_types": {
+        "ConversionException": 2
+      },
+      "examples": [
+        {
+          "name": "testDecimalLiteralToInteger",
+          "expression": "'1.1'.toInteger() = {}",
+          "error": "Conversion Error: Could not convert string '[]' to INT32\n\nLINE 11: ...('1.1' AS VARCHAR))) IN ('false', 'f') THEN 0 ELSE NULL END = '[]') AS result\n                                                    "
+        },
+        {
+          "name": "testEquality3",
+          "expression": "true = {}",
+          "error": "Conversion Error: Could not convert string '[]' to BOOL\n\nLINE 3:     SELECT resource.id, resource, (TRUE = '[]') AS result\n                                                  ^"
+        }
+      ],
+      "test_names": [
+        "testDecimalLiteralToInteger",
+        "testEquality3"
+      ]
+    },
+    {
+      "pattern": "binder: no_function_matches",
+      "count": 2,
+      "error_types": {
+        "BinderException": 2
+      },
+      "examples": [
+        {
+          "name": "testToday2",
+          "expression": "today().toString().length() = 10",
+          "error": "Binder Error: No function matches the given name and argument types 'length(STRUCT(VARCHAR, \"NULL\"[], BOOLEAN))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tlength(VARCHAR) -> B"
+        },
+        {
+          "name": "testNow2",
+          "expression": "now().toString().length() > 10",
+          "error": "Binder Error: No function matches the given name and argument types 'length(STRUCT(VARCHAR, \"NULL\"[], BOOLEAN))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tlength(VARCHAR) -> B"
+        }
+      ],
+      "test_names": [
+        "testToday2",
+        "testNow2"
+      ]
+    },
+    {
+      "pattern": "function_signature: argument_count_mismatch",
+      "count": 1,
+      "error_types": {
+        "ValueError": 1
+      },
+      "examples": [
+        {
+          "name": "testPower3",
+          "expression": "(-1).power(0.5)",
+          "error": "Function 'power' requires exactly 2 arguments, got 1"
+        }
+      ],
+      "test_names": [
+        "testPower3"
+      ]
+    }
+  ],
+  "top_3_patterns": [
+    {
+      "pattern": "result_logic: none_result",
+      "count": 185,
+      "error_types": {
+        "ConversionException": 26,
+        "parse": 126,
+        "ParserException": 12,
+        "translator_unsupported": 10,
+        "semantic": 1,
+        "execution": 2,
+        "InvalidInputException": 6,
+        "ValueError": 2
+      },
+      "examples": [
+        {
+          "name": "testLiteralTimeHour",
+          "expression": "@T14.is(Time)",
+          "error": "Conversion Error: time field value out of range: \"14\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"
+        },
+        {
+          "name": "testDateNotEqualTimeSecond",
+          "expression": "Patient.birthDate != @T12:14:15",
+          "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)"
+        },
+        {
+          "name": "testDateNotEqualTimeMinute",
+          "expression": "Patient.birthDate != @T12:14",
+          "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)"
+        }
+      ],
+      "test_names": [
+        "testLiteralTimeHour",
+        "testDateNotEqualTimeSecond",
+        "testDateNotEqualTimeMinute",
+        "testStringYearConvertsToDate",
+        "testStringMonthConvertsToDate",
+        "testStringDayConvertsToDate",
+        "testExists4",
+        "testAllTrue1",
+        "testAllTrue2",
+        "testSubSetOf3",
+        "testCollectionBoolean2",
+        "testCollectionBoolean4",
+        "testDistinct2",
+        "testDistinct3",
+        "testDistinct5",
+        "testDistinct6",
+        "testRepeat3",
+        "testRepeat4",
+        "testRepeat5",
+        "testIndexer1",
+        "testSkip3",
+        "testIif3",
+        "testIif4",
+        "testIif9",
+        "testIif11",
+        "testToChars1",
+        "testMatchesEmpty",
+        "testMatchesEmpty3",
+        "testMatchesFullWithinUrl1",
+        "testMatchesFullWithinUrl3",
+        "testMatchesFullWithinUrl4",
+        "testMatchesFullWithinUrl1a",
+        "testMatchesFullWithinUrl2",
+        "testReplaceMatches5",
+        "testEncodeBase64A",
+        "testEncodeHex",
+        "testEncodeBase64B",
+        "testEncodeUrlBase64",
+        "testDecodeBase64A",
+        "testDecodeHex",
+        "testDecodeBase64B",
+        "testDecodeUrlBase64",
+        "testEscapeHtml",
+        "testEscapeJson",
+        "testUnescapeHtml",
+        "testUnescapeJson",
+        "testTrim1",
+        "testTrim2",
+        "testTrim3",
+        "testTrim4",
+        "testTrim5",
+        "testTrim6",
+        "testSplit3",
+        "testTrace1",
+        "testTrace2",
+        "testSort1",
+        "testSort2",
+        "testSort3",
+        "testSort4",
+        "testSort5",
+        "testSort6",
+        "testSort7",
+        "testSort8",
+        "testSort9",
+        "testSort10",
+        "testEquivalent3",
+        "testNotEquivalent3",
+        "testCombine1",
+        "testCombine3",
+        "testUnion4",
+        "testUnion5",
+        "testUnion8",
+        "testUnion9",
+        "testUnion10",
+        "testUnion11",
+        "testBooleanLogicAnd3",
+        "testBooleanLogicAnd7",
+        "testBooleanLogicAnd8",
+        "testBooleanLogicAnd9",
+        "testBooleanLogicOr6",
+        "testBooleanLogicOr7",
+        "testBooleanLogicOr8",
+        "testBooleanLogicOr9",
+        "testBooleanLogicXOr1",
+        "testBooleanLogicXOr2",
+        "testBooleanLogicXOr3",
+        "testBooleanLogicXOr4",
+        "testBooleanLogicXOr5",
+        "testBooleanLogicXOr6",
+        "testBooleanLogicXOr7",
+        "testBooleanLogicXOr8",
+        "testBooleanLogicXOr9",
+        "testBooleanImplies3",
+        "testBooleanImplies6",
+        "testBooleanImplies7",
+        "testBooleanImplies8",
+        "testBooleanImplies9",
+        "testPlus4",
+        "testExp1",
+        "testExp2",
+        "testExp3",
+        "testPower1",
+        "testPower2",
+        "testTruncate1",
+        "testTruncate2",
+        "testTruncate3",
+        "testPrecedence6",
+        "testType1",
+        "testType1a",
+        "testType2",
+        "testType2a",
+        "testType3",
+        "testType4",
+        "testType9",
+        "testType10",
+        "testType15",
+        "testType16",
+        "testType20",
+        "testType21",
+        "testType23",
+        "testTypeA1",
+        "testTypeA2",
+        "testTypeA3",
+        "testTypeA4",
+        "testTypeA",
+        "testConformsTo1",
+        "testConformsTo2",
+        "LowBoundaryDecimalDefault",
+        "LowBoundaryDecimal1",
+        "LowBoundaryDecimal2",
+        "LowBoundaryDecimal4",
+        "LowBoundaryNegDecimalDefault",
+        "LowBoundaryNegDecimal1",
+        "LowBoundaryNegDecimal2",
+        "LowBoundaryNegDecimal4",
+        "LowBoundaryDecimal7",
+        "LowBoundaryDecimal8",
+        "LowBoundaryDecimal9",
+        "LowBoundaryDecimal10",
+        "LowBoundaryDecimal11",
+        "LowBoundaryDecimal12",
+        "LowBoundaryDecimal13",
+        "LowBoundaryDecimal14",
+        "LowBoundaryDecimal15",
+        "LowBoundaryQuantity",
+        "LowBoundaryDateMonth",
+        "LowBoundaryDateTimeMillisecond1",
+        "LowBoundaryDateTimeMillisecond2",
+        "LowBoundaryDateTimeMillisecond3",
+        "LowBoundaryTimeMillisecond",
+        "HighBoundaryDecimalDefault",
+        "HighBoundaryDecimal1",
+        "HighBoundaryDecimal2",
+        "HighBoundaryDecimal4",
+        "HighBoundaryDecimal5",
+        "HighBoundaryDecimal6",
+        "HighBoundaryDecimal8",
+        "HighBoundaryDecimal9",
+        "HighBoundaryDecimal10",
+        "HighBoundaryDecimal11",
+        "HighBoundaryDecimal12",
+        "HighBoundaryDecimal13",
+        "HighBoundaryDecimal14",
+        "HighBoundaryDecimal15",
+        "HighBoundaryDecimal16",
+        "HighBoundaryDecimal",
+        "HighBoundaryQuantity",
+        "HighBoundaryDateMonth",
+        "HighBoundaryDateTimeMillisecond1",
+        "HighBoundaryDateTimeMillisecond2",
+        "HighBoundaryDateTimeMillisecond3",
+        "HighBoundaryTimeMillisecond",
+        "Comparable1",
+        "Comparable2",
+        "Comparable3",
+        "PrecisionDecimal",
+        "PrecisionYear",
+        "PrecisionDateTimeMilliseconds",
+        "PrecisionTimeMinutes",
+        "PrecisionTimeMilliseconds",
+        "from-zulip-1",
+        "testPeriodInvariantOld",
+        "testPeriodInvariantNew",
+        "testFHIRPathAsFunction17",
+        "testContainedId"
+      ]
+    },
+    {
+      "pattern": "result_logic: single_value_instead_of_empty",
+      "count": 92,
+      "error_types": {
+        "null": 92
+      },
+      "examples": [
+        {
+          "name": "testLiteralDateTimeYear",
+          "expression": "@2015T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testLiteralDateTimeMonth",
+          "expression": "@2015-02T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        },
+        {
+          "name": "testLiteralDateTimeDay",
+          "expression": "@2015-02-04T.is(DateTime)",
+          "error": "Unexpected evaluation outcome."
+        }
+      ],
+      "test_names": [
+        "testLiteralDateTimeYear",
+        "testLiteralDateTimeMonth",
+        "testLiteralDateTimeDay",
+        "testLiteralDateTimeUTC",
+        "testLiteralDateTimeTimezoneOffset",
+        "testLiteralQuantityDecimal",
+        "testLiteralQuantityInteger",
+        "testLiteralQuantityDay",
+        "testLiteralIntegerGreaterThan",
+        "testLiteralDateTimeTZGreater",
+        "testLiteralDateTimeTZLess",
+        "testLiteralDateTimeTZEqualTrue",
+        "testLiteralUnicode",
+        "testExpressionsEqual",
+        "testIntegerBooleanNotTrue",
+        "testStringYearConvertsToDateTime",
+        "testStringMonthConvertsToDateTime",
+        "testStringHourConvertsToDateTime",
+        "testStringHourConvertsToTime",
+        "testStringDecimalConvertsToIntegerFalse",
+        "testDecimalLiteralToIntegerIsEmpty",
+        "testIntegerLiteralConvertsToQuantity",
+        "testDecimalLiteralConvertsToQuantity",
+        "testStringIntegerLiteralConvertsToQuantity",
+        "testStringQuantityLiteralConvertsToQuantity",
+        "testStringQuantityWeekConvertsToQuantity",
+        "testStringDecimalLiteralConvertsToQuantity",
+        "testBooleanLiteralConvertsToQuantity",
+        "testStringDecimalLiteralToQuantity",
+        "testStringLiteralToString",
+        "testBooleanLiteralToString",
+        "testQuantityLiteralWkToString",
+        "testQuantityLiteralWeekToString",
+        "testExists2",
+        "testExists5",
+        "testQuantity1",
+        "testQuantity2",
+        "testQuantity4",
+        "testQuantity5",
+        "testQuantity6",
+        "testQuantity7",
+        "testSelect1",
+        "testSelect2",
+        "testRepeat1",
+        "testIndexer2",
+        "testToInteger4",
+        "testStartsWith8",
+        "testStartsWith9",
+        "testEndsWith8",
+        "testEndsWith9",
+        "testContainsString8",
+        "testContainsString9",
+        "testMatchesCaseSensitive1",
+        "testMatchesEmpty2",
+        "testMatchesSingleLineMode1",
+        "testMatchesWithinUrl2",
+        "testMatchesWithinUrl1a",
+        "testReplaceMatches1",
+        "testReplaceMatches2",
+        "testReplaceMatches3",
+        "testReplaceMatches4",
+        "testReplaceMatches6",
+        "testReplaceMatches7",
+        "testEquality24",
+        "testEquality28",
+        "testNEquality18",
+        "testEquivalent11",
+        "testEquivalent22",
+        "testEquivalent23",
+        "testLessThan22",
+        "testLessOrEqual22",
+        "testUnion2",
+        "testUnion3",
+        "testBooleanLogicAnd4",
+        "testBooleanLogicAnd5",
+        "testBooleanLogicAnd6",
+        "testBooleanImplies2",
+        "testBooleanImplies4",
+        "testConcatenate2",
+        "testConcatenate3",
+        "testPrecedence4",
+        "testVariables1",
+        "testVariables2",
+        "testVariables3",
+        "testVariables4",
+        "testType11",
+        "testType13",
+        "testType22",
+        "testPolymorphicsA",
+        "testFHIRPathIsFunction3",
+        "testFHIRPathIsFunction5",
+        "testFHIRPathIsFunction7"
+      ]
+    },
+    {
+      "pattern": "binder: column_not_found_in_from",
+      "count": 65,
+      "error_types": {
+        "BinderException": 65
+      },
+      "examples": [
+        {
+          "name": "testDollarThis1",
+          "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
+          "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_ex"
+        },
+        {
+          "name": "testDollarThis2",
+          "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
+          "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_ex"
+        },
+        {
+          "name": "testDollarOrderAllowed",
+          "expression": "Patient.name.skip(1).given",
+          "error": "Binder Error: Referenced column \"name_item\" not found in FROM clause!\nCandidate bindings: \"cte_1_order\", \"result\"\n\nLINE 13:     FROM cte_2, LATERAL UNNEST(json_extract(name_item, '$.given[*]')) AS giv"
+        }
+      ],
+      "test_names": [
+        "testDollarThis1",
+        "testDollarThis2",
+        "testDollarOrderAllowed",
+        "testDollarOrderAllowedA",
+        "testCollectionNotEqualEmpty",
+        "testAllTrue3",
+        "testAllTrue4",
+        "testSubSetOf1",
+        "testSubSetOf2",
+        "testSuperSetOf1",
+        "testSuperSetOf2",
+        "testRepeat2",
+        "testFirstLast1",
+        "testFirstLast2",
+        "testTail2",
+        "testSkip4",
+        "testTake3",
+        "testTake4",
+        "testTake5",
+        "testTake6",
+        "testTake7",
+        "testIndexOf1",
+        "testIndexOf2",
+        "testIndexOf3",
+        "testIndexOf5",
+        "testIndexOf4",
+        "testIndexOf6",
+        "testSubstring1",
+        "testSubstring2",
+        "testSubstring3",
+        "testSubstring4",
+        "testSubstring5",
+        "testSubstring7",
+        "testSubstring8",
+        "testSubstring9",
+        "testReplace1",
+        "testReplace2",
+        "testReplace3",
+        "testReplace4",
+        "testReplace5",
+        "testReplace6",
+        "testLength1",
+        "testLength2",
+        "testLength3",
+        "testLength4",
+        "testLength5",
+        "testLength6",
+        "testSplit1",
+        "testSplit2",
+        "testSplit4",
+        "testEquality26",
+        "testEquality27",
+        "testNEquality20",
+        "testNEquality21",
+        "testEquivalent20",
+        "testEquivalent21",
+        "testNotEquivalent20",
+        "testNotEquivalent21",
+        "testCombine2",
+        "testExtension1",
+        "testExtension2",
+        "testExtension3",
+        "testFHIRPathIsFunction8",
+        "testFHIRPathIsFunction9",
+        "testFHIRPathIsFunction10"
+      ]
+    }
+  ],
+  "timestamp": "/mnt/d/fhir4ds3"
+}
