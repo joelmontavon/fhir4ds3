@@ -1028,6 +1028,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Delegate to dialect for time literal syntax
             sql_expr = self.dialect.generate_time_literal(str(node.value))
 
+        elif node.literal_type == "empty_collection":
+            # Empty collection literal {} - generate SQL for empty JSON array
+            # SP-100-003: Empty collections are represented as empty JSON arrays
+            # Use dialect-agnostic SQL for empty array
+            sql_expr = "'[]'  # Empty JSON array literal"
+
         else:
             # Unknown or unsupported literal type
             raise ValueError(
