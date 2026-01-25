@@ -4250,13 +4250,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 #    These are simple identifiers that reference columns in the CTE chain
                 #
                 # We should only use pending_fragment_result for case 1 (collection expressions)
-                pending = self.context.pending_fragment_result
-                pending_upper = pending.upper().strip() if pending else ""
+                # SP-100-fix: pending_fragment_result is a 3-tuple (expression, parent_path, is_multi_item)
+                pending_result = self.context.pending_fragment_result
+                # Extract expression from tuple if it's a tuple, otherwise use as-is
+                pending_expr = pending_result[0] if pending_result and isinstance(pending_result, tuple) else pending_result
+                pending_upper = pending_expr.upper().strip() if pending_expr else ""
                 is_collection_expr = (
-                    pending is not None and (
-                        pending.strip().startswith("(") or  # Subquery or grouped expression
-                        pending.strip().startswith("COALESCE") or  # Combine/union result
-                        pending.strip().startswith("CASE") or  # Conditional expression
+                    pending_expr is not None and (
+                        pending_expr.strip().startswith("(") or  # Subquery or grouped expression
+                        pending_expr.strip().startswith("COALESCE") or  # Combine/union result
+                        pending_expr.strip().startswith("CASE") or  # Conditional expression
                         "SELECT" in pending_upper or  # Contains SQL subquery
                         pending_upper.startswith("STRING_SPLIT") or  # split() result
                         pending_upper.startswith("REGEXP_SPLIT") or  # PostgreSQL split
@@ -4306,7 +4309,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         )
 
                     # Otherwise, it's a collection expression (union, combine, etc.)
-                    collection_expr = pending
+                    # SP-100-fix: Use pending_expr (extracted from tuple)
+                    collection_expr = pending_expr
 
                     # Get the JSON type to determine if it's an array
                     json_type_expr = self.dialect.get_json_type(collection_expr)
