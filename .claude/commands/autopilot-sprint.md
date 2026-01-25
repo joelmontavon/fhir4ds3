@@ -53,8 +53,14 @@ Fully automated ultra fast sprint workflow that identifies architectural gaps or
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 6. REVIEW & APPROVE     │ 7. TEST & VALIDATE  │ 8. CLOSE OUT  │
+│ 6. REVIEW & APPROVE     │ 7. TEST & VALIDATE  │ 8. VALIDATE   │
 │    code-reviewer        │    qa-tester       │  architect     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 9. MERGE WORKTREE      │ 10. CLEANUP       │ 11. DOCUMENT    │
+│    git-master           │    git-master     │  writer         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -203,41 +209,127 @@ cd ../sprint-SP-XXX
 2. **Validation report:** Test results, pass/fail, recommendations
 3. **Feedback:** Pass → approve, Fail → return to executor
 
-### Phase 8: Sprint Closeout
+### Phase 8: Sprint Validation
 
-**When all tasks complete:**
+**When all tasks complete and are approved:**
 
-1. **Sprint validation:**
+1. **Navigate to sprint worktree:**
    ```bash
    cd ../sprint-SP-XXX
+   ```
+
+2. **Run full test suite:**
+   ```bash
    python -m pytest tests/
    python tests/run_compliance.py
    ```
 
-2. **Merge to main:**
+3. **Verify all quality gates:**
+   - All tasks approved by code-reviewer
+   - All tests passing (100%)
+   - No merge conflicts in sprint branch
+
+4. **Report validation results:**
+   ```
+   ✅ Sprint Validation Complete
+   ✅ 15/15 tasks approved
+   ✅ 1,247 tests passing
+   ✅ Ready to merge to main
+   ```
+
+**If validation fails:**
+- Report failures to user
+- Create tasks for fixes
+- Return to Phase 5 (Execution) for remediation
+
+### Phase 9: Merge Worktree
+
+**CRITICAL:** Only proceed after Phase 8 validation passes
+
+**Use** `oh-my-claudecode:git-master` **skill for all merge operations**
+
+1. **Switch to main directory:**
    ```bash
    cd ../[main-directory]
+   ```
+
+2. **Checkout and update main branch:**
+   ```bash
    git checkout main
    git pull origin main
-   git merge sprint-SP-XXX --no-ff
+   ```
+
+3. **Merge sprint branch:**
+   ```bash
+   git merge sprint-SP-XXX --no-ff -m "Merge sprint-SP-XXX: [sprint name]"
+   ```
+
+4. **Resolve any conflicts** (if they arise):
+   - Use `git-master` for conflict resolution
+   - Test after resolution
+   - Commit the merge
+
+5. **Push to remote:**
+   ```bash
    git push origin main
    ```
 
-3. **Cleanup:**
+6. **Verify merge:**
+   ```bash
+   git log --oneline -5
+   ```
+
+**Report merge completion:**
+```
+✅ Sprint SP-XXX merged to main
+✅ Commit: abc1234
+✅ Pushed to origin/main
+```
+
+### Phase 10: Worktree Cleanup
+
+**After successful merge:**
+
+1. **Remove sprint worktree:**
    ```bash
    git worktree remove ../sprint-SP-XXX
+   ```
+
+2. **Prune worktree list:**
+   ```bash
    git worktree prune
    ```
 
-4. **Documentation:** Sprint summary, task archive, retrospective
+3. **Verify cleanup:**
+   ```bash
+   git worktree list
+   ```
+
+4. **Delete sprint branch** (optional, after confirmation):
+   ```bash
+   git branch -d sprint-SP-XXX
+   ```
+
+### Phase 11: Documentation
+
+**Final sprint documentation:**
+
+1. **Sprint summary:** `project-docs/plans/archived-sprints/SP-XXX-summary.md`
+2. **Task archive:** Move task documents to archived-sprints/
+3. **Retrospective:** Lessons learned, metrics, improvements
 
 ## Git Workflow Summary
 
 ```bash
-# Sprint Setup
+# ──────────────────────────────────────────────────────────────
+# SPRINT SETUP (Phase 5)
+# ──────────────────────────────────────────────────────────────
 git worktree add ../sprint-SP-XXX sprint/SP-XXX
+cd ../sprint-SP-XXX
 
-# Per-Task (parallel)
+# ──────────────────────────────────────────────────────────────
+# PER-TASK WORKFLOW (Phase 5-6, Parallel)
+# ──────────────────────────────────────────────────────────────
 git checkout -b SP-XXX-YYY-[task-name]
 # ... implement and test ...
 git commit -m "feat(scope): description (Task: SP-XXX-YYY)"
@@ -245,13 +337,30 @@ git checkout sprint-SP-XXX
 
 # Review (if approved)
 git merge SP-XXX-YYY-[task-name] --no-ff
+git branch -d SP-XXX-YYY-[task-name]
 
-# Sprint Completion
+# ──────────────────────────────────────────────────────────────
+# SPRINT VALIDATION (Phase 8)
+# ──────────────────────────────────────────────────────────────
+cd ../sprint-SP-XXX
+python -m pytest tests/
+python tests/run_compliance.py
+
+# ──────────────────────────────────────────────────────────────
+# MERGE WORKTREE TO MAIN (Phase 9) ⭐ KEY STEP
+# ──────────────────────────────────────────────────────────────
+cd ../[main-directory]
 git checkout main
-git merge sprint-SP-XXX --no-ff
+git pull origin main
+git merge sprint-SP-XXX --no-ff -m "Merge sprint-SP-XXX: [description]"
 git push origin main
+
+# ──────────────────────────────────────────────────────────────
+# WORKTREE CLEANUP (Phase 10)
+# ──────────────────────────────────────────────────────────────
 git worktree remove ../sprint-SP-XXX
 git worktree prune
+git branch -d sprint-SP-XXX  # optional
 ```
 
 ## Agent Orchestration
@@ -265,7 +374,10 @@ git worktree prune
 | **Execution** | executor, executor-high | sonnet/opus | **✅ ULTRAPILOT** |
 | Review | code-reviewer | opus | ✅ Yes |
 | Testing | qa-tester | sonnet | ✅ Yes |
-| Closeout | architect | opus | No |
+| Sprint Validation | architect | opus | No |
+| **Merge Worktree** | git-master | - | No |
+| Cleanup | git-master | - | No |
+| Documentation | writer | haiku | No |
 
 ## Progress Tracking
 
@@ -362,7 +474,16 @@ git worktree prune
    ⚠️ BLOCKER: Task SP-XXX-007 has merge conflicts. Awaiting guidance.
    ```
 
-8. **Completion:** Final summary with deliverables
+8. **Merge Phase Progress:** Report during worktree merge (Phase 9)
+   ```
+   🔀 Phase 9: Merging worktree to main...
+      → Switched to main branch
+      → Merging sprint-SP-XXX...
+      → Merge complete: abc1234
+      → Pushed to origin/main
+   ```
+
+9. **Completion:** Final summary with deliverables
    ```
    🎉 Sprint SP-XXX Complete!
    ✅ 15/15 tasks approved
@@ -376,7 +497,9 @@ git worktree prune
 
 1. **Sprint Planning:** Present plan, request approval
 2. **Per-Task Review:** Approve/reject/needs-testing decisions
-3. **Sprint Completion:** Confirm merge and cleanup
+3. **Sprint Validation Confirm:** Confirm all tests passed before merge
+4. **Merge Confirmation:** Explicit approval before merging worktree to main
+5. **Cleanup Confirm:** Confirm worktree removal after successful merge
 
 ## Cancellation
 
@@ -454,4 +577,6 @@ User says "stop", "cancel", "abort":
 | Production QA | `oh-my-claudecode:qa-tester-high` | opus |
 | Build fixes | `oh-my-claudecode:build-fixer` | sonnet |
 | TDD guidance | `oh-my-claudecode:tdd-guide` | sonnet |
-| Git operations | `oh-my-claudecode:git-master` skill | - |
+| **Worktree merge to main** | `git-master` skill | - |
+| **Worktree cleanup** | `git-master` skill | - |
+| Documentation | `writer` | haiku |

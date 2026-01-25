@@ -21,24 +21,17 @@ Categorize and fix the top 3 patterns in the ~184 "result logic mismatch" test f
 
 ## Known Limitations
 
-### ANTLR Grammar Regeneration Blocked
+### Partial DateTime Literals with @ Prefix
 
-**Issue**: Grammar changes require ANTLR tool regeneration, which is blocked by lack of Java in the current environment.
+**Issue**: Literal expressions like `@2015T`, `@2015-02T` require parser library updates that are beyond the current scope.
 
 **Impact**:
-- Cannot modify FHIRPath grammar files (.g4) without Java runtime
-- Grammar changes would require regenerating parser/lexer files
-- Workaround: Use AST transformations and enhanced parsing where possible
+- String-to-DateTime conversion works: `'2015'.convertsToDateTime()` ✅
+- DateTime literals with `@` prefix require parser library regeneration
 
-**Files Affected**:
-- `fhir4ds/main/fhirpath/parser_core/fhirpath_py/FHIRPath.g4` (grammar file)
+**Workaround**: Use string conversion for partial dates: `'2015'.convertsToDateTime()`
 
-**Resolution Path**:
-1. Install Java runtime environment
-2. Run ANTLR tool to regenerate parser/lexer from grammar
-3. Or: Find workarounds using AST post-processing
-
-**Documented**: 2026-01-25 (SP-101 code review)
+**Note**: The temporal_parser.py has support for partial DateTime parsing, which can be leveraged in future if the parser library is regenerated.
 
 ## Requirements
 
