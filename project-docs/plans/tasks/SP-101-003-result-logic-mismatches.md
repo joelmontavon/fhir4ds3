@@ -17,6 +17,29 @@ Categorize and fix the top 3 patterns in the ~184 "result logic mismatch" test f
 **Issue**: Tests produce wrong values or types (not crashes/errors)
 **Status**: Uncategorized - root causes unknown
 
+---
+
+## Known Limitations
+
+### ANTLR Grammar Regeneration Blocked
+
+**Issue**: Grammar changes require ANTLR tool regeneration, which is blocked by lack of Java in the current environment.
+
+**Impact**:
+- Cannot modify FHIRPath grammar files (.g4) without Java runtime
+- Grammar changes would require regenerating parser/lexer files
+- Workaround: Use AST transformations and enhanced parsing where possible
+
+**Files Affected**:
+- `fhir4ds/main/fhirpath/parser_core/fhirpath_py/FHIRPath.g4` (grammar file)
+
+**Resolution Path**:
+1. Install Java runtime environment
+2. Run ANTLR tool to regenerate parser/lexer from grammar
+3. Or: Find workarounds using AST post-processing
+
+**Documented**: 2026-01-25 (SP-101 code review)
+
 ## Requirements
 
 ### Phase 1: Categorization (4 hours)

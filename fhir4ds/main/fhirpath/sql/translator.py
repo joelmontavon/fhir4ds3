@@ -3910,13 +3910,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if fhir_type in {"integer", "positiveint", "unsignedint"}:
                 return "integer"
 
-        # SP-101-001: Fallback to text analysis for numeric literals
-        # This handles cases where the parser hasn't set proper metadata
-        text = getattr(node, "text", "").strip()
-        if text and self._is_numeric_literal(text):
-            if "." in text or "e" in text.lower():
-                return "decimal"
-            return "integer"
+        # SP-101-001: Fallback to text analysis for numeric literals ONLY
+        # This handles cases where the parser hasn't set proper metadata on literals.
+        # IMPORTANT: Only apply text-based inference to literal nodes to avoid
+        # incorrectly typing column references as integers/decimals based on name.
+        if getattr(node, "node_type", None) == "literal":
+            text = getattr(node, "text", "").strip()
+            if text and self._is_numeric_literal(text):
+                if "." in text or "e" in text.lower():
+                    return "decimal"
+                return "integer"
 
         return "unknown"
 
@@ -3959,24 +3962,6 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if inferred_type == "decimal":
             return expression
         return self.dialect.generate_type_cast(expression, "Decimal")
-
-    def _ensure_integer_expression(self, expression: str, inferred_type: str) -> str:
-        """Ensure expression is evaluated as integer for integer-only operations.
-
-        SP-101-001: Helper for integer-specific operations like modulo with integers.
-        - If type is integer, use expression as-is
-        - If type is decimal or unknown, cast to integer first
-
-        Args:
-            expression: SQL expression to cast
-            inferred_type: Inferred type ("integer", "decimal", or "unknown")
-
-        Returns:
-            SQL expression that evaluates to an integer value
-        """
-        if inferred_type == "integer":
-            return expression
-        return self.dialect.generate_type_cast(expression, "Integer")
 
     def _translate_temporal_quantity_subtraction(
         self,
@@ -5731,10 +5716,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Use regex to check if it matches a DateTime pattern
         # Pattern: YYYY(-MM(-DD(T(HH(:MM(:SS)?)?)?)?)?
         # Matches: 2015, 2015-02, 2015-02-04, 2015T, 2015-02T, 2015-02-04T, 2015-02-04T10:00:00
+        datetime_pattern = r"'^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?(T([0-9]{2}(:[0-9]{2})?(:[0-9]{2})?)?)?$'"
         return (
             f"CASE "
             f"WHEN {string_cast} IS NULL THEN FALSE "
-            f"WHEN REGEXP_MATCHES({string_cast}, '^[0-9]{{4}}(-[0-9]{{2}})?(-[0-9]{{2}})?(T([0-9]{{2}}(:[0-9]{{2}})?(:[0-9]{{2}})?)?)?$') THEN TRUE "
+            f"WHEN {self.dialect.generate_regex_match(string_cast, datetime_pattern)} THEN TRUE "
             f"ELSE FALSE "
             f"END"
         )
@@ -5746,11 +5732,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         string_cast = self.dialect.generate_type_cast(value_expr, "String")
         # Pattern: HH(:MM(:SS(.sss)?)?)?
-        # Note: Use single backslash for dot to match literal period in SQL regex
+        # Note: Use escaped backslash for literal period in regex
+        time_pattern = r"'^[0-9]{2}(:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?$'"
         return (
             f"CASE "
             f"WHEN {string_cast} IS NULL THEN FALSE "
-            f"WHEN REGEXP_MATCHES({string_cast}, '^[0-9]{{2}}(:[0-9]{{2}}(:[0-9]{{2}}(\\.[0-9]+)?)?)?$') THEN TRUE "
+            f"WHEN {self.dialect.generate_regex_match(string_cast, time_pattern)} THEN TRUE "
             f"ELSE FALSE "
             f"END"
         )

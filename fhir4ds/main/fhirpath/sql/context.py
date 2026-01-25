@@ -156,6 +156,18 @@ class TranslationContext:
     # Maps logical column names (like "result") to actual column aliases in CTE output
     # This is critical for chained operations like Patient.name.first().given where
     # the CTE outputs a column named "name_item" but subsequent code references "result"
+    #
+    # Lifetime and scoping:
+    # - Aliases are added when a CTE is created and a column is renamed (e.g., "result" -> "name_item")
+    # - Aliases persist through expression chains to allow subsequent operations to reference the renamed column
+    # - Aliases are NOT automatically cleared between function calls in the same chain
+    # - Aliases ARE cleared when context.reset() is called, typically at the start of a new translation
+    # - There is no nested scoping for aliases; once registered, an alias remains until explicitly cleared
+    #
+    # Example chain where aliases matter:
+    #   Patient.name.first().given
+    #   1. first() creates CTE with output column "name_item", registers alias "result" -> "name_item"
+    #   2. given() needs to access "result" but it resolves to "name_item" via this registry
     cte_column_aliases: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

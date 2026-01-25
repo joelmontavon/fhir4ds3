@@ -105,6 +105,10 @@ class _StubDialect:
         """Cast expression to double for stub dialect."""
         return f"TRY_CAST({expression} AS DOUBLE)"
 
+    def generate_regex_match(self, string_expr: str, regex_pattern: str) -> str:
+        """Generate regex matching SQL for stub dialect."""
+        return f"REGEXP_MATCHES({string_expr}, {regex_pattern})"
+
 
 @pytest.fixture()
 def translator():
@@ -723,3 +727,204 @@ class TestToString:
         node = _make_function("3.14.toString()", "toString")
         fragment = translator.visit_function_call(node)
         assert fragment.expression == "'3.14'"
+
+
+# ============================================================================
+# SP-101-003: convertsToDateTime and convertsToTime Tests
+# ============================================================================
+
+
+class TestConvertsToDateTime:
+    """Tests for convertsToDateTime() function - SP-101-003.
+
+    Tests partial date format support:
+    - Year only: '2015'
+    - Year-month: '2015-02'
+    - Year-month-day: '2015-02-04'
+    - With time: '2015-02-04T10:00:00'
+    """
+
+    parser = FHIRPathParser()
+
+    @classmethod
+    def _translate_expression(cls, translator: ASTToSQLTranslator, expression: str) -> SQLFragment:
+        ast = cls.parser.parse(expression).get_ast()
+        fragments = translator.translate(ast)
+        return fragments[-1]
+
+    def test_string_year_converts_to_datetime(self, translator):
+        """Test year-only string '2015'.convertsToDateTime() returns TRUE."""
+        node = _make_function("'2015'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Valid year literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_month_converts_to_datetime(self, translator):
+        """Test year-month string '2015-02'.convertsToDateTime() returns TRUE."""
+        node = _make_function("'2015-02'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Valid year-month literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_day_converts_to_datetime(self, translator):
+        """Test full date string '2015-02-04'.convertsToDateTime() returns TRUE."""
+        node = _make_function("'2015-02-04'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Valid full date literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_datetime_with_time_converts_to_datetime(self, translator):
+        """Test datetime with time '2015-02-04T10:00:00'.convertsToDateTime() returns TRUE."""
+        node = _make_function("'2015-02-04T10:00:00'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Valid datetime literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_invalid_datetime_format(self, translator):
+        """Test invalid format 'not-a-date'.convertsToDateTime() returns FALSE."""
+        node = _make_function("'not-a-date'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Invalid format should evaluate to FALSE
+        assert fragment.expression == "FALSE"
+
+    @pytest.mark.parametrize("dialect_fixture", ["duckdb_translator", "postgresql_translator"])
+    def test_converts_to_datetime_uses_dialect_regex_for_context(self, request, dialect_fixture):
+        """Test convertsToDateTime() uses dialect.generate_regex_match() for context references."""
+        translator = request.getfixturevalue(dialect_fixture)
+        # Use a context reference (not a literal) to trigger SQL generation
+        fragment = self._translate_expression(translator, "id.convertsToDateTime()")
+
+        # Should contain dialect-specific regex matching
+        dialect_name = translator.dialect.name
+        assert "CASE" in fragment.expression
+        if dialect_name == "DUCKDB":
+            assert "regexp_matches" in fragment.expression
+        elif dialect_name == "POSTGRESQL":
+            assert " ~ " in fragment.expression  # PostgreSQL uses ~ operator
+
+    def test_converts_to_datetime_context_reference_generates_sql(self, translator):
+        """Test convertsToDateTime() on context reference generates CASE expression."""
+        # Use stub dialect's extract method for context reference
+        fragment = self._translate_expression(translator, "id.convertsToDateTime()")
+        # Context reference should generate SQL with CASE
+        assert "CASE" in fragment.expression
+        # Verify dialect method was used (should see regex matching - uppercase for stub)
+        assert ("REGEXP_MATCHES" in fragment.expression or "regexp_matches" in fragment.expression or " ~ " in fragment.expression)
+
+
+class TestConvertsToTime:
+    """Tests for convertsToTime() function - SP-101-003.
+
+    Tests partial time format support:
+    - Hour only: '14'
+    - Hour-minute: '14:34'
+    - Hour-minute-second: '14:34:28'
+    - With milliseconds: '14:34:28.123'
+    """
+
+    parser = FHIRPathParser()
+
+    @classmethod
+    def _translate_expression(cls, translator: ASTToSQLTranslator, expression: str) -> SQLFragment:
+        ast = cls.parser.parse(expression).get_ast()
+        fragments = translator.translate(ast)
+        return fragments[-1]
+
+    def test_string_hour_converts_to_time(self, translator):
+        """Test hour-only string '14'.convertsToTime() returns TRUE."""
+        node = _make_function("'14'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Valid hour literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_minute_converts_to_time(self, translator):
+        """Test hour-minute string '14:34'.convertsToTime() returns TRUE."""
+        node = _make_function("'14:34'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Valid hour-minute literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_second_converts_to_time(self, translator):
+        """Test full time string '14:34:28'.convertsToTime() returns TRUE."""
+        node = _make_function("'14:34:28'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Valid full time literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_millisecond_converts_to_time(self, translator):
+        """Test time with milliseconds '14:34:28.123'.convertsToTime() returns TRUE."""
+        node = _make_function("'14:34:28.123'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Valid time with milliseconds literal should evaluate to TRUE
+        assert fragment.expression == "TRUE"
+
+    def test_string_invalid_time_format(self, translator):
+        """Test invalid format 'not-a-time'.convertsToTime() returns FALSE."""
+        node = _make_function("'not-a-time'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Invalid format should evaluate to FALSE
+        assert fragment.expression == "FALSE"
+
+    @pytest.mark.parametrize("dialect_fixture", ["duckdb_translator", "postgresql_translator"])
+    def test_converts_to_time_uses_dialect_regex_for_context(self, request, dialect_fixture):
+        """Test convertsToTime() uses dialect.generate_regex_match() for context references."""
+        translator = request.getfixturevalue(dialect_fixture)
+        # Use a context reference (not a literal) to trigger SQL generation
+        fragment = self._translate_expression(translator, "id.convertsToTime()")
+
+        # Should contain dialect-specific regex matching
+        dialect_name = translator.dialect.name
+        assert "CASE" in fragment.expression
+        if dialect_name == "DUCKDB":
+            assert "regexp_matches" in fragment.expression
+        elif dialect_name == "POSTGRESQL":
+            assert " ~ " in fragment.expression  # PostgreSQL uses ~ operator
+
+    def test_converts_to_time_context_reference_generates_sql(self, translator):
+        """Test convertsToTime() on context reference generates CASE expression."""
+        # Use stub dialect's extract method for context reference
+        fragment = self._translate_expression(translator, "id.convertsToTime()")
+        # Context reference should generate SQL with CASE
+        assert "CASE" in fragment.expression
+        # Verify dialect method was used (should see regex matching - uppercase for stub)
+        assert ("REGEXP_MATCHES" in fragment.expression or "regexp_matches" in fragment.expression or " ~ " in fragment.expression)
+
+
+class TestConvertsToDateTimeTimeEdgeCases:
+    """Edge case tests for convertsToDateTime() and convertsToTime()."""
+
+    parser = FHIRPathParser()
+
+    @classmethod
+    def _translate_expression(cls, translator: ASTToSQLTranslator, expression: str) -> SQLFragment:
+        ast = cls.parser.parse(expression).get_ast()
+        fragments = translator.translate(ast)
+        return fragments[-1]
+
+    def test_empty_string_converts_to_datetime(self, translator):
+        """Test empty string ''.convertsToDateTime() returns FALSE."""
+        node = _make_function("''.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Empty string should evaluate to FALSE
+        assert fragment.expression == "FALSE"
+
+    def test_empty_string_converts_to_time(self, translator):
+        """Test empty string ''.convertsToTime() returns FALSE."""
+        node = _make_function("''.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Empty string should evaluate to FALSE
+        assert fragment.expression == "FALSE"
+
+    def test_partial_datetime_with_t_only(self, translator):
+        """Test year with T '2015T'.convertsToDateTime() returns TRUE."""
+        node = _make_function("'2015T'.convertsToDateTime()", "convertsToDateTime")
+        fragment = translator.visit_function_call(node)
+        # Pattern allows T with no time components
+        assert fragment.expression == "TRUE"
+
+    def test_time_with_single_digit_components(self, translator):
+        """Test time with single digit hour '9'.convertsToTime() should return FALSE."""
+        node = _make_function("'9'.convertsToTime()", "convertsToTime")
+        fragment = translator.visit_function_call(node)
+        # Pattern requires 2-digit hour, so single digit should fail
+        assert fragment.expression == "FALSE"
