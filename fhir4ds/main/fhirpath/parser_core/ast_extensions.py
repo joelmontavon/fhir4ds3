@@ -194,6 +194,7 @@ class EnhancedASTNode:
                         SP-023-006: Enhanced to handle FHIR temporal literals.
                         SP-100-003: Enhanced to handle empty collection literals.
                         SP-103-003: Enhanced to properly process escape sequences in string literals.
+                        SP-104-007: Enhanced to detect partial datetime literals from original source.
                         """
                         if not text:
                             return None, "unknown", None
@@ -205,11 +206,29 @@ class EnhancedASTNode:
                             # Empty collection marker - use special value to signal empty collection
                             return "{}[]", "empty_collection", None
 
+                        # SP-104-007: Check for partial datetime literals from original source
+                        # The ANTLR DATETIME lexer strips the 'T' suffix from @YYYYT patterns
+                        # We need to check the original expression to detect this
+                        original_source = self._get_original_source()
+                        if original_source and text.startswith('@'):
+                            # Check if the original source has a 'T' suffix that was stripped
+                            # Pattern: @YYYYT, @YYYY-MMT, @YYYY-MM-DDT (without time components)
+                            temporal_from_source = self._parse_partial_datetime_from_source(original_source)
+                            if temporal_from_source:
+                                literal_type = temporal_from_source.get("literal_type", "string")
+                                normalized_value = temporal_from_source.get("normalized", text.lstrip("@"))
+                                # Store the original source in temporal_info for the translator
+                                temporal_from_source["original_source"] = original_source
+                                return normalized_value, literal_type, temporal_from_source
+
                         # Handle FHIR temporal literals
                         temporal_info = self._parse_temporal_literal(text)
                         if temporal_info:
                             literal_type = temporal_info.get("literal_type", "string")
                             normalized_value = temporal_info.get("normalized", text.lstrip("@"))
+                            # Also preserve original source if available
+                            if original_source:
+                                temporal_info["original_source"] = original_source
                             return normalized_value, literal_type, temporal_info
 
                         # Handle string literals (quoted)
@@ -265,6 +284,57 @@ class EnhancedASTNode:
 
                         # Default to string for unrecognized
                         return text, "string", None
+
+                    def _get_original_source(self):
+                        """Get the original FHIRPath expression source text.
+
+                        SP-104-007: Retrieve the original expression from the enhanced_node's
+                        metadata to detect partial datetime literals that were stripped by ANTLR.
+
+                        The original_expression is now propagated to all child nodes during
+                        metadata creation, so it should be directly available in the current node.
+                        """
+                        if (hasattr(self, 'enhanced_node') and
+                            self.enhanced_node and
+                            self.enhanced_node.metadata and
+                            hasattr(self.enhanced_node.metadata, 'custom_attributes')):
+                            # Get original_expression from the current node's metadata
+                            return self.enhanced_node.metadata.custom_attributes.get('original_expression')
+                        return None
+
+                    def _parse_partial_datetime_from_source(self, original_source: str):
+                        """Detect partial datetime literal from original source text.
+
+                        SP-104-007: Check if the original source contains a partial datetime
+                        pattern (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT) that was stripped by ANTLR.
+
+                        Args:
+                            original_source: The original FHIRPath expression string
+
+                        Returns:
+                            Temporal info dict if partial datetime detected, None otherwise
+                        """
+                        import re
+                        if not original_source or not original_source.startswith('@'):
+                            return None
+
+                        # Look for temporal literal pattern in the source
+                        # Find all @... patterns in the source
+                        temporal_matches = re.finditer(r'@(\d{4}(?:-\d{2})?(?:-\d{2})?T?)(?![\d:-])', original_source)
+                        for match in temporal_matches:
+                            temporal_text = match.group(0)  # Full match including @
+                            body = match.group(1)  # Without @
+
+                            # Check if it ends with 'T' (partial datetime pattern)
+                            if body.endswith('T'):
+                                # Remove the trailing T to parse the date part
+                                body_without_t = body[:-1]
+                                # Parse as partial datetime
+                                partial_match = re.fullmatch(r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?", body_without_t)
+                                if partial_match:
+                                    return self._parse_partial_datetime_literal(temporal_text, body_without_t, partial_match)
+
+                        return None
 
                     def _parse_temporal_literal(self, text):
                         """Parse FHIR temporal literal returning metadata for range comparisons.

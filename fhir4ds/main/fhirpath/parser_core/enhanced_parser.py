@@ -464,21 +464,35 @@ class EnhancedFHIRPathParser:
     def _add_basic_metadata(self, ast: EnhancedASTNode, original_expression: str) -> None:
         """Add only essential metadata for basic functionality"""
         try:
+            # SP-104-007: Store original expression in root metadata for datetime workaround
+            # This preserves the original source text before ANTLR processing to detect
+            # partial datetime literals (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT) where the
+            # 'T' suffix is stripped by the ANTLR DATETIME lexer pattern
+            if ast.metadata and hasattr(ast.metadata, 'custom_attributes'):
+                ast.metadata.custom_attributes['original_expression'] = original_expression
+
             # Add minimal metadata required for basic operation
-            self._add_essential_metadata(ast)
+            # Pass original_expression to propagate to children
+            self._add_essential_metadata(ast, original_expression)
 
         except Exception as e:
             self.logger.error(f"Error adding basic metadata: {str(e)}")
 
-    def _add_essential_metadata(self, node: EnhancedASTNode) -> None:
+    def _add_essential_metadata(self, node: EnhancedASTNode, original_expression: Optional[str] = None) -> None:
         """Add only essential metadata required for basic functionality"""
         if not node.metadata:
             from .metadata_types import MetadataBuilder
             node.metadata = MetadataBuilder.create_node_metadata(node.node_type, node.text)
 
+        # SP-104-007: Propagate original_expression to child nodes
+        # This allows child literal nodes to access the original source text
+        # to detect partial datetime patterns that were stripped by ANTLR
+        if original_expression and hasattr(node.metadata, 'custom_attributes'):
+            node.metadata.custom_attributes['original_expression'] = original_expression
+
         # Recursively process children
         for child in node.children:
-            self._add_essential_metadata(child)
+            self._add_essential_metadata(child, original_expression)
 
     def _get_complexity_analysis(self, ast: EnhancedASTNode) -> Optional[Dict[str, Any]]:
         """Lazy complexity analysis - only compute when needed"""
