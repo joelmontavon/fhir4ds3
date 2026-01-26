@@ -930,10 +930,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Returns:
             True if node is an empty collection literal
         """
-        if isinstance(node, LiteralNode):
-            # Check for empty collection marker: text is '{}' or value is {}
-            return (node.text == '{}' or
-                    (isinstance(node.value, str) and node.value == '{}'))
+        # Check for empty collection by text or literal_type attribute
+        # This handles both LiteralNode and LiteralNodeAdapter
+        text = getattr(node, 'text', None)
+        literal_type = getattr(node, 'literal_type', None)
+
+        # Check by text value
+        if text == '{}':
+            return True
+
+        # Check by literal_type (for LiteralNodeAdapter)
+        if literal_type == 'empty_collection':
+            return True
+
+        # Check by value attribute
+        value = getattr(node, 'value', None)
+        if isinstance(value, str) and value == '{}':
+            return True
+
         return False
 
     def _translate_empty_collection(self, context: str = "default") -> str:
@@ -2932,12 +2946,28 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 left_is_empty = left_metadata.get("is_empty_collection") is True
                 right_is_empty = right_metadata.get("is_empty_collection") is True
 
+                # SP-103-007: Validate that comparison operators (<, >, <=, >=) are not used on booleans
+                # According to FHIRPath spec, only = and != are allowed for boolean comparisons
+                comparison_operators = {"<", ">", "<=", ">="}
+                if operator_lower in comparison_operators:
+                    left_literal_type = left_metadata.get("literal_type")
+                    right_literal_type = right_metadata.get("literal_type")
+                    if left_literal_type == "boolean" or right_literal_type == "boolean":
+                        from ..exceptions import FHIRPathEvaluationError
+                        raise FHIRPathEvaluationError(
+                            f"Comparison operator '{operator_lower}' cannot be used with boolean values. "
+                            f"Only equality operators (=, !=) are supported for boolean comparisons."
+                        )
+
                 # SP-100-003: Handle empty collections in comparisons
-                # Empty collections don't match anything in comparisons
+                # SP-103-007: Comparisons with empty collections return empty collections
+                # According to FHIRPath spec, comparisons involving empty collections
+                # should return empty collections (not FALSE)
+                # {} = 5 -> {}, {} = {} -> {}, 5 = {} -> {}
                 if left_is_empty or right_is_empty:
-                    # Empty collections compared with anything return FALSE
-                    # {} = 5 -> FALSE, {} = {} -> FALSE, 5 = {} -> FALSE
-                    sql_expr = "FALSE"
+                    # Return NULL to represent empty collection result
+                    # This will be filtered out in the final result
+                    sql_expr = "NULL"
                 elif operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
                     sql_expr = self._generate_collection_comparison(
                         left_fragment.expression,

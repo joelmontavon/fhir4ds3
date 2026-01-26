@@ -1486,6 +1486,10 @@ class CTEManager:
         """
         select_statement = f"SELECT * FROM {final_cte.name}"
 
+        # SP-103-007: Filter out NULL results to represent empty collections
+        # This handles cases like {} = {} which should return empty results
+        select_statement += " WHERE result IS NOT NULL"
+
         # SP-020-DEBUG: Add ORDER BY if ordering columns are present
         if ordering_columns:
             order_by_clause = "ORDER BY " + ", ".join(ordering_columns)
