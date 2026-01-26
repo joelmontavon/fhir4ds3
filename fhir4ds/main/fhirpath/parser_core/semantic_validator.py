@@ -665,6 +665,11 @@ class SemanticValidator:
         # Pattern: ends with operator (+, -, *, /, |, &, =, !=, <, >, <=, >=, ~, etc.)
         trimmed = raw_expression.strip()
 
+        # Special case: if expression ends with '*/' (comment terminator), skip validation
+        # The '/' is part of the comment terminator, not a division operator
+        if re.search(r'\*/\s*$', trimmed):
+            return
+
         # List of binary operators that should not appear at the end of an expression
         binary_operators = [
             '+', '-', '*', '/', '|', '&', '=', '!=',
