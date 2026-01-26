@@ -37,8 +37,8 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     # Type conversion functions
     'convertsToBoolean', 'toBoolean', 'convertsToInteger', 'toInteger',
     'convertsToDecimal', 'toDecimal', 'convertsToString', 'toString',
-    'convertsToQuantity', 'toQuantity', 'convertsToDateTime', 'toDateTime',
-    'convertsToTime', 'toTime',
+    'convertsToQuantity', 'toQuantity', 'convertsToDate', 'toDate',
+    'convertsToDateTime', 'toDateTime', 'convertsToTime', 'toTime',
     # String functions
     'startsWith', 'endsWith', 'contains', 'substring', 'length', 'upper',
     'lower', 'matches', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',

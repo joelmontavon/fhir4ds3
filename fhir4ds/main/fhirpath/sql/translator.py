@@ -870,6 +870,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Will need full UCUM library support
         return None
 
+    def _evaluate_literal_to_date(self, value: Any) -> Optional[str]:
+        """Evaluate toDate() for literal values.
+
+        SP-103-006: Implement toDate() literal evaluation.
+        Converts a valid date string to ISO 8601 date format.
+        Only accepts date strings without time component.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            # Validate ISO 8601 date format (no time component)
+            stripped = value.strip()
+            # Pattern: YYYY, YYYY-MM, or YYYY-MM-DD (no 'T' or time allowed)
+            if re.match(r'^\d{4}(-\d{2}(-\d{2})?)?$', stripped):
+                # Ensure it doesn't have time component
+                if 'T' not in stripped:
+                    return stripped
+            return None
+        return None
+
     def _evaluate_literal_to_datetime(self, value: Any) -> Optional[str]:
         """Evaluate toDateTime() for literal values."""
         if value is None:
@@ -1990,6 +2010,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_converts_to_function(node, target_type="Decimal")
         elif function_name == "convertstoquantity":
             return self._translate_converts_to_function(node, target_type="Quantity")
+        elif function_name == "convertstodate":
+            return self._translate_converts_to_function(node, target_type="Date")
         elif function_name == "convertstodatetime":
             return self._translate_converts_to_function(node, target_type="DateTime")
         elif function_name == "convertstotime":
@@ -2004,6 +2026,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_to_decimal(node)
         elif function_name == "toquantity":
             return self._translate_to_quantity(node)
+        elif function_name == "todate":
+            return self._translate_to_date(node)
         elif function_name == "todatetime":
             return self._translate_to_datetime(node)
         elif function_name == "totime":
@@ -5969,6 +5993,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             return False
 
+        if target_type == "Date":
+            if isinstance(value, str):
+                stripped = value.strip()
+                # SP-103-006: Support Date formats (no time component)
+                # Accepts: YYYY, YYYY-MM, YYYY-MM-DD
+                # Pattern: Year required, month/day optional, no 'T' or time allowed
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)(?!T)$', stripped))
+            return False
+
         if target_type == "DateTime":
             if isinstance(value, str):
                 stripped = value.strip()
@@ -6000,6 +6033,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._build_converts_to_decimal_expression(value_expr)
         if target_type == "Quantity":
             return self._build_converts_to_quantity_expression(value_expr)
+        if target_type == "Date":
+            return self._build_converts_to_date_expression(value_expr)
         if target_type == "DateTime":
             return self._build_converts_to_datetime_expression(value_expr)
         if target_type == "Time":
@@ -6062,6 +6097,47 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """Generate SQL for convertsToDecimal() checks."""
         decimal_cast = self.dialect.generate_type_cast(value_expr, "Decimal")
         return f"CASE WHEN {decimal_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
+
+    def _build_converts_to_date_expression(self, value_expr: str) -> str:
+        """Generate SQL for convertsToDate() checks.
+
+        SP-103-006: Implement date conversion checking.
+        A value can convert to Date if:
+        - It's a string matching ISO 8601 date format (YYYY, YYYY-MM, YYYY-MM-DD)
+        - Does NOT include time component (no 'T' or time allowed)
+
+        According to FHIRPath spec:
+        - '2015' converts to Date (year only)
+        - '2015-02' converts to Date (year-month)
+        - '2015-02-04' converts to Date (full date)
+        - '2015T' does NOT convert to Date (has time separator)
+        - '2015-02-04T10:00' does NOT convert to Date (has time)
+        """
+        # First, try to cast as string
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Use regex to check if it matches a Date pattern
+        # Pattern: YYYY(-MM(-DD)?)? without 'T' (time separator)
+        # Matches: 2015, 2015-02, 2015-02-04
+        # Does NOT match: 2015T, 2015-02T, 2015-02-04T10:00:00
+        # Note: Using simple string matching instead of regex for better compatibility
+        # Check for: starts with 4 digits, optionally followed by -MM, optionally followed by -DD, and no 'T'
+        # The negative lookahead (?!T) doesn't work well in all SQL regex engines, so we use a different approach
+
+        # First check: matches basic date pattern (YYYY-MM-DD with optional parts)
+        date_pattern_basic = "^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?$"
+        # Second check: does NOT contain 'T' (time separator)
+        contains_t = "POSITION('T' IN " + trimmed_string + ") > 0"
+        regex_match = self.dialect.generate_regex_match(trimmed_string, "'" + date_pattern_basic + "'")
+
+        return (
+            "CASE "
+            "WHEN " + trimmed_string + " IS NULL THEN FALSE "
+            "WHEN " + regex_match + " AND NOT " + contains_t + " THEN TRUE "
+            "ELSE FALSE "
+            "END"
+        )
 
     def _build_converts_to_quantity_expression(self, value_expr: str) -> str:
         """Generate SQL for convertsToQuantity() checks.
@@ -6302,6 +6378,40 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 raise ValueError("toQuantity() requires a resolvable target expression")
 
             sql_expr = self._build_to_quantity_expression(value_expr)
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=dependencies
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_to_date(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate toDate() function to SQL conversion.
+
+        SP-103-006: Implement toDate() conversion.
+        Converts a value to a Date string (ISO 8601 format).
+        """
+        value_expr, dependencies, literal_value, snapshot, _, _ = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+
+        try:
+            if literal_value is not None:
+                result = self._evaluate_literal_to_date(literal_value)
+                sql_expr = self._to_sql_literal(result, "string") if result else "NULL"
+                return SQLFragment(
+                    expression=sql_expr,
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False
+                )
+
+            if not value_expr:
+                raise ValueError("toDate() requires a resolvable target expression")
+
+            sql_expr = self._build_to_date_expression(value_expr)
             return SQLFragment(
                 expression=sql_expr,
                 source_table=source_table,
@@ -6569,6 +6679,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # For now, always return NULL - Quantity conversion needs UCUM support
         # Will be enhanced in future iterations
         return "NULL"
+
+    def _build_to_date_expression(self, value_expr: str) -> str:
+        """Generate SQL for toDate() conversion.
+
+        SP-103-006: Implement toDate() SQL conversion.
+        Converts a value to a Date string (ISO 8601 format).
+        Only converts strings that match date format without time component.
+        """
+        # Cast to string first
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Check if it matches date pattern (YYYY, YYYY-MM, YYYY-MM-DD) without 'T'
+        # Use regex to validate and return the trimmed string if valid, NULL otherwise
+        date_pattern_basic = "^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?$"
+        # Check for time separator 'T'
+        contains_t = "POSITION('T' IN " + trimmed_string + ") > 0"
+        regex_match = self.dialect.generate_regex_match(trimmed_string, "'" + date_pattern_basic + "'")
+
+        return (
+            "CASE "
+            "WHEN " + regex_match + " AND NOT " + contains_t + " THEN " + trimmed_string + " "
+            "ELSE NULL "
+            "END"
+        )
 
     def _build_to_datetime_expression(self, value_expr: str) -> str:
         """Generate SQL for toDateTime() conversion."""
