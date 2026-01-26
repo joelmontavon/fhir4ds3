@@ -1,122 +1,176 @@
 {
   "total_tests": 934,
-  "passed_tests": 627,
-  "failed_tests": 307,
-  "compliance_percentage": 67.1,
-  "execution_time_seconds": 370.43,
+  "passed_tests": 545,
+  "failed_tests": 389,
+  "compliance_percentage": 58.35117773019272,
+  "execution_time_seconds": 286.71720480918884,
   "failed_tests_by_category": {
-    "Other": 78,
-    "Type Checking": 10,
-    "Unary Polarity": 31,
-    "Type Conversion": 9,
-    "DateTime Literals": 20,
-    "Comparison Operators": 44,
-    "Collection Functions": 20,
-    "Quantity Literals": 82,
-    "Arithmetic Operators": 13
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 26,
+      "failed": 46
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 48,
+      "failed": 68
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 64,
+      "failed": 77
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 60,
+      "failed": 53
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 247,
+      "failed": 91
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 19,
+      "failed": 9
+    }
   },
   "sample_failures": [
     {
-      "name": "testPolymorphismA",
-      "expression": "Observation.value.unit",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.unit'"
-    },
-    {
-      "name": "testPolymorphismIsA1",
-      "expression": "Observation.value.is(Quantity)",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.is(Quantity)'"
-    },
-    {
-      "name": "testPolymorphismIsA2",
-      "expression": "Observation.value is Quantity",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value is Quantity'"
-    },
-    {
-      "name": "testPolymorphismIsA3",
-      "expression": "Observation.issued is instant",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.issued is instant'"
-    },
-    {
-      "name": "testPolymorphismIsB",
-      "expression": "Observation.value.is(Period).not()",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.is(Period).not()'"
-    },
-    {
       "name": "testPolymorphismAsA",
       "expression": "Observation.value.as(Quantity).unit",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.as(Quantity).unit'"
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testPolymorphismAsAFunction",
-      "expression": "(Observation.value as Quantity).unit",
-      "error": "[parse] [FP070] parse stage failed for expression '(Observation.value as Quantity).unit'"
+      "name": "testLiteralDateTimeYear",
+      "expression": "@2015T.is(DateTime)",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testPolymorphismAsBFunction",
-      "expression": "Observation.value.as(Period).start",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.as(Period).start'"
+      "name": "testLiteralDateTimeMonth",
+      "expression": "@2015-02T.is(DateTime)",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testDollarThis1",
-      "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
-      "error": "[parse] [FP070] parse stage failed for expression 'Patient.name.given.where(substring($this.length()-3) = 'out')'"
-    },
-    {
-      "name": "testDollarThis2",
-      "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
-      "error": "[parse] [FP070] parse stage failed for expression 'Patient.name.given.where(substring($this.length()-3) = 'ter')'"
-    },
-    {
-      "name": "testLiteralBooleanTrue",
-      "expression": "true.convertsToBoolean()",
-      "error": "[parse] [FP070] parse stage failed for expression 'true.convertsToBoolean()'"
-    },
-    {
-      "name": "testLiteralBooleanFalse",
-      "expression": "false.convertsToBoolean()",
-      "error": "[parse] [FP070] parse stage failed for expression 'false.convertsToBoolean()'"
+      "name": "testLiteralDateTimeDay",
+      "expression": "@2015-02-04T.is(DateTime)",
+      "error": "Unexpected evaluation outcome."
     },
     {
       "name": "testLiteralTimeUTC",
       "expression": "@T14:34:28Z.is(Time)",
-      "error": "Expected semantic failure but expression was accepted",
-      "invalid_type": "execution"
+      "error": "Expected semantic failure but expression was accepted."
     },
     {
       "name": "testLiteralTimeTimezoneOffset",
       "expression": "@T14:34:28+10:00.is(Time)",
-      "error": "Expected semantic failure but expression was accepted",
-      "invalid_type": "execution"
+      "error": "Expected semantic failure but expression was accepted."
     },
     {
-      "name": "testLiteralQuantityDay",
-      "expression": "4 days.convertsToQuantity()",
-      "error": "[parse] [FP070] parse stage failed for expression '4 days.convertsToQuantity()'"
+      "name": "testLiteralQuantityDecimal",
+      "expression": "10.1 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testLiteralDecimalGreaterThanNonZeroTrue",
-      "expression": "Observation.value.value > 180.0",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 180.0'"
+      "name": "testLiteralQuantityInteger",
+      "expression": "10 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testLiteralDecimalGreaterThanZeroTrue",
-      "expression": "Observation.value.value > 0.0",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 0.0'"
+      "name": "testPolarityPrecedence",
+      "expression": "-Patient.name.given.count() = -5",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testLiteralDecimalGreaterThanIntegerTrue",
-      "expression": "Observation.value.value > 0",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 0'"
+      "name": "testLiteralIntegerGreaterThan",
+      "expression": "Patient.name.given.count() > -3",
+      "error": "Unexpected evaluation outcome."
     },
     {
-      "name": "testLiteralDecimalLessThanInteger",
-      "expression": "Observation.value.value < 190",
-      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value < 190'"
+      "name": "testDateNotEqual",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00",
+      "error": "Expected valid expression with empty result set."
+    },
+    {
+      "name": "testDateNotEqualTimezoneOffsetBefore",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00-10:00",
+      "error": "Expected valid expression with empty result set."
+    },
+    {
+      "name": "testDateNotEqualTimezoneOffsetAfter",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00+10:00",
+      "error": "Expected valid expression with empty result set."
+    },
+    {
+      "name": "testDateNotEqualUTC",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00Z",
+      "error": "Expected valid expression with empty result set."
     },
     {
       "name": "testDateNotEqualTimeSecond",
       "expression": "Patient.birthDate != @T12:14:15",
-      "error": "[execute] [FP070] execute stage failed for expression 'Patient.birthDate != @T12:14:15'"
+      "error": "Unexpected evaluation outcome."
+    },
+    {
+      "name": "testDateNotEqualTimeMinute",
+      "expression": "Patient.birthDate != @T12:14",
+      "error": "Unexpected evaluation outcome."
+    },
+    {
+      "name": "testDateTimeGreaterThanDate2",
+      "expression": "now() > today()",
+      "error": "Expected valid expression with empty result set."
+    },
+    {
+      "name": "testLiteralDateTimeTZGreater",
+      "expression": "@2017-11-05T01:30:00.0-04:00 > @2017-11-05T01:15:00.0-05:00",
+      "error": "Unexpected evaluation outcome."
+    },
+    {
+      "name": "testLiteralDateTimeTZLess",
+      "expression": "@2017-11-05T01:30:00.0-04:00 < @2017-11-05T01:15:00.0-05:00",
+      "error": "Unexpected evaluation outcome."
+    },
+    {
+      "name": "testLiteralDateTimeTZEqualTrue",
+      "expression": "@2017-11-05T01:30:00.0-04:00 = @2017-11-05T00:30:00.0-05:00",
+      "error": "Unexpected evaluation outcome."
     }
   ]
 }

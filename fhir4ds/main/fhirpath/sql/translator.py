@@ -473,6 +473,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # because temporal literals like @2015 are stored as DATE '2015-01-01'
                 # The original_literal preserves the "@2015" pattern for partial date detection
                 if original_literal and original_literal.startswith('@'):
+                    # SP-104-006: Workaround for ANTLR lexer stripping 'T' suffix from partial DateTimes
+                    # If original_literal is @YYYY (Date pattern) but we're checking for DateTime,
+                    # it might have been @YYYYT originally. Check if expression is a TIMESTAMP type.
+                    # This handles cases like @2015T.is(DateTime) where lexer strips the T.
+                    if normalized_type == 'datetime':
+                        # Check if the SQL expression is a TIMESTAMP (would be generated from @YYYYT)
+                        # If so, the original was likely a partial DateTime, not a Date
+                        if f"TIMESTAMP '" in expression or "TIMESTAMP '" in str(expression):
+                            # This is a TIMESTAMP literal, so it's a DateTime type
+                            return "true"
+
                     # Parse the temporal literal to determine its type
                     parsed = self.temporal_parser.parse(original_literal)
                     if parsed:

@@ -1,77 +1,14 @@
 {
-  "sprint_id": "SP-103",
   "active": true,
   "mode": "ultrapilot",
-  "phase": "parallel_execution",
-  "started_at": "2026-01-25T22:55:00Z",
-  "workers": [
-    {
-      "id": "w1",
-      "task_id": "SP-103-001",
-      "task_name": "DateTime Literal Parsing",
-      "status": "pending",
-      "owned_files": [
-        "fhir4ds/fhirpath/parser_core/literal_parser.py",
-        "fhir4ds/fhirpath/parser_core/semantic_validator.py",
-        "fhir4ds/fhirpath/sql/translators/literal_translator.py"
-      ],
-      "branch": "SP-103-001-datetime-literals",
-      "estimated_tests": 21
-    },
-    {
-      "id": "w2",
-      "task_id": "SP-103-002",
-      "task_name": "Unary Polarity Operator",
-      "status": "pending",
-      "owned_files": [
-        "fhir4ds/fhirpath/parser_core/expression_parser.py",
-        "fhir4ds/fhirpath/ast/nodes.py",
-        "fhir4ds/fhirpath/sql/translators/expression_translator.py"
-      ],
-      "branch": "SP-103-002-unary-polarity",
-      "estimated_tests": 32
-    },
-    {
-      "id": "w3",
-      "task_id": "SP-103-003",
-      "task_name": "Quantity Literals",
-      "status": "pending",
-      "owned_files": [
-        "fhir4ds/fhirpath/parser_core/literal_parser.py",
-        "fhir4ds/fhirpath/ucum/units.py",
-        "fhir4ds/fhirpath/functions/type_conversion.py"
-      ],
-      "branch": "SP-103-003-quantity-literals",
-      "estimated_tests": 80
-    },
-    {
-      "id": "w4",
-      "task_id": "SP-103-004",
-      "task_name": "Semantic Validation",
-      "status": "pending",
-      "owned_files": [
-        "fhir4ds/fhirpath/parser_core/semantic_validator.py"
-      ],
-      "branch": "SP-103-004-semantic-validation",
-      "estimated_tests": 2
-    },
-    {
-      "id": "w5",
-      "task_id": "SP-103-005",
-      "task_name": "Simple Arithmetic Fixes",
-      "status": "pending",
-      "owned_files": [
-        "run_baseline_compliance.py",
-        "fhir4ds/fhirpath/sql/translators/operator_translator.py"
-      ],
-      "branch": "SP-103-005-simple-arithmetic",
-      "estimated_tests": 13
-    }
-  ],
-  "shared_files": [],
-  "baseline_compliance": 66.8,
-  "target_compliance": 100.0,
-  "total_workers": 5,
-  "completed_workers": 0,
-  "results": []
+  "sprint": "SP-104",
+  "started_at": "2026-01-26T14:30:00Z",
+  "baseline_compliance": 67.1,
+  "baseline_passing": 627,
+  "target_compliance": 70.0,
+  "target_passing": 650,
+  "gap": 23,
+  "workers": [],
+  "phase": "initialization",
+  "status": "spawning_workers"
 }
