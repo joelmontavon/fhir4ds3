@@ -1399,6 +1399,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
+                metadata={"source_path": self._build_json_path(processed_components)},
             )
 
             self.fragments.append(final_fragment)
@@ -1769,12 +1770,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 sql_expr = f"COALESCE({', '.join(variant_exprs)})"
                 logger.debug(f"Generated polymorphic COALESCE for {poly_prop}: {sql_expr}")
 
+                # SP-103-004: Include source_path for type validation
+                field_path = '.'.join(normalized_components) if normalized_components else ''
+                source_path = "$." + field_path
                 return SQLFragment(
                     expression=sql_expr,
                     source_table=self.context.current_table,
                     requires_unnest=False,
                     is_aggregate=False,
-                    metadata={"is_json_string": True}
+                    metadata={"is_json_string": True, "source_path": source_path}
                 )
 
         # Check if we're accessing a FHIR primitive type field
@@ -1805,12 +1809,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Return SQL fragment with JSON extraction expression
         # This is not an unnest operation and not an aggregate
         # Mark as JSON-extracted string for type-aware comparison casting
+        # SP-103-004: Include source_path in metadata for type validation
+        source_path = "$." + field_path if field_path else json_path
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"is_json_string": True}
+            metadata={"is_json_string": True, "source_path": source_path}
         )
 
     def visit_generic(self, node: Any) -> SQLFragment:
@@ -2876,17 +2882,39 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     left_literal_type = left_metadata.get("literal_type")
                     right_literal_type = right_metadata.get("literal_type")
 
-                    # Cast left JSON string to match right literal type
-                    if left_is_json and right_is_literal and right_literal_type:
-                        left_expr = self._apply_safe_cast_for_type(
-                            left_expr, right_literal_type
-                        )
+                    # SP-103-004: Handle comparison of numeric JSON values with string literals
+                    # When comparing a path ending in .value (which should be numeric) with a
+                    # string literal, we need to cast to numeric type first to ensure proper
+                    # type validation. If the string literal is not a valid number, this will
+                    # cause a SQL execution error as expected by FHIRPath semantics.
 
-                    # Cast right JSON string to match left literal type
-                    if right_is_json and left_is_literal and left_literal_type:
-                        right_expr = self._apply_safe_cast_for_type(
-                            right_expr, left_literal_type
-                        )
+                    # Check if left is JSON numeric value and right is string literal
+                    if (left_is_json and right_is_literal and
+                        right_literal_type == "string" and
+                        left_metadata.get("source_path", "").endswith(".value")):
+                        # Try strict cast to DECIMAL - will error if right is not numeric
+                        left_expr = self.dialect.strict_cast_to_decimal(left_expr)
+
+                    # Check if right is JSON numeric value and left is string literal
+                    elif (right_is_json and left_is_literal and
+                          left_literal_type == "string" and
+                          right_metadata.get("source_path", "").endswith(".value")):
+                        # Try strict cast to DECIMAL - will error if left is not numeric
+                        right_expr = self.dialect.strict_cast_to_decimal(right_expr)
+
+                    else:
+                        # Standard safe casting for non-error cases
+                        # Cast left JSON string to match right literal type
+                        if left_is_json and right_is_literal and right_literal_type:
+                            left_expr = self._apply_safe_cast_for_type(
+                                left_expr, right_literal_type
+                            )
+
+                        # Cast right JSON string to match left literal type
+                        if right_is_json and left_is_literal and left_literal_type:
+                            right_expr = self._apply_safe_cast_for_type(
+                                right_expr, left_literal_type
+                            )
 
                     # SP-022-010: Handle datetime function comparisons
                     # When comparing a datetime function (today(), now(), timeOfDay())
