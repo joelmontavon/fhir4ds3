@@ -721,16 +721,72 @@ class CTEManager:
 
         columns.extend(ordering_columns)
 
+        # SP-105 Phase 2: Propagate _item columns from source CTEs throughout the chain
+        # This fixes "column not found" errors when combine/exclude reference columns
+        # that were available in earlier CTEs but not propagated forward
+        propagated_item_columns = set()
+        if source_table.startswith("cte_"):
+            # Check if any previous CTEs had _item columns that should be propagated
+            # We need to look at what columns are available in the source CTE
+            # For now, we conservatively preserve columns that are referenced in the expression
+            import re
+            # Find all _item column references in the expression
+            # Match both qualified (cte_X.name_item) and unqualified (name_item) references
+            item_refs = re.findall(r'\b(\w+_item)\b', expression)
+            for ref in item_refs:
+                # Check if this column is from the source CTE
+                # If the expression references just "name_item", it means the source CTE has it
+                propagated_item_columns.add(ref)
+
+            if propagated_item_columns:
+                logger.info(
+                    f"SP-105 Phase 2: Propagating _item columns from expression: {propagated_item_columns}"
+                )
+
+        # Track which columns we've already added to avoid duplicates
+        added_columns = set()
+
         # SP-105: Include the collection item column in SELECT if we need to preserve it
         # This fixes "Referenced column 'name_item' not found" after take()/first()/last()
         if preserve_item_column and item_column_name:
             # Add the item column to SELECT so subsequent operations can reference it
             # Also alias it as 'result' so the standard result column is available
             columns.append(f"{item_column_name} AS {result_alias}")
+            added_columns.add(item_column_name)
             logger.info(
                 f"SP-105: Preserved collection item column '{item_column_name}' as '{result_alias}'"
             )
         else:
+            # Check if fragment has explicit preserved_columns list (for combine/exclude)
+            if hasattr(fragment, 'preserved_columns') and fragment.preserved_columns:
+                # Add all preserved columns to SELECT (deduplicate)
+                for col_name in set(fragment.preserved_columns):
+                    # Skip if already added
+                    if col_name in added_columns:
+                        continue
+                    # Qualify column with source_table if not already qualified
+                    if '.' not in col_name and not col_name.startswith(source_table + '.'):
+                        qualified_col = f"{source_table}.{col_name}"
+                    else:
+                        qualified_col = col_name
+                    columns.append(qualified_col)
+                    added_columns.add(col_name)
+                    logger.info(
+                        f"SP-105 Phase 2: Preserving column '{qualified_col}' from preserved_columns list"
+                    )
+
+            # Add propagated _item columns from source CTEs (deduplicate)
+            for col_name in propagated_item_columns:
+                # Skip if already added (either directly or via preserved_columns)
+                if col_name in added_columns:
+                    continue
+                qualified_col = f"{source_table}.{col_name}"
+                columns.append(qualified_col)
+                added_columns.add(col_name)
+                logger.info(
+                    f"SP-105 Phase 2: Propagating column '{qualified_col}' from source CTE"
+                )
+
             # Standard case: add the expression as result
             columns.append(f"{expression} AS {result_alias}")
 

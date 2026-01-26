@@ -44,6 +44,10 @@ class SQLFragment:
             by the CTE Builder for dependency resolution and topological sorting.
         metadata: Extensible dictionary for additional metadata. Allows future
             enhancements without breaking changes to the dataclass structure.
+        preserved_columns: List of column names from previous CTEs that must be
+            preserved in the SELECT clause of CTEs wrapping this fragment. Used
+            by functions like combine() and exclude() that reference columns from
+            earlier in the CTE chain.
 
     Design Decisions:
         1. **Mutability**: SQLFragment is mutable to allow post-creation updates if
@@ -103,6 +107,7 @@ class SQLFragment:
     is_aggregate: bool = False
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    preserved_columns: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate SQLFragment after initialization.
@@ -127,6 +132,9 @@ class SQLFragment:
 
         if not isinstance(self.metadata, dict):
             raise ValueError("metadata must be a dictionary")
+
+        if not isinstance(self.preserved_columns, list):
+            raise ValueError("preserved_columns must be a list")
 
     def add_dependency(self, dependency: str) -> None:
         """Add a CTE dependency to this fragment.

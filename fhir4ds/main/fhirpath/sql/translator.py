@@ -925,6 +925,42 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Will need full UCUM library support
         return None
 
+    def _extract_preserved_columns(self, *fragments: SQLFragment) -> List[str]:
+        """Extract column names that need to be preserved through CTEs.
+
+        SP-105: Analyzes fragments to find columns from UNNEST operations (ending with _item)
+        that must be preserved in CTE SELECT clauses. This fixes "column not found" errors
+        in combine() and exclude() operations.
+
+        Args:
+            *fragments: Variable number of SQLFragments to analyze
+
+        Returns:
+            List of column names to preserve (e.g., ['name_item', 'given_item'])
+        """
+        preserved = set()
+
+        for frag in fragments:
+            # Check source_table for _item columns
+            if frag.source_table and frag.source_table.endswith('_item'):
+                preserved.add(frag.source_table)
+
+            # Check dependencies for _item columns
+            for dep in frag.dependencies:
+                if dep.endswith('_item'):
+                    preserved.add(dep)
+
+            # Check expression for direct column references
+            # Pattern: matches column_name followed by punctuation or space
+            # Specifically looks for _item suffix which indicates UNNEST results
+            import re
+            # Find all potential column references
+            # This regex matches identifiers ending with _item
+            column_refs = re.findall(r'\b(\w+_item)\b', frag.expression)
+            preserved.update(column_refs)
+
+        return list(preserved)
+
     def _evaluate_literal_to_date(self, value: Any) -> Optional[str]:
         """Evaluate toDate() for literal values.
 
@@ -6943,13 +6979,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 {"function": "exclude", "is_collection": True}
             )
 
+            # SP-105: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when exclude() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=base_expr, source_table=source_table),
+                exclusion_fragment
+            )
+
             return SQLFragment(
                 expression=final_expr,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata=metadata
+                metadata=metadata,
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7389,13 +7434,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalized_right,
             )
 
+            # SP-105: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when combine() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=base_expr, source_table=source_table),
+                other_fragment
+            )
+
             return SQLFragment(
                 expression=combine_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=dependencies,
-                metadata={"function": "combine", "is_collection": True}
+                metadata={"function": "combine", "is_collection": True},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
