@@ -121,3 +121,33 @@ class TestIifTranslation:
 
         sql = fragment.expression.lower()
         assert expected_snippet in sql
+
+    def test_iif_empty_collection_returns_false_result(self, stub_env):
+        """SP-100-002-Enhanced: Empty collection {} in criterion should evaluate to false."""
+        translator, parser = stub_env
+        fragment = _translate_expression(translator, parser, "iif({}, true, false)")
+
+        # Empty collection should optimize to return false-result directly
+        assert fragment.expression == "FALSE"
+        assert fragment.metadata.get("optimized") == "empty_collection_false"
+
+    def test_iif_empty_collection_without_false_returns_null(self, stub_env):
+        """SP-100-002-Enhanced: Empty collection {} with no false-result should return NULL."""
+        translator, parser = stub_env
+        fragment = _translate_expression(translator, parser, "iif({}, true)")
+
+        # Empty collection should optimize to return NULL directly
+        assert fragment.expression == "NULL"
+        assert fragment.metadata.get("optimized") == "empty_collection_null"
+
+    def test_iif_union_expression_in_criterion(self, stub_env):
+        """SP-100-002-Enhanced: Union expression {} | true in criterion should extract first value."""
+        translator, parser = stub_env
+        fragment = _translate_expression(translator, parser, "iif({} | true, true, false)")
+
+        # Union expression should extract first element using [0] indexing
+        sql = fragment.expression
+        assert "[0]" in sql
+        assert "CASE" in sql
+        # Should extract first element from union
+        assert "EXTRACT" in sql or "json_extract" in sql or "jsonb_extract" in sql

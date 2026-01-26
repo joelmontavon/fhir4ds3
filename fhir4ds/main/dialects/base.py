@@ -962,6 +962,40 @@ class DatabaseDialect(ABC):
         """Generate logical condition combination SQL."""
         pass
 
+    def generate_xor(self, left_condition: str, right_condition: str) -> str:
+        """Generate XOR (exclusive or) SQL.
+
+        XOR returns true if operands have different boolean values.
+        Empty collections are treated as false.
+
+        Truth table:
+          true XOR false = true
+          false XOR true = true
+          true XOR true = false
+          false XOR false = false
+
+        This is a thin dialect method - contains ONLY syntax differences.
+
+        Args:
+            left_condition: Left boolean SQL expression
+            right_condition: Right boolean SQL expression
+
+        Returns:
+            SQL expression performing XOR operation
+
+        Example:
+            DuckDB/PostgreSQL: ((left) OR (right)) AND NOT ((left) AND (right))
+
+        Note:
+            Both databases don't have native XOR operator, so we use the pattern:
+            (a OR b) AND NOT (a AND b)
+
+            This default implementation uses standard SQL patterns that work across
+            DuckDB and PostgreSQL. Dialects can override if database-specific
+            syntax is needed.
+        """
+        return f"(({left_condition}) OR ({right_condition})) AND NOT (({left_condition}) AND ({right_condition}))"
+
     @abstractmethod
     def generate_conditional_expression(self, condition: str, true_expr: str, false_expr: str) -> str:
         """Generate conditional expression SQL."""

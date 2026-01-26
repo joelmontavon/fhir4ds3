@@ -2395,6 +2395,71 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         pattern = r"\s*(-?\d+(?:\.\d+)?)\s*'([^']+)'\s*"
         return re.fullmatch(pattern, value or "")
 
+    def _build_implies_sql(
+        self,
+        left_sql: str,
+        left_is_empty: bool,
+        left_is_true_literal: bool,
+        left_is_false_literal: bool,
+        right_sql: str,
+        right_is_empty: bool,
+        right_metadata: dict,
+    ) -> str:
+        """Build SQL expression for Implies operator with empty collection handling.
+
+        The Implies operator (a implies b) is logically equivalent to (NOT a) OR b.
+        This method handles the complex empty collection semantics as specified in
+        the FHIRPath specification.
+
+        Empty collection handling:
+        - {} implies true -> true (empty antecedent is true)
+        - {} implies false -> {} (propagate empty)
+        - {} implies {} -> {} (propagate empty)
+        - true implies {} -> {} (propagate empty)
+        - false implies {} -> true (false implies anything)
+        - false implies anything -> true (false implies anything)
+
+        Args:
+            left_sql: SQL expression for the left operand (antecedent)
+            left_is_empty: Whether the left operand is an empty collection
+            left_is_true_literal: Whether the left operand is a TRUE boolean literal
+            left_is_false_literal: Whether the left operand is a FALSE boolean literal
+            right_sql: SQL expression for the right operand (consequent)
+            right_is_empty: Whether the right operand is an empty collection
+            right_metadata: Metadata dictionary for the right operand
+
+        Returns:
+            SQL expression implementing the Implies operator with proper empty
+            collection handling
+        """
+        if left_is_empty and right_is_empty:
+            # {} implies {} -> {} (propagate empty)
+            return "NULL"
+        elif left_is_empty and not right_is_empty:
+            # Check if right is false literal
+            right_is_false_literal = (
+                right_metadata.get("is_literal") is True
+                and right_metadata.get("literal_type") == "boolean"
+                and str(right_sql).upper() == "FALSE"
+            )
+            if right_is_false_literal:
+                # {} implies false -> {} (propagate empty)
+                return "NULL"
+            else:
+                # {} implies true -> true (empty antecedent is true)
+                # Also handles {} implies (non-false expression) -> (NOT NULL) OR expr -> expr
+                return right_sql
+        elif left_is_true_literal and right_is_empty:
+            # true implies {} -> {} (propagate empty)
+            return "NULL"
+        elif left_is_false_literal:
+            # false implies anything -> true
+            return "TRUE"
+        else:
+            # Standard implies: (NOT left) OR right
+            not_left = self.dialect.generate_boolean_not(left_sql)
+            return f"({not_left}) OR ({right_sql})"
+
     def visit_operator(self, node: OperatorNode) -> SQLFragment:
         """Translate operators to SQL.
 
@@ -2621,7 +2686,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 "and": "AND",
                 "or": "OR",
                 "xor": "XOR",
-                "implies": "OR NOT",  # A implies B ≡ (NOT A) OR B
+                "implies": "IMPLIES",  # Handled specially below with empty collection semantics
 
                 # Arithmetic operators
                 "+": "+",
@@ -2643,6 +2708,78 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     left_fragment.expression,
                     sql_operator,
                     right_fragment.expression
+                )
+            elif node.operator_type == "logical" and operator_lower == "xor":
+                # SP-100-009: XOR operator with empty collection semantics
+                # XOR returns true if operands have different boolean values
+                # Empty collections are treated as false
+                # Truth table with empty collections:
+                # - true xor false = true
+                # - false xor true = true
+                # - true xor true = false
+                # - false xor false = false
+                # - {} xor true -> false xor true = true (empty is false)
+                # - {} xor false -> false xor false = false (empty is false)
+                # - true xor {} -> true xor false = true (empty is false)
+                # - false xor {} -> false xor false = false (empty is false)
+                # - {} xor {} -> false xor false = false (both empty are false)
+
+                left_metadata = getattr(left_fragment, "metadata", {}) or {}
+                right_metadata = getattr(right_fragment, "metadata", {}) or {}
+                left_is_empty = left_metadata.get("is_empty_collection") is True
+                right_is_empty = right_metadata.get("is_empty_collection") is True
+
+                # For XOR, empty collections are treated as false
+                if left_is_empty and right_is_empty:
+                    # {} xor {} -> false xor false = false
+                    sql_expr = "FALSE"
+                elif left_is_empty:
+                    # {} xor right -> false xor right = NOT right (when right is boolean)
+                    # This simplifies to just NOT right since false XOR true = true
+                    # But we need to handle the actual XOR logic
+                    # false xor right = right (when right is boolean literal)
+                    # For non-literal expressions, use COALESCE to treat NULL as FALSE
+                    sql_expr = self.dialect.generate_xor(
+                        "FALSE",
+                        f"COALESCE({right_fragment.expression}, FALSE)"
+                    )
+                elif right_is_empty:
+                    # left xor {} -> left xor false = left (when left is boolean)
+                    sql_expr = self.dialect.generate_xor(
+                        f"COALESCE({left_fragment.expression}, FALSE)",
+                        "FALSE"
+                    )
+                else:
+                    # Standard XOR: use dialect method
+                    sql_expr = self.dialect.generate_xor(
+                        left_fragment.expression,
+                        right_fragment.expression
+                    )
+            elif node.operator_type == "logical" and operator_lower == "implies":
+                # SP-100-010: Implies operator with empty collection semantics
+                # a implies b is logically equivalent to (NOT a) OR b
+                # Empty collection handling is encapsulated in _build_implies_sql helper
+
+                left_metadata = getattr(left_fragment, "metadata", {}) or {}
+                right_metadata = getattr(right_fragment, "metadata", {}) or {}
+                left_is_empty = left_metadata.get("is_empty_collection") is True
+                right_is_empty = right_metadata.get("is_empty_collection") is True
+                left_is_true_literal = (left_metadata.get("is_literal") is True and
+                                        left_metadata.get("literal_type") == "boolean" and
+                                        str(left_fragment.expression).upper() == "TRUE")
+                left_is_false_literal = (left_metadata.get("is_literal") is True and
+                                         left_metadata.get("literal_type") == "boolean" and
+                                         str(left_fragment.expression).upper() == "FALSE")
+
+                # Build implies SQL using helper method
+                sql_expr = self._build_implies_sql(
+                    left_sql=left_fragment.expression,
+                    left_is_empty=left_is_empty,
+                    left_is_true_literal=left_is_true_literal,
+                    left_is_false_literal=left_is_false_literal,
+                    right_sql=right_fragment.expression,
+                    right_is_empty=right_is_empty,
+                    right_metadata=right_metadata,
                 )
             elif node.operator_type == "comparison":
                 left_metadata = getattr(left_fragment, "metadata", {}) or {}
@@ -2816,6 +2953,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         2. Translating each operand exactly once
         3. Building a single SQL expression that combines all elements linearly
 
+        SP-100-007: Save and restore context for each operand to prevent path pollution.
+        When translating union operands like (given | family), each operand must be
+        evaluated from the same base context, not accumulating path modifications.
+
         Args:
             node: The top-level OperatorNode for the union chain
 
@@ -2831,11 +2972,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         operand_nodes = self._collect_union_operands(node)
         logger.debug("Collected %d union operands from chain", len(operand_nodes))
 
+        # SP-100-007: Save context state before translating operands
+        # This prevents path pollution where each operand accumulates
+        # the path modifications from previous operands.
+        saved_path = self.context.parent_path.copy()
+        saved_table = self.context.current_table
+
         # Translate each operand exactly once
         operand_fragments: List[SQLFragment] = []
         for operand_node in operand_nodes:
+            # SP-100-007: Restore context before each translation
+            # Each operand starts from the same base context
+            self.context.parent_path = saved_path.copy()
+            self.context.current_table = saved_table
+
             fragment = self.visit(operand_node)
             operand_fragments.append(fragment)
+
+        # SP-100-007: Restore context after all translations
+        # The final context should reflect the original state before union processing
+        self.context.parent_path = saved_path
+        self.context.current_table = saved_table
 
         # Handle degenerate cases
         if len(operand_fragments) == 0:
@@ -5162,6 +5319,46 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             criterion_fragment = self.visit(criterion_node)
             criterion_sql = criterion_fragment.expression
 
+            # SP-100-002-Enhanced: Handle empty collections and union expressions in criterion
+            # Empty collections {} should evaluate to FALSE in boolean context
+            # Union expressions like {} | true should reduce to the first non-empty value
+            criterion_is_empty_collection = (
+                criterion_fragment.metadata.get('literal_type') == 'empty_collection'
+            )
+            criterion_is_union = criterion_fragment.metadata.get('operator') == 'union'
+
+            if criterion_is_empty_collection:
+                # Empty collection {} evaluates to FALSE in boolean context
+                # Directly return the false-result branch
+                if false_result_node:
+                    false_result_fragment = self.visit(false_result_node)
+                    return SQLFragment(
+                        expression=false_result_fragment.expression,
+                        source_table=snapshot["current_table"],
+                        requires_unnest=false_result_fragment.requires_unnest,
+                        is_aggregate=false_result_fragment.is_aggregate,
+                        dependencies=false_result_fragment.dependencies,
+                        metadata={"function": "iif", "optimized": "empty_collection_false"}
+                    )
+                else:
+                    # No false-result, return NULL (empty collection)
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=snapshot["current_table"],
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=[],
+                        metadata={"function": "iif", "optimized": "empty_collection_null"}
+                    )
+            elif criterion_is_union:
+                # SP-100-002-Enhanced: Union expression in criterion
+                # Extract the first element from the union for boolean evaluation
+                # This handles cases like: iif({} | true, true, false) -> iif(true, true, false)
+                # Wrap the union expression and extract the first element
+                normalized_criterion = self._normalize_collection_expression(criterion_sql)
+                # Use dialect's extract_json_field with [0] to get first element
+                criterion_sql = f"({self.dialect.extract_json_field(normalized_criterion, '$[0]')})"
+
             # Translate true-result to SQL
             true_result_fragment = self.visit(true_result_node)
             true_result_sql = true_result_fragment.expression
@@ -5357,6 +5554,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 'XorExpression',
                 'ImpliesExpression',
                 'TypeExpression',
+                'UnionExpression',  # SP-100-002-Enhanced: Union can reduce to single boolean value
             }
             if node.node_type in boolean_expression_types:
                 return True

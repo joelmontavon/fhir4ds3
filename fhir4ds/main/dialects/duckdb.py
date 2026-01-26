@@ -1073,11 +1073,13 @@ class DuckDBDialect(DatabaseDialect):
         FHIRPath supports partial precision timestamps. This method pads them
         to the full YYYY-MM-DDTHH:MM:SS.fff format required by SQL TIMESTAMP.
 
+        SP-100-012: Enhanced to handle timezone suffixes (Z, +/-HH:MM).
+
         Args:
             timestamp_str: Partial or full timestamp string
 
         Returns:
-            Padded timestamp in full format
+            Padded timestamp in full format (without timezone suffix)
 
         Examples:
             @2015T → 2015-01-01T00:00:00
@@ -1086,9 +1088,24 @@ class DuckDBDialect(DatabaseDialect):
             @2015-02-04T14 → 2015-02-04T14:00:00
             @2015-02-04T14:30 → 2015-02-04T14:30:00
             @2015-02-04T14:30:45 → 2015-02-04T14:30:45 (no change)
+            @2015-02-04T14:30:45Z → 2015-02-04T14:30:45 (timezone stripped)
         """
         # Remove @ prefix if present
         ts = timestamp_str.lstrip('@')
+
+        # SP-100-012: Strip timezone suffix before processing
+        # DuckDB will handle timezone conversion separately
+        timezone = None
+        if ts.endswith('Z'):
+            timezone = 'Z'
+            ts = ts[:-1]
+        else:
+            # Check for +/-HH:MM timezone offset
+            import re
+            tz_match = re.search(r'([+-]\d{2}:\d{2})$', ts)
+            if tz_match:
+                timezone = tz_match.group(1)
+                ts = ts[:tz_match.start()]
 
         # Check if there's a 'T' separator
         if 'T' in ts:

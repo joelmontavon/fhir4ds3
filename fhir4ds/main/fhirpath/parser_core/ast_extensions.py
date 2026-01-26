@@ -236,6 +236,7 @@ class EnhancedASTNode:
                         """Parse FHIR temporal literal returning metadata for range comparisons.
 
                         SP-023-006: Replicated from ASTAdapter._parse_temporal_literal().
+                        SP-100-012: Enhanced to handle partial DateTime literals (@2015T, @2015-02T).
                         """
                         if not text.startswith("@"):
                             return None
@@ -245,6 +246,11 @@ class EnhancedASTNode:
 
                         body = text[1:]
                         if "T" in body:
+                            # SP-100-012: Check for partial DateTime pattern first
+                            # (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT without time components)
+                            partial_datetime_match = re.fullmatch(r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?T$", body)
+                            if partial_datetime_match:
+                                return self._parse_partial_datetime_literal(text, body, partial_datetime_match)
                             return self._parse_datetime_literal(text, body)
                         return self._parse_date_literal(text, body)
 
@@ -292,10 +298,15 @@ class EnhancedASTNode:
                         }
 
                     def _parse_datetime_literal(self, original, body):
-                        """Parse FHIR dateTime literal with optional reduced precision."""
+                        """Parse FHIR dateTime literal with optional reduced precision and timezone.
+
+                        SP-100-012: Enhanced to handle timezone suffixes (Z, +/-HH:MM).
+                        """
+                        # Pattern with optional timezone suffix: Z or +/-HH:MM
                         pattern = re.compile(
                             r"^(\d{4})-(\d{2})-(\d{2})T"
-                            r"(\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?$"
+                            r"(\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+                            r"(?:Z|[+-]\d{2}:\d{2})?$"
                         )
                         match = pattern.fullmatch(body)
                         if not match:
@@ -308,6 +319,16 @@ class EnhancedASTNode:
                         minute = int(match.group(5) or 0)
                         second = int(match.group(6) or 0)
                         fraction = match.group(7)
+
+                        # Extract timezone from original text
+                        timezone = None
+                        if "Z" in body:
+                            timezone = "Z"
+                        elif "+" in body or "-" in body and body.rfind("-") > 10:
+                            # Find timezone offset at the end
+                            tz_match = re.search(r"([+-]\d{2}:\d{2})$", body)
+                            if tz_match:
+                                timezone = tz_match.group(1)
 
                         microseconds = self._fraction_to_microseconds(fraction)
                         start_dt = datetime(year, month, day, hour, minute, second, microseconds)
@@ -333,7 +354,11 @@ class EnhancedASTNode:
                             is_partial = True
                             normalized = f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}"
 
-                        return {
+                        # Append timezone to normalized value if present
+                        if timezone:
+                            normalized = f"{normalized}{timezone}"
+
+                        result = {
                             "kind": "datetime",
                             "precision": precision,
                             "normalized": normalized,
@@ -343,6 +368,62 @@ class EnhancedASTNode:
                             "literal_type": "datetime",
                             "original": original,
                             "fraction_digits": len(fraction) if fraction else 0
+                        }
+
+                        # Add timezone information if present
+                        if timezone:
+                            result["timezone"] = timezone
+
+                        return result
+
+                    def _parse_partial_datetime_literal(self, original, body, match):
+                        """Parse FHIR partial dateTime literal (date components with 'T' suffix).
+
+                        SP-100-012: Handles @YYYYT, @YYYY-MMT, @YYYY-MM-DDT as partial DateTime literals.
+                        These are distinct from Date literals because they include the 'T' suffix.
+                        """
+                        year = int(match.group(1))
+                        month_str = match.group(2)
+                        day_str = match.group(3)
+
+                        month = int(month_str) if month_str else 1
+                        day = int(day_str) if day_str else 1
+
+                        # Determine precision and calculate boundaries
+                        if not month_str:
+                            # Year only: @2015T
+                            start_dt = datetime(year, 1, 1)
+                            end_dt = datetime(year + 1, 1, 1)
+                            precision = "year"
+                            is_partial = True
+                            normalized = f"{year:04d}"
+                        elif not day_str:
+                            # Year-month: @2015-02T
+                            start_dt = datetime(year, month, 1)
+                            if month == 12:
+                                end_dt = datetime(year + 1, 1, 1)
+                            else:
+                                end_dt = datetime(year, month + 1, 1)
+                            precision = "month"
+                            is_partial = True
+                            normalized = f"{year:04d}-{month:02d}"
+                        else:
+                            # Year-month-day: @2015-02-04T
+                            start_dt = datetime(year, month, day)
+                            end_dt = start_dt + timedelta(days=1)
+                            precision = "day"
+                            is_partial = False
+                            normalized = f"{year:04d}-{month:02d}-{day:02d}"
+
+                        return {
+                            "kind": "datetime",
+                            "precision": precision,
+                            "normalized": normalized,
+                            "start": self._format_datetime_iso(start_dt),
+                            "end": self._format_datetime_iso(end_dt),
+                            "is_partial": is_partial,
+                            "literal_type": "datetime",
+                            "original": original
                         }
 
                     def _parse_time_literal(self, text):
