@@ -1461,6 +1461,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         identifier_value = node.identifier or node.text
         logger.debug(f"Translating identifier: {identifier_value}")
+        logger.debug(f"SP-103-005: visit_identifier: identifier_value='{identifier_value}', parent_path={self.context.parent_path}")
+
+        # SP-103-005: Skip empty identifiers and structural nodes (parentheses, etc.)
+        # These are part of the AST structure but not actual path components
+        if not identifier_value or identifier_value in ['( )', 'ofType', 'as', 'is']:
+            logger.debug(f"SP-103-005: Skipping structural identifier: '{identifier_value}'")
+            # Return a placeholder that doesn't modify the path
+            return SQLFragment(
+                expression=self.context.current_table,
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False
+            )
 
         # Split compound identifiers (e.g., "Patient.name.family", "$this.given") into components
         components = [part.strip().strip('`') for part in identifier_value.split('.') if part.strip()]
@@ -1747,10 +1760,38 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 polymorphic_idx = idx
                 break
 
+        logger.debug(f"SP-103-005: visit_identifier checking for polymorphic: identifier={identifier_value}, parent_path={self.context.parent_path}, polymorphic_idx={polymorphic_idx}")
+
         if polymorphic_idx is not None:
             poly_prop = normalized_components[polymorphic_idx]
             remaining = normalized_components[polymorphic_idx + 1:]
             variants = resolve_polymorphic_property(poly_prop) or []
+
+            # SP-103-005: Check if there's a resolved polymorphic field from ofType()
+            if hasattr(self.context, 'polymorphic_field_mappings') and poly_prop in self.context.polymorphic_field_mappings:
+                resolved_field = self.context.polymorphic_field_mappings[poly_prop]
+                logger.debug(f"SP-103-005: Found resolved polymorphic field: {poly_prop} -> {resolved_field}")
+                logger.debug(f"SP-103-005: normalized_components={normalized_components}, polymorphic_idx={polymorphic_idx}, remaining={remaining}")
+
+                # Build path using the resolved field instead of COALESCE
+                path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
+                resolved_path = ".".join(path_parts)
+                resolved_expr = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=resolved_path
+                )
+                logger.debug(f"SP-103-005: Generated resolved field extraction: {resolved_expr}")
+                logger.debug(f"SP-103-005: Resolved path: {resolved_path}")
+
+                field_path = '.'.join(normalized_components) if normalized_components else ''
+                source_path = "$." + field_path
+                return SQLFragment(
+                    expression=resolved_expr,
+                    source_table=self.context.current_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    metadata={"is_json_string": True, "source_path": source_path}
+                )
 
             if variants:
                 # Build paths for all variants
@@ -7093,7 +7134,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             - Database-specific type checking functions (json_type vs jsonb_typeof)
             - Database-specific casting syntax
         """
+        # SP-103-005: Debug node structure
         logger.debug(f"Translating type operation: {node.operation} with target type: {node.target_type}")
+        logger.debug(f"SP-103-005: node type: {type(node).__name__}")
+        logger.debug(f"SP-103-005: node.text: {getattr(node, 'text', 'N/A')}")
+        logger.debug(f"SP-103-005: node.children: {len(node.children) if hasattr(node, 'children') else 'N/A'}")
+        logger.debug(f"SP-103-005: hasattr enhanced_node: {hasattr(node, 'enhanced_node')}")
+        if hasattr(node, 'enhanced_node'):
+            logger.debug(f"SP-103-005: enhanced_node.parent: {node.enhanced_node.parent}")
+            logger.debug(f"SP-103-005: enhanced_node.parent.text: {getattr(node.enhanced_node.parent, 'text', 'N/A') if node.enhanced_node.parent else 'N/A'}")
+            if node.enhanced_node.parent and hasattr(node.enhanced_node.parent, 'children'):
+                logger.debug(f"SP-103-005: enhanced_node.parent.children: {len(node.enhanced_node.parent.children)}")
+                for i, child in enumerate(node.enhanced_node.parent.children):
+                    logger.debug(f"SP-103-005: enhanced_node.parent child {i}: '{child.text}'")
 
         # Validate operation
         if not node.operation:
@@ -7291,6 +7344,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Capture parent_path BEFORE visiting child to detect if we're at root level
         parent_path_before_child = self.context.parent_path.copy()
 
+        logger.debug(f"SP-103-005: _translate_oftype_operation: parent_path_before_child={parent_path_before_child}")
+
         # Get the collection expression to filter
         expr_fragment = self.visit(node.children[0])
 
@@ -7305,6 +7360,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             identifier_value = child_node.identifier or child_node.text or ""
             if identifier_value:
                 property_name = identifier_value.split(".")[-1].strip("`")
+        else:
+            # SP-103-005: Handle TypeOperationNodeAdapter wrapping EnhancedASTNode
+            # The adapter wraps the ofType() node, which is child 1 of the parent.
+            # Child 0 of the parent is the identifier (e.g., 'value').
+            logger.debug(f"SP-103-005: child_node type: {type(child_node).__name__}, text: {getattr(child_node, 'text', 'N/A')}")
+
+            # Access the parent through enhanced_node
+            if hasattr(node, 'enhanced_node') and node.enhanced_node.parent:
+                parent = node.enhanced_node.parent
+                logger.debug(f"SP-103-005: Found parent through enhanced_node: {parent.text}")
+
+                # The parent should have 2 children: [identifier, ofType()]
+                if hasattr(parent, 'children') and len(parent.children) >= 1:
+                    identifier_child = parent.children[0]
+                    identifier_text = getattr(identifier_child, 'text', '')
+                    if identifier_text and 'ofType' not in identifier_text:
+                        property_name = identifier_text.split(".")[-1].strip("`")
+                        logger.debug(f"SP-103-005: Extracted property_name from parent child 0: {property_name}")
+
+        logger.debug(f"SP-103-005: _translate_oftype_operation: property_name={property_name}, is_polymorphic={is_polymorphic_property(property_name) if property_name else False}")
 
         # POLYMORPHIC FIELD HANDLING:
         # If the child is a polymorphic property (e.g., "value"), use type-specific field resolution
@@ -7314,16 +7389,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # IMPORTANT: Only apply this for direct property access (e.g., $.value), not nested
         # (e.g., $.component.value) to avoid breaking collection filtering
         if property_name and is_polymorphic_property(property_name):
-            # Check if this is a direct property access by checking if parent_path was empty
-            # before we visited the child node
-            # Direct access: parent_path_before_child is empty (e.g., value.ofType(integer))
-            # Nested access: parent_path_before_child has elements (e.g., component.value.ofType(integer))
-            is_direct_access = len(parent_path_before_child) == 0
+            # Check if this is a direct property access
+            # Direct access: parent_path contains only the property name (e.g., ['value'])
+            # Nested access: parent_path contains multiple elements (e.g., ['component', 'value'])
+            is_direct_access = (
+                len(parent_path_before_child) == 1 and
+                parent_path_before_child[0] == property_name
+            )
 
             if is_direct_access:
                 polymorphic_field = resolve_polymorphic_field_for_type(property_name, canonical_type)
                 if polymorphic_field:
                     logger.debug(f"Resolved polymorphic field: {property_name} + {canonical_type} → {polymorphic_field}")
+                    logger.debug(f"Parent path before: {self.context.parent_path}")
 
                     # Build JSON path for the polymorphic field
                     # Need to extract the source table from the expression
@@ -7338,6 +7416,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     )
 
                     logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+
+                    # SP-103-005: Update parent_path to reflect the resolved type
+                    # The current path ends with the base property name (e.g., 'value'),
+                    # and we need to replace it with the polymorphic field (e.g., 'valueRange')
+                    if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                        # Replace the last element
+                        self.context.parent_path[-1] = polymorphic_field
+                    else:
+                        # Append if the structure is different than expected
+                        self.context.parent_path.append(polymorphic_field)
+                    logger.debug(f"Parent path after: {self.context.parent_path}")
+
+                    # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
+                    # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
+                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                        self.context.polymorphic_field_mappings = {}
+                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                    logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
 
                     return SQLFragment(
                         expression=poly_field_sql,

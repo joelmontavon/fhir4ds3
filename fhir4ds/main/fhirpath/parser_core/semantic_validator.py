@@ -546,6 +546,18 @@ class SemanticValidator:
         masked_with_backticks: str,
     ) -> None:
         """Validate element navigation against the type registry."""
+        # SP-103-005: Check if expression contains type-changing functions
+        # These functions (ofType, as, etc.) make static validation unreliable
+        # without full type inference, so we skip path validation when present.
+        collapsed = re.sub(r'\s+', '', expression or '')
+        has_type_changing_function = any(
+            f'{func}(' in collapsed for func in ('ofType', 'as(', 'asType(', 'convertsTo(')
+        )
+
+        if has_type_changing_function:
+            # Skip path validation - type changes make it unreliable
+            return
+
         # Absolute paths (Patient.name.given)
         for match in self._absolute_path_rgx.finditer(masked_with_backticks):
             path = match.group(1)
