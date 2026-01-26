@@ -245,12 +245,13 @@ class EnhancedOfficialTestRunner:
                 error_type = actual_result.get('error_type')
                 if error_type:
                     # Map invalid_flag to expected error_type
-                    # "semantic" flag expects "semantic" error
-                    # "execution" flag expects "execution" error
+                    # "syntax" flag expects syntax errors (parse errors are syntax errors)
+                    # "semantic" flag expects semantic errors
+                    # "execution" flag expects execution errors
                     if error_type == invalid_flag:
                         return True
-                    # Treat parser-level errors as acceptable for semantic expectations
-                    if error_type == "parse" and invalid_flag == "semantic":
+                    # Treat parser-level errors as acceptable for syntax and semantic expectations
+                    if error_type == "parse" and invalid_flag in ("syntax", "semantic"):
                         return True
                     return False
                 # No error_type specified - any invalid result is OK
@@ -645,11 +646,26 @@ class EnhancedOfficialTestRunner:
                 logger.error(f"Error message: {exc}")
                 logger.debug(f"Traceback: {traceback.format_exc()}")
 
+                # Map SQL execution errors to "execution" error type for validation
+                # Common SQL error types: BinderException, CatalogException, etc.
+                exc_type_name = type(exc).__name__
+                sql_execution_errors = {
+                    'BinderException', 'CatalogException', 'ConstraintException',
+                    'DataException', 'DependencyException', 'IOException',
+                    'InterruptedException', 'NumericException', 'OptimizerException',
+                    'OutOfWorkMemoryException', 'ParserException', 'PermissionException',
+                    'PlannerException', 'SequenceException', 'SerializationException',
+                    'StandardException', 'TableNotFoundException', 'TransactionException',
+                    'TypeMismatchException', 'VacuumException'
+                }
+
+                error_type = "execution" if exc_type_name in sql_execution_errors else exc_type_name
+
                 # Return detailed error information instead of None
                 return {
                     'is_valid': False,
                     'error': str(exc),
-                    'error_type': type(exc).__name__,
+                    'error_type': error_type,
                     'result': None
                 }
 

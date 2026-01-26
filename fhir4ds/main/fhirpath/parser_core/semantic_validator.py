@@ -140,6 +140,9 @@ class SemanticValidator:
         snippet_state: Dict[str, int] = {}
 
         if parsed_expression is not None and parsed_expression.ast is not None:
+            # SP-102-004: Validate incomplete expressions
+            self._validate_incomplete_expressions(raw_expression, parsed_expression.ast)
+
             self._validate_function_definitions(
                 raw_expression,
                 parsed_expression,
@@ -637,6 +640,101 @@ class SemanticValidator:
                 )
 
             current_type = registry.get_canonical_name(element_type)
+
+    def _validate_incomplete_expressions(
+        self,
+        raw_expression: str,
+        parsed_ast: EnhancedASTNode
+    ) -> None:
+        """
+        SP-102-004: Validate that expressions are complete and well-formed.
+
+        Detects incomplete expressions such as trailing operators:
+        - "2 + 2 /" (missing right operand)
+        - "1 + " (missing right operand)
+        - "5 * " (missing right operand)
+
+        Args:
+            raw_expression: Original expression text
+            parsed_ast: Parsed AST node
+
+        Raises:
+            FHIRPathParseError: When expression is incomplete
+        """
+        # Check for trailing operators that indicate incomplete expressions
+        # Pattern: ends with operator (+, -, *, /, |, &, =, !=, <, >, <=, >=, ~, etc.)
+        trimmed = raw_expression.strip()
+
+        # List of binary operators that should not appear at the end of an expression
+        binary_operators = [
+            '+', '-', '*', '/', '|', '&', '=', '!=',
+            '<', '>', '<=', '>=', '~', '!', 'or', 'and',
+            'in', 'contains', 'is', 'as'
+        ]
+
+        # Check if expression ends with an operator (possibly with whitespace)
+        for op in binary_operators:
+            # Match operator at end of expression (with optional whitespace)
+            pattern = rf'\s*{re.escape(op)}\s*$'
+            if re.search(pattern, trimmed):
+                # Special case: negative numbers like "-1" are valid
+                if op == '-' and re.match(r'^\s*-\s*\d+\s*$', trimmed):
+                    continue
+                raise FHIRPathParseError(
+                    f"Incomplete expression: expression ends with '{op}' operator"
+                )
+
+        # Check for division without right operand (e.g., "2 + 2 /")
+        # This catches cases where the parser treats "/" as a binary operator
+        # but there's no right operand
+        if '/' in trimmed and not re.search(r'/\s*[^\s*/)]', trimmed):
+            # Check if "/" is followed by something other than another operator
+            parts = trimmed.split('/')
+            if len(parts) > 1:
+                # Get the part after the last "/"
+                last_part = parts[-1].strip()
+                if not last_part or last_part in ['+', '-', '*', '|', '&', '=', '!=', '<', '>', '<=', '>=', '~']:
+                    raise FHIRPathParseError(
+                        "Incomplete expression: missing right operand for division operator"
+                    )
+
+    def _validate_unary_operators_on_literals(
+        self,
+        raw_expression: str,
+        parsed_ast: EnhancedASTNode
+    ) -> None:
+        """
+        SP-102-004: Validate that unary operators are not used on literals inappropriately.
+
+        Detects invalid patterns like:
+        - "-1.convertsToInteger()" (unary minus on literal with method call)
+
+        Note: In FHIRPath, negative literals like "-1" are valid, but they should
+        be treated as literal values, not as expressions with unary operators that
+        can have methods chained to them.
+
+        Args:
+            raw_expression: Original expression text
+            parsed_ast: Parsed AST node
+
+        Raises:
+            FHIRPathParseError: When unary operator is used inappropriately on literal
+        """
+        # Check for patterns like "-1.method()" or "+1.method()"
+        # The pattern is: unary operator, number, then method call
+        pattern = r'^\s*([+-])\s*(\d+(?:\.\d+)?)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
+
+        match = re.search(pattern, raw_expression)
+        if match:
+            operator = match.group(1)
+            literal = match.group(2)
+            method = match.group(3)
+
+            raise FHIRPathParseError(
+                f"Invalid expression: unary operator '{operator}' cannot be applied to "
+                f"literal '{literal}' with method call '{method}()'. "
+                f"Use '{operator}{literal}' as a literal value or wrap in parentheses."
+            )
 
 
 class FHIRPathExpressionWrapper:
