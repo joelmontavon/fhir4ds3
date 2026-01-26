@@ -1218,6 +1218,20 @@ class DuckDBDialect(DatabaseDialect):
         """
         return f"TRY_CAST({expression} AS BIGINT)"
 
+    def strict_cast_to_decimal(self, expression: str) -> str:
+        """Strictly cast expression to DECIMAL in DuckDB.
+
+        SP-103-004: Uses CAST which throws error on type mismatch.
+        """
+        return f"CAST({expression} AS DECIMAL)"
+
+    def strict_cast_to_integer(self, expression: str) -> str:
+        """Strictly cast expression to BIGINT in DuckDB.
+
+        SP-103-004: Uses CAST which throws error on type mismatch.
+        """
+        return f"CAST({expression} AS BIGINT)"
+
     def safe_cast_to_date(self, expression: str) -> str:
         """Safely cast expression to DATE in DuckDB.
 
