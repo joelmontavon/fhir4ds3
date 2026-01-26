@@ -1306,10 +1306,13 @@ class DuckDBDialect(DatabaseDialect):
                 f"THEN {scalar_predicate} ELSE false END"
             )
 
-        # Return false when input is NULL (NULL is not of any type)
+        # Return NULL when input is NULL to propagate empty collections
+        # SP-102-003: When is() is called on a non-existent field (NULL),
+        # returning NULL instead of false ensures the row is filtered out,
+        # producing an empty result set as expected by FHIRPath semantics.
         return (
             f"CASE "
-            f"WHEN {expression} IS NULL THEN false "
+            f"WHEN {expression} IS NULL THEN NULL "
             f"WHEN typeof({expression}) = 'JSON' THEN {json_branch} "
             f"ELSE {scalar_branch} "
             f"END"
