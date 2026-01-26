@@ -5849,8 +5849,36 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return False
 
         if target_type == "Quantity":
-            # For now, return False - Quantity conversion needs UCUM support
-            # Will be enhanced in future iterations
+            # SP-103-003: Implement Quantity type conversion
+            # According to FHIRPath spec, the following can convert to Quantity:
+            # - Integer literals (e.g., 1, 5, 10)
+            # - Decimal literals (e.g., 1.0, 5.5, 10.25)
+            # - Boolean literals (true, false) - convert to 1.0 and 0.0
+            # - String representations of integers (e.g., '1', '5')
+            # - String representations of decimals (e.g., '1.0', '5.5')
+            # - String representations of quantities (e.g., '1 day', '4 days', '1 \'wk\'')
+
+            if isinstance(value, bool):
+                # Booleans can convert to Quantity (true -> 1.0, false -> 0.0)
+                return True
+            if isinstance(value, (int, float)):
+                # Numbers can convert to Quantity
+                return True
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return False
+
+                # Check if it's a valid quantity string
+                # Format: <number> [<unit>] or <number> '<unit>'
+                # Examples: '1', '1.0', '1 day', '4 days', '1 \'wk\''
+
+                # Try to match: number followed by optional unit
+                # Pattern: optional +/-, digits with optional decimal, optional space, optional unit in quotes or plain text
+                quantity_pattern = r'^[\+\-]?(\d+\.?\d*|\.\d+)(\s+[a-zA-Z]+|\s+\'[a-zA-Z]+\'|\s+\"[a-zA-Z]+\")?$'
+                if re.match(quantity_pattern, stripped):
+                    return True
+
             return False
 
         if target_type == "DateTime":
@@ -5948,10 +5976,60 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return f"CASE WHEN {decimal_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
 
     def _build_converts_to_quantity_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToQuantity() checks."""
-        # For now, always return FALSE - Quantity conversion needs UCUM support
-        # Will be enhanced in future iterations
-        return "FALSE"
+        """Generate SQL for convertsToQuantity() checks.
+
+        SP-103-003: Implement quantity conversion checking.
+        A value can convert to Quantity if:
+        - It's a number (integer or decimal)
+        - It's a boolean
+        - It's a string that represents a number or number with unit
+
+        According to FHIRPath spec and test cases:
+        - '1' converts to Quantity (just a number)
+        - '1.0' converts to Quantity (decimal number)
+        - '1 day' converts to Quantity (number + space + date/time precision unit)
+        - '1 'wk'' converts to Quantity (number + space + single-quoted unit)
+        - '1 wk' does NOT convert to Quantity (unquoted non-date/time unit)
+        """
+        # Cast to string first
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Check if it's a valid quantity string using regex
+        # Pattern: optional +/-, digits with optional decimal, optional space, optional unit
+        # Units allowed:
+        # 1. Date/time precision words (year, month, week, day, hour, minute, second, millisecond)
+        # 2. Plural date/time precision words (years, months, weeks, days, hours, minutes, seconds, milliseconds)
+        # 3. Single-quoted units (e.g., '1 'wk'')
+        # 4. Double-quoted units (e.g., '1 "kg"')
+        #
+        # Note: Unquoted non-date/time units like '1 wk' should NOT match (per test cases)
+        #
+        # IMPORTANT: In SQL string literals, single quotes are escaped by doubling them
+        # So \s+'[a-zA-Z]+' becomes \s+''[a-zA-Z]+''
+        quantity_pattern = r"^[\+\-]?(\d+\.?\d*|\.\d+)(\s+(year|years|month|months|week|weeks|day|days|hour|hours|minute|minutes|second|seconds|millisecond|milliseconds)|\s+''[a-zA-Z]+''|\s+\"[a-zA-Z]+\")?$"
+
+        # Also check if it's a boolean
+        lowered_string = f"LOWER({trimmed_string})"
+        is_boolean = f"({lowered_string} IN ('true', 'false', 't', 'f', '1', '0'))"
+
+        # Check if it matches quantity pattern - need to quote the pattern as a string literal
+        # SQL escaping: single quotes within string are doubled
+        is_quantity = self.dialect.generate_regex_match(trimmed_string, f"'{quantity_pattern}'")
+
+        # Combine checks: boolean OR matches quantity pattern OR is a number
+        decimal_cast = self.dialect.generate_type_cast(value_expr, "Decimal")
+        is_number = f"({decimal_cast} IS NOT NULL)"
+
+        return (
+            f"CASE "
+            f"WHEN {value_expr} IS NULL THEN FALSE "
+            f"WHEN {is_boolean} THEN TRUE "
+            f"WHEN {is_number} THEN TRUE "
+            f"WHEN {is_quantity} THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _build_converts_to_datetime_expression(self, value_expr: str) -> str:
         """Generate SQL for convertsToDateTime() checks.
