@@ -568,8 +568,18 @@ class EnhancedASTNode:
                 return OperatorNodeAdapter(self).accept(visitor)
 
             elif category in [NodeCategory.FUNCTION_CALL, NodeCategory.CONDITIONAL]:
-                # Special handling for CONDITIONAL category
+                # SP-103-008: Special handling for CONDITIONAL category
+                # Check if this is an InvocationExpression containing a type operation
                 if category == NodeCategory.CONDITIONAL and self.node_type == 'InvocationExpression':
+                    # SP-103-008: Check if any child is a TYPE_OPERATION (e.g., is(), as(), ofType())
+                    # If so, unwrap to that child instead of visiting generically
+                    if self.children:
+                        for child in self.children:
+                            if (child.metadata and
+                                child.metadata.node_category == NodeCategory.TYPE_OPERATION):
+                                # Unwrap to the type operation child
+                                return child.accept(visitor)
+
                     # Container node marked as CONDITIONAL should be visited generically to traverse children
                     return visitor.visit_generic(self)
 
