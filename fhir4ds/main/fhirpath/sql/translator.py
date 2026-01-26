@@ -1084,16 +1084,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # Return SQL fragment marked as empty collection
             # The actual SQL expression depends on context (handled by consumers)
+            # SP-104-002: Include source text for consistency
+            empty_metadata = {
+                "literal_type": "empty_collection",
+                "is_literal": True,
+                "is_empty_collection": True
+            }
+            if node.text:
+                empty_metadata["source_text"] = node.text
+                empty_metadata["text"] = node.text
+
             return SQLFragment(
                 expression="NULL",  # Default - consumers will override
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                metadata={
-                    "literal_type": "empty_collection",
-                    "is_literal": True,
-                    "is_empty_collection": True
-                }
+                metadata=empty_metadata
             )
 
         # Handle different literal types
@@ -1150,12 +1156,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Return SQL fragment with literal expression
         # Literals don't require unnesting and are not aggregate operations
         # Include literal_type in metadata for type-aware comparison casting
+        # SP-104-002: Include source text and temporal_info for type checking
+        fragment_metadata = {
+            "literal_type": node.literal_type,
+            "is_literal": True
+        }
+        # Include source text for temporal literals to support type checking
+        if node.text:
+            fragment_metadata["source_text"] = node.text
+        if node.text:
+            fragment_metadata["text"] = node.text
+        # Include temporal_info if available (for date/time literals)
+        if hasattr(node, 'temporal_info') and node.temporal_info:
+            fragment_metadata["temporal_info"] = node.temporal_info
+
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"literal_type": node.literal_type, "is_literal": True}
+            metadata=fragment_metadata
         )
 
     def _path_requires_unnest(self, path_components: List[str]) -> bool:
@@ -7419,6 +7439,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         canonical_type = self._resolve_canonical_type(node.target_type)
         normalized = canonical_type.lower()
 
+        # SP-104-002: Extract original literal for temporal type checking
+        original_literal = None
+        if hasattr(expr_fragment, 'metadata') and expr_fragment.metadata:
+            if expr_fragment.metadata.get('is_literal'):
+                original_literal = (
+                    expr_fragment.metadata.get('source_text') or
+                    expr_fragment.metadata.get('text') or
+                    expr_fragment.metadata.get('temporal_info', {}).get('original') if expr_fragment.metadata.get('temporal_info') else None
+                )
+
         primitive_families = {
             "uri",
             "url",
@@ -7437,6 +7467,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         elif normalized == "collection":
             type_check_sql = (
                 f"CASE WHEN {expr_fragment.expression} IS NULL THEN false ELSE true END"
+            )
+        # SP-104-002: Check for temporal literals first
+        elif original_literal and original_literal.startswith('@'):
+            # Temporal literal - use literal type check
+            type_check_sql = self._generate_literal_type_check(
+                expr_fragment.expression,
+                canonical_type,
+                original_literal
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -8248,33 +8286,57 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             hasattr(path_fragment, 'metadata') and
             path_fragment.metadata.get('is_literal', False)
         )
-        if self._is_sql_literal_expression(value_expr) or path_has_literal_metadata:
-            # SP-103-001: Extract original literal text for timezone detection
-            # SP-104-002: Check path_fragment for original literal text first
-            original_literal = None
-            if 'path_fragment' in locals() and hasattr(path_fragment, 'metadata'):
+
+        # SP-104-002: Extract original literal text for temporal type checking
+        # Try multiple sources to find the original literal text
+        original_literal = None
+
+        # 1. Check path_fragment metadata (if we parsed a path)
+        if path_has_literal_metadata and 'path_fragment' in locals():
+            if hasattr(path_fragment, 'metadata') and path_fragment.metadata:
                 original_literal = (
                     path_fragment.metadata.get('source_text') or
                     path_fragment.metadata.get('text')
                 )
-            if not original_literal and self.fragments and len(self.fragments) > 0:
-                # Find the fragment that matches the value_expr
-                # The literal might not be the last fragment (could be earlier in the chain)
-                for frag in self.fragments:
-                    if hasattr(frag, 'expression') and str(frag.expression) == str(value_expr):
-                        # Try to get original literal from metadata first
-                        if hasattr(frag, 'metadata') and frag.metadata:
-                            original_literal = frag.metadata.get('source_text') or frag.metadata.get('text')
-                        # If not in metadata, try extracting from the expression itself
-                        if not original_literal and hasattr(frag, 'expression'):
-                            expr_str = str(frag.expression)
-                            # Strip SQL quotes to get the actual FHIRPath literal
-                            # SQL string literals are wrapped in single quotes: '@T14:34:28Z'
-                            unquoted = expr_str.strip("'\"")
-                            # Check if it looks like a FHIRPath literal (starts with @)
-                            if unquoted.startswith('@'):
-                                original_literal = unquoted
-                        break
+
+        # 2. Check fragments list for literal metadata
+        if not original_literal and self.fragments and len(self.fragments) > 0:
+            # Check the most recent fragment first
+            for frag in reversed(self.fragments):
+                if hasattr(frag, 'metadata') and frag.metadata:
+                    if frag.metadata.get('is_literal'):
+                        original_literal = (
+                            frag.metadata.get('source_text') or
+                            frag.metadata.get('text') or
+                            frag.metadata.get('temporal_info', {}).get('original') if frag.metadata.get('temporal_info') else None
+                        )
+                        if original_literal:
+                            break
+
+        # 3. Try extracting from expression itself (fallback for temporal literals)
+        if not original_literal:
+            expr_str = str(value_expr).strip()
+            # Check for DATE/TIME/TIMESTAMP literals: DATE '2020-01-01'
+            temporal_match = re.match(r'^(DATE|TIMESTAMP|TIME)\s+[\'"]([^\'"]+)[\'"]', expr_str, re.IGNORECASE)
+            if temporal_match:
+                # This is a temporal literal, but we've lost the original text
+                # We can infer the type from the SQL keyword
+                temporal_type = temporal_match.group(1).upper()
+                if temporal_type == 'DATE':
+                    # Could be @YYYY, @YYYY-MM, or @YYYY-MM-DD
+                    # Try to extract year from the value
+                    date_value = temporal_match.group(2)
+                    if date_value:
+                        # Use the SQL value as fallback
+                        pass  # Let the type check work with SQL types
+            # Check for string literals that might be temporal: '@2020-01-01'
+            elif expr_str.startswith("'@") or expr_str.startswith('"@'):
+                # Strip quotes to get the original literal
+                unquoted = expr_str.strip("'\"")
+                if unquoted.startswith('@'):
+                    original_literal = unquoted
+
+        if self._is_sql_literal_expression(value_expr) or path_has_literal_metadata:
             type_check_sql = self._generate_literal_type_check(value_expr, canonical_type, original_literal)
         # Route to appropriate type check based on type classification
         # Maintains thin dialect principle - business logic in translator
