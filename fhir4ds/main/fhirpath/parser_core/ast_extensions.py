@@ -193,6 +193,7 @@ class EnhancedASTNode:
 
                         SP-023-006: Enhanced to handle FHIR temporal literals.
                         SP-100-003: Enhanced to handle empty collection literals.
+                        SP-103-003: Enhanced to properly process escape sequences in string literals.
                         """
                         if not text:
                             return None, "unknown", None
@@ -213,7 +214,17 @@ class EnhancedASTNode:
 
                         # Handle string literals (quoted)
                         if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
-                            return text[1:-1], "string", None
+                            # SP-103-003: Use ast.literal_eval to properly process escape sequences
+                            # The parser returns strings like "'1 \\'wk\\''" which need to be evaluated
+                            # to get the actual string value "1 'wk'"
+                            import ast as python_ast
+                            try:
+                                # Evaluate the string literal to process escape sequences
+                                evaluated_value = python_ast.literal_eval(text)
+                                return evaluated_value, "string", None
+                            except (ValueError, SyntaxError):
+                                # Fallback to simple stripping if evaluation fails
+                                return text[1:-1], "string", None
 
                         # Handle boolean literals
                         if text.lower() == 'true':
@@ -1188,7 +1199,37 @@ class ASTNodeFactory:
                 metadata=metadata
             )
         elif 'literal' in node_type.lower():
-            node = ASTNodeFactory.create_literal_node(text, text)
+            # Special handling for QuantityLiteral nodes
+            if node_type == 'QuantityLiteral':
+                # Extract value and unit from the quantity literal structure
+                value_str, unit_str = ASTNodeFactory._extract_quantity_info(fhirpath_node)
+
+                # Create quantity metadata
+                metadata = MetadataBuilder() \
+                    .with_category(NodeCategory.LITERAL) \
+                    .with_type_info(TypeInformation(
+                        sql_data_type=SQLDataType.TEXT,  # Quantities stored as text
+                        is_collection=False,
+                        is_nullable=False,
+                        fhir_type='Quantity'
+                    )) \
+                    .with_optimization_hint(OptimizationHint.PROJECTION_SAFE) \
+                    .with_source_location(text) \
+                    .build()
+
+                # Store quantity info in custom_attributes for later use
+                metadata.custom_attributes['literal_type'] = 'quantity'
+                metadata.custom_attributes['quantity_value'] = value_str
+                metadata.custom_attributes['quantity_unit'] = unit_str
+
+                node = EnhancedASTNode(
+                    node_type="literal",
+                    text=text,
+                    metadata=metadata
+                )
+            else:
+                # Regular literal (string, number, boolean, etc.)
+                node = ASTNodeFactory.create_literal_node(text, text)
         elif 'identifier' in node_type.lower() or 'path' in node_type.lower():
             node = ASTNodeFactory.create_path_node(text)
         else:
@@ -1245,6 +1286,68 @@ class ASTNodeFactory:
                         return gc_text
 
         return 'unknown'
+
+    @staticmethod
+    def _extract_quantity_info(fhirpath_node: Union[Dict[str, Any], Any]) -> tuple[Optional[str], Optional[str]]:
+        """Extract quantity value and unit from a QuantityLiteral node.
+
+        Returns:
+            Tuple of (value_str, unit_str) where value_str is the numeric value as string
+            and unit_str is the unit (e.g., 'days', 'wk'). Returns (None, None) if not found.
+        """
+        if isinstance(fhirpath_node, dict):
+            children = fhirpath_node.get('children', [])
+            terminal_node_text = fhirpath_node.get('terminalNodeText', [])
+        else:
+            children = getattr(fhirpath_node, 'children', [])
+            terminal_node_text = getattr(fhirpath_node, 'terminalNodeText', [])
+
+        # Extract value from terminalNodeText (should be the number)
+        value_str = None
+        if terminal_node_text and len(terminal_node_text) > 0:
+            value_str = terminal_node_text[0].strip()
+
+        # Extract unit from children (look for Unit node)
+        unit_str = None
+        for child in children:
+            if isinstance(child, dict):
+                child_type = child.get('type', '')
+                child_children = child.get('children', [])
+            else:
+                child_type = getattr(child, 'type', '')
+                child_children = getattr(child, 'children', [])
+
+            if child_type == 'Unit':
+                # Look for DateTimePrecision or PluralDateTimePrecision
+                for grandchild in child_children:
+                    if isinstance(grandchild, dict):
+                        gc_type = grandchild.get('type', '')
+                        gc_terminal = grandchild.get('terminalNodeText', [])
+                    else:
+                        gc_type = getattr(grandchild, 'type', '')
+                        gc_terminal = getattr(grandchild, 'terminalNodeText', [])
+
+                    if gc_type in ['DateTimePrecision', 'PluralDateTimePrecision']:
+                        if gc_terminal and len(gc_terminal) > 0:
+                            unit_str = gc_terminal[0].strip()
+                            break
+
+                # Also check if unit is a string literal (e.g., '1 \'wk\'')
+                if not unit_str:
+                    for grandchild in child_children:
+                        if isinstance(grandchild, dict):
+                            gc_type = grandchild.get('type', '')
+                            gc_terminal = grandchild.get('terminalNodeText', [])
+                        else:
+                            gc_type = getattr(grandchild, 'type', '')
+                            gc_terminal = getattr(grandchild, 'terminalNodeText', [])
+
+                        if gc_type == 'StringLiteral' and gc_terminal and len(gc_terminal) > 0:
+                            # Remove quotes from string literal
+                            unit_str = gc_terminal[0].strip().strip('\'"')
+                            break
+
+        return value_str, unit_str
 
     @staticmethod
     def _classify_node_category(node_type: str, text: str) -> NodeCategory:
