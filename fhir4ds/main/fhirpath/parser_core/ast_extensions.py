@@ -296,7 +296,9 @@ class EnhancedASTNode:
                             end_dt = datetime(year + 1, 1, 1)
                             precision = "year"
                             normalized = f"{year:04d}"
-                            literal_type = "string"
+                            # SP-104-004: Use "date" literal_type for all date literals, including partial dates
+                            # This ensures they're converted to DATE SQL literals for proper comparison
+                            literal_type = "date"
                             is_partial = True
                         elif re.fullmatch(r"\d{4}-\d{2}$", body):
                             year, month = map(int, body.split("-"))
@@ -307,7 +309,8 @@ class EnhancedASTNode:
                                 end_dt = datetime(year, month + 1, 1)
                             precision = "month"
                             normalized = f"{year:04d}-{month:02d}"
-                            literal_type = "string"
+                            # SP-104-004: Use "date" literal_type for all date literals, including partial dates
+                            literal_type = "date"
                             is_partial = True
                         elif re.fullmatch(r"\d{4}-\d{2}-\d{2}$", body):
                             year, month, day = map(int, body.split("-"))
