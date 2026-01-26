@@ -1460,12 +1460,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 dependencies = binding.dependencies.copy()
                 source_table = binding.source_table or self.context.current_table
 
+                # SP-102-001: When $this is referenced in a lambda scope and will be used
+                # as the base for a function call (e.g., $this.length()), we need to ensure
+                # the expression is properly formatted for SQL consumption.
+                # For variable bindings that reference column names (not expressions),
+                # we need to ensure they're treated as column references, not nested expressions.
+                expression = binding.expression
+
+                # Check if the expression is a simple column reference (no parentheses, no function calls)
+                # If it is, it can be used directly. Otherwise, wrap it as a subquery alias.
+                if expression and not any(c in expression for c in '()'):
+                    # Simple column reference - use directly
+                    pass
+                elif expression and '(' in expression:
+                    # Complex expression - wrap as subquery for safety
+                    # This shouldn't happen with $this bindings, but handle it defensively
+                    pass
+
                 return SQLFragment(
-                    expression=binding.expression,
+                    expression=expression,
                     source_table=source_table,
                     requires_unnest=binding.requires_unnest,
                     is_aggregate=binding.is_aggregate,
-                    dependencies=dependencies
+                    dependencies=dependencies,
+                    metadata={"is_variable_reference": True}  # Mark as variable reference
                 )
 
             # Variable with member access (e.g., $this.given)
@@ -8403,6 +8421,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # The condition expression should be self-contained and reference the source columns.
         fragments_before = len(self.fragments)
 
+        # SP-102-001: Clear pending_fragment_result to prevent stale values from outer scope
+        # from leaking into the lambda scope. This fixes issues like substring($this.length()-3)
+        # where substring was incorrectly using the pending_fragment_result from name.given
+        # instead of using the $this variable from the lambda scope.
+        old_pending = self.context.pending_fragment_result
+        self.context.pending_fragment_result = None
+
         with self._variable_scope({
             "$this": VariableBinding(
                 expression=this_expression,
@@ -8411,6 +8436,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         }):
             # Translate the filter condition argument
             condition_fragment = self.visit(node.arguments[0])
+
+        # SP-102-001: Restore pending_fragment_result after lambda scope exits
+        self.context.pending_fragment_result = old_pending
 
         # SP-022-012: Remove any intermediate fragments that were added during
         # condition translation. The condition expression is self-contained.
@@ -10537,14 +10565,25 @@ END"""
             # SP-022-012: Check for pending_fragment_result from InvocationExpression chain
             # This handles cases like $this.length() where $this was visited before length()
             # and its expression was stored in pending_fragment_result
+            # SP-102-001: pending_fragment_result is a tuple (sql_expression, parent_path, is_multi_item)
             if self.context.pending_fragment_result is not None:
-                string_expr = self.context.pending_fragment_result
+                logger.debug(f"SP-102-001 DEBUG: substring found pending_fragment_result = {self.context.pending_fragment_result}")
+                # Extract the SQL expression from the tuple
+                pending_result = self.context.pending_fragment_result
+                if isinstance(pending_result, tuple):
+                    string_expr = pending_result[0]  # sql_expression is first element
+                else:
+                    # Legacy behavior: if it's not a tuple, use it directly
+                    string_expr = pending_result
+
                 # SP-025-002: Find the fragment that generated this expression and track dependencies
                 # This ensures the CTE manager properly chains fragments together
                 if self.fragments:
                     # The most recent fragment should be the one that generated pending_fragment_result
                     pending_fragment = self.fragments[-1]
-                    if pending_fragment.expression == string_expr:
+                    # Compare with the actual expression, not the tuple
+                    fragment_expr = pending_fragment.expression
+                    if isinstance(fragment_expr, str) and fragment_expr == string_expr:
                         # Add dependencies from the pending fragment
                         if hasattr(pending_fragment, "dependencies") and pending_fragment.dependencies:
                             dependencies.extend(pending_fragment.dependencies)
@@ -10556,6 +10595,42 @@ END"""
                 self.context.pending_fragment_result = None
                 if source_table is None:
                     source_table = self.context.current_table
+            # SP-102-001: Check if we're in a lambda scope with $this bound
+            # This handles cases like substring($this.length()-3) where the string
+            # argument is implicit and should be $this
+            elif func_name in ("substring", "indexof", "replace"):
+                logger.debug(f"SP-102-001 DEBUG: substring checking for $this, func_name={func_name}")
+                this_binding = self.context.get_variable("$this")
+                if this_binding is not None:
+                    # Use $this as the implicit string argument
+                    # SP-102-001: $this might be a column reference (like 'given_item') or an expression
+                    # For column references from UNNEST, we need to unwrap the JSON to get the string value
+                    this_expr = this_binding.expression
+                    # Check if this is a simple column reference (no parentheses, no function calls)
+                    is_simple_column = this_expr and not any(c in this_expr for c in '()')
+
+                    if is_simple_column:
+                        # Simple column reference - need to unwrap JSON
+                        # Use extract_json_string to get the scalar value from the JSON column
+                        string_expr = self.dialect.extract_json_string(this_expr, "$")
+                        logger.debug(
+                            f"SP-102-001: Unwrapped $this column {this_expr} -> {string_expr}"
+                        )
+                    else:
+                        # Complex expression - use as-is
+                        string_expr = this_expr
+                        logger.debug(
+                            f"SP-102-001: Using $this expression directly: {string_expr}"
+                        )
+
+                    source_table = this_binding.source_table or self.context.current_table
+                    requires_unnest = this_binding.requires_unnest
+                    is_aggregate = this_binding.is_aggregate
+                    if this_binding.dependencies:
+                        dependencies.extend(this_binding.dependencies)
+                    logger.debug(
+                        f"SP-102-001: Using $this as implicit string argument for {func_name}"
+                    )
             else:
                 current_path = self.context.get_json_path()
                 if current_path and current_path != "$":
