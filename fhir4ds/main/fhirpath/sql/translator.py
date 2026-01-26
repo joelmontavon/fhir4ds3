@@ -2695,8 +2695,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if temporal_fragment is not None:
                 return temporal_fragment
 
-        # Translate both operands
+        # SP-103-005: Save context state before translating operands
+        # This prevents path pollution where the right operand inherits
+        # parent_path modifications from the left operand.
+        # Example: value.ofType(Range).low.value + value.ofType(Range).high.value
+        # Without this isolation, the right operand incorrectly starts with
+        # parent_path=['valueRange', 'low', 'value'] instead of [].
+        saved_path = self.context.parent_path.copy()
+        saved_table = self.context.current_table
+        saved_element_column = self.context.current_element_column
+        saved_element_type = self.context.current_element_type
+
+        # Translate left operand
         left_fragment = self.visit(node.children[0])
+
+        # Restore context before translating right operand
+        self.context.parent_path = saved_path.copy()
+        self.context.current_table = saved_table
+        self.context.current_element_column = saved_element_column
+        self.context.current_element_type = saved_element_type
+
+        # Translate right operand with clean context
         right_fragment = self.visit(node.children[1])
 
         # SP-022-007: Fix column reference for first()/last()/skip()/take() + comparison
