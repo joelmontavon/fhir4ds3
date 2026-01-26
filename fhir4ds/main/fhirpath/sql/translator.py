@@ -1132,6 +1132,23 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Delegate to dialect for time literal syntax
             sql_expr = self.dialect.generate_time_literal(str(node.value))
 
+        elif node.literal_type == "quantity":
+            # SP-104-003: Handle quantity literals (duration literals like "7 days")
+            # If temporal_info is present, generate INTERVAL SQL
+            if hasattr(node, 'temporal_info') and node.temporal_info:
+                temporal_info = node.temporal_info
+                if temporal_info.get('kind') == 'duration':
+                    # Generate INTERVAL SQL: INTERVAL '7 days'
+                    value = temporal_info.get('value', str(node.value))
+                    unit = temporal_info.get('unit', 'days')
+                    sql_expr = f"INTERVAL '{value} {unit}'"
+                else:
+                    # Fall back to numeric value
+                    sql_expr = str(node.value)
+            else:
+                # Fall back to numeric value
+                sql_expr = str(node.value)
+
         elif node.literal_type == "empty_collection":
             # Empty collection literal {} - generate SQL for empty JSON array
             # SP-100-003: Empty collections are represented as empty JSON arrays
