@@ -1141,8 +1141,52 @@ class DuckDBDialect(DatabaseDialect):
         return f"{date_part}T{time_part}"
 
     def generate_time_literal(self, time_value: str) -> str:
-        """Generate SQL time literal for DuckDB."""
-        return f"TIME '{time_value}'"
+        """Generate SQL time literal for DuckDB.
+
+        Handles partial time formats by padding to full HH:MM:SS format.
+        Also strips timezone suffixes (Z, +/-HH:MM) as they're not supported
+        in DuckDB TIME literals.
+
+        Args:
+            time_value: Time string (e.g., 'T14', 'T14:34', 'T14:34:28', 'T14:34:28Z')
+
+        Returns:
+            DuckDB time literal
+
+        Examples:
+            'T14' → TIME '14:00:00'
+            'T14:34' → TIME '14:34:00'
+            'T14:34:28' → TIME '14:34:28'
+            'T14:34:28Z' → TIME '14:34:28' (timezone stripped)
+        """
+        import re
+
+        # Remove @ prefix if present
+        ts = time_value.lstrip('@')
+
+        # Strip timezone suffix (Z or +/-HH:MM) - not supported in TIME literals
+        if ts.endswith('Z'):
+            ts = ts[:-1]
+        else:
+            tz_match = re.search(r'([+-]\d{2}:\d{2})$', ts)
+            if tz_match:
+                ts = ts[:tz_match.start()]
+
+        # Remove 'T' prefix if present (FHIRPath time literal syntax)
+        if ts.startswith('T'):
+            ts = ts[1:]
+
+        # Pad partial time to HH:MM:SS format
+        time_parts = ts.split(':')
+        if len(time_parts) == 1:
+            # Hour only: 14 → 14:00:00
+            ts = f"{time_parts[0]}:00:00"
+        elif len(time_parts) == 2:
+            # Hour:minute: 14:30 → 14:30:00
+            ts = f"{time_parts[0]}:{time_parts[1]}:00"
+        # else: already HH:MM:SS or HH:MM:SS.fff
+
+        return f"TIME '{ts}'"
 
     def generate_comparison(self, left_expr: str, operator: str, right_expr: str) -> str:
         """Generate SQL comparison operation for DuckDB.

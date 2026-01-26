@@ -383,7 +383,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return False
 
-    def _generate_literal_type_check(self, expression: str, target_type: str) -> str:
+    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None) -> str:
         """Generate SQL type check for literal values.
 
         SP-022-003: This method generates simplified type checks for SQL literals
@@ -392,14 +392,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         For literals, we use typeof() directly without the JSON handling branches,
         since we know the value is a native SQL type (not JSON).
 
+        SP-103-001: Time literals with timezone suffixes (Z or +/-HH:MM) should
+        NOT pass .is(Time) checks because FHIRPath Time literals cannot have
+        timezones. Such literals are treated as DateTime, not Time.
+
         Args:
             expression: SQL literal expression (e.g., "1", "1.0", "'hello'", "TRUE")
             target_type: FHIRPath type name to check (e.g., "Integer", "Decimal", "String")
+            original_literal: Optional original FHIRPath literal text (e.g., "@T14:34:28Z")
 
         Returns:
             SQL expression that evaluates to boolean
         """
         normalized_type = (target_type or "").lower().replace("system.", "")
+
+        # SP-103-001: Special handling for Time type check
+        # Time literals with timezone suffixes should cause execution error
+        if normalized_type == 'time' and original_literal:
+            # Check if the original literal has a timezone suffix
+            import re
+            # Patterns for timezone: Z or +/-HH:MM
+            has_tz = bool(re.search(r'[Z]|[+-]\d{2}:\d{2}$', original_literal))
+            if has_tz:
+                # Time literal with timezone is invalid - generate SQL that will fail
+                # Cast an invalid time string to TIME type - this will cause a conversion error
+                return "CAST('INVALID_TIME_WITH_TIMEZONE' AS TIME)"
 
         # Map FHIRPath types to SQL type checks
         # Use dialect's generate_scalar_type_check if available, otherwise construct directly
@@ -7796,7 +7813,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # SP-022-003: For literal values, use simplified type checking that
         # doesn't involve json_type() which fails on non-JSON values
         if self._is_sql_literal_expression(value_expr):
-            type_check_sql = self._generate_literal_type_check(value_expr, canonical_type)
+            # SP-103-001: Extract original literal text for timezone detection
+            original_literal = None
+            if self.fragments and len(self.fragments) > 0:
+                # Find the fragment that matches the value_expr
+                # The literal might not be the last fragment (could be earlier in the chain)
+                for frag in self.fragments:
+                    if hasattr(frag, 'expression') and str(frag.expression) == str(value_expr):
+                        # Try to get original literal from metadata first
+                        if hasattr(frag, 'metadata') and frag.metadata:
+                            original_literal = frag.metadata.get('source_text') or frag.metadata.get('text')
+                        # If not in metadata, try extracting from the expression itself
+                        if not original_literal and hasattr(frag, 'expression'):
+                            expr_str = str(frag.expression)
+                            # Strip SQL quotes to get the actual FHIRPath literal
+                            # SQL string literals are wrapped in single quotes: '@T14:34:28Z'
+                            unquoted = expr_str.strip("'\"")
+                            # Check if it looks like a FHIRPath literal (starts with @)
+                            if unquoted.startswith('@'):
+                                original_literal = unquoted
+                        break
+            type_check_sql = self._generate_literal_type_check(value_expr, canonical_type, original_literal)
         # Route to appropriate type check based on type classification
         # Maintains thin dialect principle - business logic in translator
         elif self._is_primitive_type(canonical_type):
