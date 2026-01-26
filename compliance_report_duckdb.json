@@ -1,0 +1,120 @@
+{
+  "total_tests": 934,
+  "passed_tests": 627,
+  "failed_tests": 307,
+  "compliance_percentage": 67.1,
+  "execution_time_seconds": 370.26,
+  "failed_tests_by_category": {
+    "Other": 78,
+    "Type Checking": 13,
+    "Unary Polarity": 32,
+    "Type Conversion": 9,
+    "Comparison Operators": 44,
+    "DateTime Literals": 18,
+    "Collection Functions": 20,
+    "Quantity Literals": 80,
+    "Arithmetic Operators": 13
+  },
+  "sample_failures": [
+    {
+      "name": "testPolymorphismA",
+      "expression": "Observation.value.unit",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.unit'"
+    },
+    {
+      "name": "testPolymorphismIsA1",
+      "expression": "Observation.value.is(Quantity)",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.is(Quantity)'"
+    },
+    {
+      "name": "testPolymorphismIsA2",
+      "expression": "Observation.value is Quantity",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value is Quantity'"
+    },
+    {
+      "name": "testPolymorphismIsA3",
+      "expression": "Observation.issued is instant",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.issued is instant'"
+    },
+    {
+      "name": "testPolymorphismIsB",
+      "expression": "Observation.value.is(Period).not()",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.is(Period).not()'"
+    },
+    {
+      "name": "testPolymorphismAsA",
+      "expression": "Observation.value.as(Quantity).unit",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.as(Quantity).unit'"
+    },
+    {
+      "name": "testPolymorphismAsAFunction",
+      "expression": "(Observation.value as Quantity).unit",
+      "error": "[parse] [FP070] parse stage failed for expression '(Observation.value as Quantity).unit'"
+    },
+    {
+      "name": "testPolymorphismAsBFunction",
+      "expression": "Observation.value.as(Period).start",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.as(Period).start'"
+    },
+    {
+      "name": "testDollarThis1",
+      "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
+      "error": "[parse] [FP070] parse stage failed for expression 'Patient.name.given.where(substring($this.length()-3) = 'out')'"
+    },
+    {
+      "name": "testDollarThis2",
+      "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
+      "error": "[parse] [FP070] parse stage failed for expression 'Patient.name.given.where(substring($this.length()-3) = 'ter')'"
+    },
+    {
+      "name": "testLiteralBooleanTrue",
+      "expression": "true.convertsToBoolean()",
+      "error": "[parse] [FP070] parse stage failed for expression 'true.convertsToBoolean()'"
+    },
+    {
+      "name": "testLiteralBooleanFalse",
+      "expression": "false.convertsToBoolean()",
+      "error": "[parse] [FP070] parse stage failed for expression 'false.convertsToBoolean()'"
+    },
+    {
+      "name": "testLiteralQuantityDay",
+      "expression": "4 days.convertsToQuantity()",
+      "error": "[parse] [FP070] parse stage failed for expression '4 days.convertsToQuantity()'"
+    },
+    {
+      "name": "testLiteralDecimalGreaterThanNonZeroTrue",
+      "expression": "Observation.value.value > 180.0",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 180.0'"
+    },
+    {
+      "name": "testLiteralDecimalGreaterThanZeroTrue",
+      "expression": "Observation.value.value > 0.0",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 0.0'"
+    },
+    {
+      "name": "testLiteralDecimalGreaterThanIntegerTrue",
+      "expression": "Observation.value.value > 0",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value > 0'"
+    },
+    {
+      "name": "testLiteralDecimalLessThanInteger",
+      "expression": "Observation.value.value < 190",
+      "error": "[parse] [FP070] parse stage failed for expression 'Observation.value.value < 190'"
+    },
+    {
+      "name": "testDateNotEqualTimeSecond",
+      "expression": "Patient.birthDate != @T12:14:15",
+      "error": "[execute] [FP070] execute stage failed for expression 'Patient.birthDate != @T12:14:15'"
+    },
+    {
+      "name": "testDateNotEqualTimeMinute",
+      "expression": "Patient.birthDate != @T12:14",
+      "error": "[execute] [FP070] execute stage failed for expression 'Patient.birthDate != @T12:14'"
+    },
+    {
+      "name": "testCollectionNotEqualEmpty",
+      "expression": "Patient.name.given != {}",
+      "error": "[execute] [FP070] execute stage failed for expression 'Patient.name.given != {}'"
+    }
+  ]
+}

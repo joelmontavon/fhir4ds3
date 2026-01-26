@@ -703,6 +703,36 @@ class SemanticValidator:
                         "Incomplete expression: missing right operand for division operator"
                     )
 
+    def _validate_time_literal_timezones(self, raw_expression: str) -> None:
+        """
+        SP-103-001: Validate that Time literals do not have timezone suffixes.
+
+        According to the FHIRPath specification, Time literals (@THH:MM:SS) cannot
+        have timezone suffixes (Z or +/-HH:MM). If a time-like literal has a
+        timezone suffix, it's considered invalid.
+
+        Args:
+            raw_expression: Original expression text
+
+        Raises:
+            FHIRPathParseError: When a Time literal has a timezone suffix
+        """
+        # Match time literals with timezone suffixes
+        # Pattern: @T followed by time (HH:MM:SS or partial) and timezone (Z or +/-HH:MM)
+        # Group 1: optional fractional seconds
+        # Group 2: timezone suffix
+        pattern = r'@T\d{2}(?::\d{2})?(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})'
+
+        match = re.search(pattern, raw_expression)
+        if match:
+            tz_suffix = match.group(1)  # Timezone is now group 1
+            literal = match.group(0)
+
+            raise FHIRPathParseError(
+                f"Time literal '{literal}' is invalid: Time literals cannot have timezone suffixes. "
+                f"Use DateTime literal format (e.g., @2015-02-04T{tz_suffix}) for time with timezone."
+            )
+
     def _validate_unary_operators_on_literals(
         self,
         raw_expression: str,
