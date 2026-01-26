@@ -808,6 +808,24 @@ class EnhancedASTNode:
                         self.metadata = enhanced_node.metadata
                         self.children = enhanced_node.children
 
+                        # SP-104-002: Extract value expression from parent if available
+                        # For InvocationExpression like "@2015.is(Date)", the value expression (@2015)
+                        # is a sibling of the type operation in the parent's children
+                        self.value_expression = None
+                        if (hasattr(enhanced_node, 'parent') and
+                            enhanced_node.parent and
+                            enhanced_node.parent.node_type == 'InvocationExpression' and
+                            len(enhanced_node.parent.children) >= 2):
+                            # The parent is an InvocationExpression with multiple children
+                            # The first child should be the value expression
+                            for child in enhanced_node.parent.children:
+                                # Skip the type operation node itself
+                                if child is not enhanced_node and child.metadata:
+                                    # Check if this is the value expression (not another type operation)
+                                    if child.metadata.node_category != NodeCategory.TYPE_OPERATION:
+                                        self.value_expression = child
+                                        break
+
                         # Extract operation and target type
                         self.operation, self.target_type = self._extract_operation_and_type(enhanced_node)
 
