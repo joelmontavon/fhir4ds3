@@ -1,18 +1,18 @@
 {
   "total_tests": 934,
-  "passed_tests": 624,
-  "failed_tests": 310,
-  "compliance_percentage": 66.8,
-  "execution_time_seconds": 364.08,
+  "passed_tests": 627,
+  "failed_tests": 307,
+  "compliance_percentage": 67.1,
+  "execution_time_seconds": 370.43,
   "failed_tests_by_category": {
     "Other": 78,
     "Type Checking": 10,
-    "Unary Polarity": 32,
+    "Unary Polarity": 31,
     "Type Conversion": 9,
     "DateTime Literals": 20,
     "Comparison Operators": 44,
     "Collection Functions": 20,
-    "Quantity Literals": 84,
+    "Quantity Literals": 82,
     "Arithmetic Operators": 13
   },
   "sample_failures": [
