@@ -1566,8 +1566,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # SP-022-008: Array field after subset - generate UNNEST fragment
                 # Build array extraction path with [*] for unnesting
                 array_path = element_path + "[*]"
+
+                # SP-102-002: Use logical column name instead of resolved alias for element columns
+                # When extracting from an element column (e.g., after skip()), we need to use
+                # the logical column name (e.g., "result") rather than the actual column name
+                # from the previous CTE (e.g., "name_item"), because the CTE builder will
+                # handle the column reference correctly.
+                # Only resolve the alias if it's not coming from an element column.
+                if self.context.current_element_column:
+                    # Use the logical element column name directly
+                    column_for_extraction = self.context.current_element_column
+                    logger.debug(
+                        f"SP-102-002: Using logical element column '{column_for_extraction}' "
+                        f"instead of resolving alias '{actual_element_column}'"
+                    )
+                else:
+                    # No element column, use the resolved alias
+                    column_for_extraction = actual_element_column
+
                 array_column = self.dialect.extract_json_object(
-                    column=actual_element_column,
+                    column=column_for_extraction,
                     path=array_path
                 )
 
