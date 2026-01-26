@@ -622,6 +622,11 @@ class SemanticValidator:
             if not segment:
                 continue
 
+            # SP-103-007: Skip validation for boolean literals (true, false)
+            # These are not path elements but literal values
+            if segment.lower() in {"true", "false"}:
+                break
+
             element_type = registry.get_element_type(current_type, segment)
             if element_type is None:
                 if current_type in {"BackboneElement", "Element"}:
