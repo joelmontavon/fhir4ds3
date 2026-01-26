@@ -805,6 +805,7 @@ class EnhancedASTNode:
                         """Extract the type operation and target type.
 
                         SP-023-006: Replicated from ASTAdapter._convert_type_expression().
+                        SP-103-005: Enhanced to handle ofType() with nested type structure.
                         """
                         text = node.text or ""
 
@@ -817,16 +818,17 @@ class EnhancedASTNode:
                                 target_type = self._extract_type_from_children(node)
                                 return op, target_type
 
-                        # Parse from text
+                        # SP-103-005: Check for ofType operation first
+                        # The text for ofType() is 'ofType()' so we check for that pattern
+                        if text == 'ofType()' or 'ofType(' in text:
+                            target_type = self._extract_type_from_children(node)
+                            return 'ofType', target_type or 'Unknown'
+
+                        # Parse from text for other operations
                         if ' is ' in text:
                             return 'is', text.split(' is ')[-1].strip()
                         elif ' as ' in text:
                             return 'as', text.split(' as ')[-1].strip()
-                        elif 'ofType(' in text:
-                            start = text.find('ofType(') + 7
-                            end = text.find(')', start)
-                            if end > start:
-                                return 'ofType', text[start:end].strip()
 
                         # Try to get type from children (TypeSpecifier)
                         target_type = self._extract_type_from_children(node)
@@ -836,6 +838,15 @@ class EnhancedASTNode:
 
                     def _extract_type_from_children(self, node):
                         """Extract target type from TypeSpecifier child node."""
+                        # SP-103-005: Handle nested structure for type operations like ofType(Range)
+                        # The AST structure for ofType(Range) is:
+                        # - node (ofType())
+                        #   - children[0] (parentheses)
+                        #     - children[0] (operation name: ofType)
+                        #     - children[1] (type specifier)
+                        #       - children[0] (type name: Range)
+
+                        # First, try the original structure (TypeSpecifier as second child)
                         if len(node.children) >= 2:
                             type_spec = node.children[1]
                             if type_spec.text:
@@ -844,6 +855,26 @@ class EnhancedASTNode:
                                 for child in type_spec.children:
                                     if child.text:
                                         return child.text.strip()
+
+                        # SP-103-005: Try nested structure (parentheses as first child)
+                        if len(node.children) >= 1 and node.children[0].children:
+                            parens_node = node.children[0]
+                            # Look for the type in the second child of the parentheses node
+                            if len(parens_node.children) >= 2:
+                                type_spec = parens_node.children[1]
+                                if type_spec.text:
+                                    return type_spec.text.strip()
+                                # Recursively search for the type name
+                                if type_spec.children:
+                                    for child in type_spec.children:
+                                        if child.text and child.text not in ['(', ')', '']:
+                                            return child.text.strip()
+                                        # Search deeper
+                                        if child.children:
+                                            for grandchild in child.children:
+                                                if grandchild.text and grandchild.text not in ['(', ')', '']:
+                                                    return grandchild.text.strip()
+
                         return None
 
                     def accept(self, v):
@@ -1063,7 +1094,10 @@ class ASTNodeFactory:
         hints = {OptimizationHint.PROJECTION_SAFE}
         sql_type = SQLDataType.UNKNOWN
 
-        if function_name in ['count', 'sum', 'avg', 'min', 'max']:
+        # SP-103-005: Check for type operations before other categories
+        if function_name.lower() in ['is', 'as', 'oftype']:
+            category = NodeCategory.TYPE_OPERATION
+        elif function_name in ['count', 'sum', 'avg', 'min', 'max']:
             category = NodeCategory.AGGREGATION
             hints.add(OptimizationHint.AGGREGATION_CANDIDATE)
             sql_type = SQLDataType.INTEGER if function_name == 'count' else SQLDataType.DECIMAL
@@ -1360,8 +1394,12 @@ class ASTNodeFactory:
         elif 'identifier' in node_type_lower:
             return NodeCategory.PATH_EXPRESSION
         elif 'invocation' in node_type_lower or 'function' in node_type_lower:
+            # SP-103-005: Check for type operations (is, as, ofType) before aggregation
+            # Match patterns like "is(", "as(", "oftype(", "is()", "as()", "oftype()"
+            if any(pattern in text_lower for pattern in ['is(', 'as(', 'oftype(', 'is()', 'as()', 'oftype()']):
+                return NodeCategory.TYPE_OPERATION
             # Check if it's an aggregation function
-            if any(func in text_lower for func in ['count', 'sum', 'avg', 'min', 'max']):
+            elif any(func in text_lower for func in ['count', 'sum', 'avg', 'min', 'max']):
                 return NodeCategory.AGGREGATION
             else:
                 return NodeCategory.FUNCTION_CALL
