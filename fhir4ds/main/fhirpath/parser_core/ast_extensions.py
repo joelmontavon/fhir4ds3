@@ -232,6 +232,29 @@ class EnhancedASTNode:
                         if text.lower() == 'false':
                             return False, "boolean", None
 
+                        # SP-104-003: Handle duration/quantity literals (e.g., "7days", "1 second")
+                        # Pattern: number followed by temporal unit (days, weeks, months, years, hours, minutes, seconds)
+                        duration_match = re.match(r'^(\d+(?:\.\d+)?)\s*(' +
+                                                r'day|days|week|weeks|month|months|year|years|' +
+                                                r'hour|hours|minute|minutes|second|seconds|millisecond|milliseconds)$',
+                                                text, re.IGNORECASE)
+                        if duration_match:
+                            value = duration_match.group(1)
+                            unit = duration_match.group(2)
+                            # Return as quantity literal with temporal unit info
+                            temporal_info = {
+                                'kind': 'duration',
+                                'value': value,
+                                'unit': unit,
+                                'original': text
+                            }
+                            # Return the value as the parsed value, but mark as quantity
+                            # The translator will use the temporal_info to generate INTERVAL SQL
+                            if '.' in value:
+                                return float(value), "quantity", temporal_info
+                            else:
+                                return int(value), "quantity", temporal_info
+
                         # Handle numeric literals
                         try:
                             if '.' in text and not text.startswith('@'):
