@@ -1424,6 +1424,27 @@ class DuckDBDialect(DatabaseDialect):
             logger.warning(f"Unknown FHIRPath type '{target_type}' in type cast, returning NULL")
             return "NULL"
 
+        # SP-104-006: Handle partial date strings for DateTime casting
+        # When the parser strips the 'T' suffix from @2015T, we get just "2015"
+        # We need to pad it to "2015-01-01" for TIMESTAMP casting
+        if normalized_type == "datetime" and duckdb_type == "TIMESTAMP":
+            # Check if expression is a simple string literal that might be a partial date
+            # Pattern: expression looks like '2015' or '2015-02' (single-quoted string)
+            import re
+            # Extract string literal if present
+            str_match = re.match(r"^'([^']+)'$", expression.strip())
+            if str_match:
+                date_str = str_match.group(1)
+                # Check if it's a partial date (YYYY or YYYY-MM)
+                if re.match(r'^\d{4}$', date_str):
+                    # Year only: pad to YYYY-01-01
+                    padded = f"{date_str}-01-01"
+                    return f"TRY_CAST('{padded}' AS {duckdb_type})"
+                elif re.match(r'^\d{4}-\d{2}$', date_str):
+                    # Year-month: pad to YYYY-MM-01
+                    padded = f"{date_str}-01"
+                    return f"TRY_CAST('{padded}' AS {duckdb_type})"
+
         # Generate type casting SQL using DuckDB's TRY_CAST() function
         # TRY_CAST returns NULL on conversion failure instead of throwing error
         return f"TRY_CAST({expression} AS {duckdb_type})"

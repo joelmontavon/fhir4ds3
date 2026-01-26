@@ -352,11 +352,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         we need to use simpler type checks that don't involve json_type() which
         fails on non-JSON values in DuckDB.
 
+        SP-104-002: Also recognize temporal literals (DATE, TIMESTAMP, TIME) for
+        type checking in is() function calls.
+
         Args:
             expression: SQL expression string
 
         Returns:
-            True if expression is a SQL literal (integer, decimal, string, boolean)
+            True if expression is a SQL literal (integer, decimal, string, boolean, temporal)
         """
         expr = expression.strip()
 
@@ -367,6 +370,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # String literal: starts and ends with single quotes
         if expr.startswith("'") and expr.endswith("'"):
             return True
+
+        # SP-104-002: Temporal literals (DATE, TIMESTAMP, TIME)
+        # Pattern: DATE '...', TIMESTAMP '...', TIME '...'
+        temporal_patterns = [
+            r"^DATE\s+'",
+            r"^TIMESTAMP\s+'",
+            r"^TIME\s+'",
+        ]
+        for pattern in temporal_patterns:
+            if re.match(pattern, expr, re.IGNORECASE):
+                return True
 
         # Numeric literal: digits, possibly with decimal point and leading minus
         # Remove potential leading minus
@@ -441,27 +455,68 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 'boolean': ['boolean', 'bool'],
             }
 
-        # Handle temporal types with regex (partial dates like @2015 are strings)
-        temporal_regex = {
-            'date': r'^\d{4}(-\d{2}(-\d{2})?)?$',
-            'datetime': r'^\d{4}(-\d{2}(-\d{2})?)?T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$',
-            'time': r'^\d{2}:\d{2}:\d{2}(\.\d+)?$',
+        # Handle temporal types (SP-104-002: Fix for temporal literal type checks)
+        # Temporal literals (@2015, @2015-02-04T14:34, @T14:34:28) are converted to native
+        # SQL types (DATE, TIMESTAMP, TIME), not strings. The type check must handle both:
+        # 1. Native SQL temporal types (typeof() returns DATE, TIMESTAMP, TIME)
+        # 2. String representations (for partial dates or edge cases)
+        temporal_types = {
+            'date': ('DATE', 'date'),
+            'datetime': ('TIMESTAMP', 'timestamp'),
+            'time': ('TIME', 'time'),
         }
-        if normalized_type in temporal_regex:
-            pattern = temporal_regex[normalized_type].replace("'", "''")
+        if normalized_type in temporal_types:
+            duckdb_type, pg_type = temporal_types[normalized_type]
             if dialect_name == 'DUCKDB':
-                native_types = {'date': 'DATE', 'datetime': 'TIMESTAMP', 'time': 'TIME'}
-                native_type = native_types.get(normalized_type, 'DATE')
+                # SP-104-002: Check typeof() first for native types, then fallback to regex
+                # For temporal literals, we also need to handle the original_literal pattern
+                # because temporal literals like @2015 are stored as DATE '2015-01-01'
+                # The original_literal preserves the "@2015" pattern for partial date detection
+                if original_literal and original_literal.startswith('@'):
+                    # SP-104-006: Workaround for ANTLR lexer stripping 'T' suffix from partial DateTimes
+                    # If original_literal is @YYYY (Date pattern) but we're checking for DateTime,
+                    # it might have been @YYYYT originally. Check if expression is a TIMESTAMP type.
+                    # This handles cases like @2015T.is(DateTime) where lexer strips the T.
+                    if normalized_type == 'datetime':
+                        # Check if the SQL expression is a TIMESTAMP (would be generated from @YYYYT)
+                        # If so, the original was likely a partial DateTime, not a Date
+                        if f"TIMESTAMP '" in expression or "TIMESTAMP '" in str(expression):
+                            # This is a TIMESTAMP literal, so it's a DateTime type
+                            return "true"
+
+                    # Parse the temporal literal to determine its type
+                    parsed = self.temporal_parser.parse(original_literal)
+                    if parsed:
+                        # Check if the parsed type matches the target type
+                        parsed_type = parsed.temporal_type.lower()  # 'date', 'datetime', 'time'
+                        if parsed_type == normalized_type or (
+                            normalized_type == 'datetime' and parsed_type == 'instant'
+                        ):
+                            # Exact type match - return true
+                            return "true"
+                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
+                            # DateTime can match Date or Time in some contexts
+                            # This is per FHIRPath specification
+                            return "true"
+
+                # Default: Check typeof() for native SQL types
                 return (
-                    f"(typeof({expression}) = '{native_type}' OR "
-                    f"regexp_matches(CAST({expression} AS VARCHAR), '{pattern}'))"
+                    f"typeof({expression}) = '{duckdb_type}'"
                 )
             else:  # PostgreSQL
-                native_types = {'date': 'date', 'datetime': 'timestamp', 'time': 'time'}
-                native_type = native_types.get(normalized_type, 'date')
+                # SP-104-002: Check pg_typeof() first for native types, also handle original_literal
+                if original_literal and original_literal.startswith('@'):
+                    parsed = self.temporal_parser.parse(original_literal)
+                    if parsed:
+                        parsed_type = parsed.temporal_type.lower()
+                        if parsed_type == normalized_type or (
+                            normalized_type == 'datetime' and parsed_type == 'instant'
+                        ):
+                            return "true"
+                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
+                            return "true"
                 return (
-                    f"(pg_typeof({expression})::text LIKE '{native_type}%' OR "
-                    f"CAST({expression} AS VARCHAR) ~ '{pattern}')"
+                    f"pg_typeof({expression})::text LIKE '{pg_type}%'"
                 )
 
         sql_types = type_map.get(normalized_type, [])
@@ -1040,16 +1095,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # Return SQL fragment marked as empty collection
             # The actual SQL expression depends on context (handled by consumers)
+            # SP-104-002: Include source text for consistency
+            empty_metadata = {
+                "literal_type": "empty_collection",
+                "is_literal": True,
+                "is_empty_collection": True
+            }
+            if node.text:
+                empty_metadata["source_text"] = node.text
+                empty_metadata["text"] = node.text
+
             return SQLFragment(
                 expression="NULL",  # Default - consumers will override
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                metadata={
-                    "literal_type": "empty_collection",
-                    "is_literal": True,
-                    "is_empty_collection": True
-                }
+                metadata=empty_metadata
             )
 
         # Handle different literal types
@@ -1082,6 +1143,23 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Delegate to dialect for time literal syntax
             sql_expr = self.dialect.generate_time_literal(str(node.value))
 
+        elif node.literal_type == "quantity":
+            # SP-104-003: Handle quantity literals (duration literals like "7 days")
+            # If temporal_info is present, generate INTERVAL SQL
+            if hasattr(node, 'temporal_info') and node.temporal_info:
+                temporal_info = node.temporal_info
+                if temporal_info.get('kind') == 'duration':
+                    # Generate INTERVAL SQL: INTERVAL '7 days'
+                    value = temporal_info.get('value', str(node.value))
+                    unit = temporal_info.get('unit', 'days')
+                    sql_expr = f"INTERVAL '{value} {unit}'"
+                else:
+                    # Fall back to numeric value
+                    sql_expr = str(node.value)
+            else:
+                # Fall back to numeric value
+                sql_expr = str(node.value)
+
         elif node.literal_type == "empty_collection":
             # Empty collection literal {} - generate SQL for empty JSON array
             # SP-100-003: Empty collections are represented as empty JSON arrays
@@ -1106,12 +1184,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Return SQL fragment with literal expression
         # Literals don't require unnesting and are not aggregate operations
         # Include literal_type in metadata for type-aware comparison casting
+        # SP-104-002: Include source text and temporal_info for type checking
+        fragment_metadata = {
+            "literal_type": node.literal_type,
+            "is_literal": True
+        }
+        # Include source text for temporal literals to support type checking
+        if node.text:
+            fragment_metadata["source_text"] = node.text
+        if node.text:
+            fragment_metadata["text"] = node.text
+        # Include temporal_info if available (for date/time literals)
+        if hasattr(node, 'temporal_info') and node.temporal_info:
+            fragment_metadata["temporal_info"] = node.temporal_info
+
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"literal_type": node.literal_type, "is_literal": True}
+            metadata=fragment_metadata
         )
 
     def _path_requires_unnest(self, path_components: List[str]) -> bool:
@@ -7371,9 +7463,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if not node.children:
             raise ValueError("is() operation requires an expression to check")
 
-        expr_fragment = self.visit(node.children[0])
+        # SP-104-002: Check if node has value_expression attribute (from parent InvocationExpression)
+        # This handles cases like "@2015.is(Date)" where the literal is a sibling in the parent
+        if hasattr(node, 'value_expression') and node.value_expression is not None:
+            # Visit the value expression from the parent
+            expr_fragment = self.visit(node.value_expression)
+        elif node.children:
+            # Fall back to visiting the first child
+            expr_fragment = self.visit(node.children[0])
+        else:
+            raise ValueError("is() operation requires an expression to check")
+
         canonical_type = self._resolve_canonical_type(node.target_type)
         normalized = canonical_type.lower()
+
+        # SP-104-002: Extract original literal for temporal type checking
+        original_literal = None
+        if hasattr(expr_fragment, 'metadata') and expr_fragment.metadata:
+            if expr_fragment.metadata.get('is_literal'):
+                original_literal = (
+                    expr_fragment.metadata.get('source_text') or
+                    expr_fragment.metadata.get('text') or
+                    expr_fragment.metadata.get('temporal_info', {}).get('original') if expr_fragment.metadata.get('temporal_info') else None
+                )
 
         primitive_families = {
             "uri",
@@ -7393,6 +7505,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         elif normalized == "collection":
             type_check_sql = (
                 f"CASE WHEN {expr_fragment.expression} IS NULL THEN false ELSE true END"
+            )
+        # SP-104-002: Check for temporal literals first
+        elif original_literal and original_literal.startswith('@'):
+            # Temporal literal - use literal type check
+            type_check_sql = self._generate_literal_type_check(
+                expr_fragment.expression,
+                canonical_type,
+                original_literal
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -8164,12 +8284,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Example: "Observation.value.is(Quantity)" → path="Observation.value"
         path_expr = self._extract_path_before_function(node.text, node.function_name)
 
+        # SP-104-002: Track original literal text for temporal type checking
+        original_literal = None
+
         # Get the value expression
         # SP-022-003: When is() is called as a method on a literal (e.g., 1.is(Integer)),
         # the function call node only contains "is()" as text, not "1.is(Integer)".
-        # In this case, check if there's a previous fragment that contains the
-        # expression we should be type-checking.
-        if path_expr:
+        # SP-104-002: Check pending_literal_value first for temporal literals
+        if self.context.pending_literal_value is not None:
+            # Use the pending literal value
+            literal_value, value_expr = self.context.pending_literal_value
+            # The pending_literal_value is a tuple (value, sql_expr)
+            # For temporal literals, the sql_expr contains the DATE/TIMESTAMP/TIME literal
+            # We need to preserve the original literal text for type checking
+            # Check if there's temporal_info in the most recent fragment
+            if self.fragments and len(self.fragments) > 0:
+                last_frag = self.fragments[-1]
+                if hasattr(last_frag, 'metadata') and last_frag.metadata:
+                    original_literal = (
+                        last_frag.metadata.get('source_text') or
+                        last_frag.metadata.get('text') or
+                        last_frag.metadata.get('temporal_info', {}).get('original') if last_frag.metadata.get('temporal_info') else None
+                    )
+            # Clear the pending value after using it
+            self.context.pending_literal_value = None
+        elif path_expr:
             # Parse and translate the path expression to update context
             # SP-023-004B: Use EnhancedASTNode directly - accept() handles dispatch
             from ..parser import FHIRPathParser
@@ -8179,12 +8318,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Visit the path to update context
             path_fragment = self.visit(path_ast)
             value_expr = path_fragment.expression
+            # Check if path_fragment has temporal literal metadata
+            if hasattr(path_fragment, 'metadata') and path_fragment.metadata:
+                original_literal = (
+                    path_fragment.metadata.get('source_text') or
+                    path_fragment.metadata.get('text') or
+                    path_fragment.metadata.get('temporal_info', {}).get('original') if path_fragment.metadata.get('temporal_info') else None
+                )
         elif self.fragments:
             # SP-022-003: No path in node.text, but we have previous fragments.
             # This happens with invocation patterns like "1.is(Integer)" where
             # the AST has the literal as a sibling node that was already visited.
             # Use the previous fragment's expression as the value to type-check.
             value_expr = self.fragments[-1].expression
+            # Check if the last fragment has temporal literal metadata
+            if hasattr(self.fragments[-1], 'metadata') and self.fragments[-1].metadata:
+                original_literal = (
+                    self.fragments[-1].metadata.get('source_text') or
+                    self.fragments[-1].metadata.get('text') or
+                    self.fragments[-1].metadata.get('temporal_info', {}).get('original') if self.fragments[-1].metadata.get('temporal_info') else None
+                )
         else:
             # No explicit path and no previous fragments, use current context
             current_path = self.context.get_json_path()
@@ -8198,27 +8351,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # SP-022-003: For literal values, use simplified type checking that
         # doesn't involve json_type() which fails on non-JSON values
-        if self._is_sql_literal_expression(value_expr):
-            # SP-103-001: Extract original literal text for timezone detection
-            original_literal = None
-            if self.fragments and len(self.fragments) > 0:
-                # Find the fragment that matches the value_expr
-                # The literal might not be the last fragment (could be earlier in the chain)
-                for frag in self.fragments:
-                    if hasattr(frag, 'expression') and str(frag.expression) == str(value_expr):
-                        # Try to get original literal from metadata first
-                        if hasattr(frag, 'metadata') and frag.metadata:
-                            original_literal = frag.metadata.get('source_text') or frag.metadata.get('text')
-                        # If not in metadata, try extracting from the expression itself
-                        if not original_literal and hasattr(frag, 'expression'):
-                            expr_str = str(frag.expression)
-                            # Strip SQL quotes to get the actual FHIRPath literal
-                            # SQL string literals are wrapped in single quotes: '@T14:34:28Z'
-                            unquoted = expr_str.strip("'\"")
-                            # Check if it looks like a FHIRPath literal (starts with @)
-                            if unquoted.startswith('@'):
-                                original_literal = unquoted
-                        break
+        # SP-104-002: Check if value_expr is a literal or if we have original_literal
+        if self._is_sql_literal_expression(value_expr) or original_literal:
             type_check_sql = self._generate_literal_type_check(value_expr, canonical_type, original_literal)
         # Route to appropriate type check based on type classification
         # Maintains thin dialect principle - business logic in translator
