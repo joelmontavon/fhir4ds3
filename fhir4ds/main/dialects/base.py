@@ -655,6 +655,46 @@ class DatabaseDialect(ABC):
         pass
 
     @abstractmethod
+    def strict_cast_to_decimal(self, expression: str) -> str:
+        """Strictly cast expression to DECIMAL, throwing error on failure.
+
+        SP-103-004: Used for type validation in comparisons. When comparing
+        numeric values with incompatible types (e.g., string literals), this
+        will cause a SQL execution error as expected by FHIRPath semantics.
+
+        Args:
+            expression: SQL expression to cast
+
+        Returns:
+            Database-specific SQL for strict cast to DECIMAL
+
+        Example:
+            DuckDB: CAST(expr AS DECIMAL)
+            PostgreSQL: expr::DECIMAL
+        """
+        pass
+
+    @abstractmethod
+    def strict_cast_to_integer(self, expression: str) -> str:
+        """Strictly cast expression to INTEGER, throwing error on failure.
+
+        SP-103-004: Used for type validation in comparisons. When comparing
+        integer values with incompatible types (e.g., string literals), this
+        will cause a SQL execution error as expected by FHIRPath semantics.
+
+        Args:
+            expression: SQL expression to cast
+
+        Returns:
+            Database-specific SQL for strict cast to INTEGER
+
+        Example:
+            DuckDB: CAST(expr AS BIGINT)
+            PostgreSQL: expr::BIGINT
+        """
+        pass
+
+    @abstractmethod
     def safe_cast_to_date(self, expression: str) -> str:
         """Safely cast expression to DATE, returning NULL on failure.
 

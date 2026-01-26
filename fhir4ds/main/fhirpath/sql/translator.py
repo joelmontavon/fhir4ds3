@@ -383,7 +383,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return False
 
-    def _generate_literal_type_check(self, expression: str, target_type: str) -> str:
+    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None) -> str:
         """Generate SQL type check for literal values.
 
         SP-022-003: This method generates simplified type checks for SQL literals
@@ -392,14 +392,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         For literals, we use typeof() directly without the JSON handling branches,
         since we know the value is a native SQL type (not JSON).
 
+        SP-103-001: Time literals with timezone suffixes (Z or +/-HH:MM) should
+        NOT pass .is(Time) checks because FHIRPath Time literals cannot have
+        timezones. Such literals are treated as DateTime, not Time.
+
         Args:
             expression: SQL literal expression (e.g., "1", "1.0", "'hello'", "TRUE")
             target_type: FHIRPath type name to check (e.g., "Integer", "Decimal", "String")
+            original_literal: Optional original FHIRPath literal text (e.g., "@T14:34:28Z")
 
         Returns:
             SQL expression that evaluates to boolean
         """
         normalized_type = (target_type or "").lower().replace("system.", "")
+
+        # SP-103-001: Special handling for Time type check
+        # Time literals with timezone suffixes should cause execution error
+        if normalized_type == 'time' and original_literal:
+            # Check if the original literal has a timezone suffix
+            import re
+            # Patterns for timezone: Z or +/-HH:MM
+            has_tz = bool(re.search(r'[Z]|[+-]\d{2}:\d{2}$', original_literal))
+            if has_tz:
+                # Time literal with timezone is invalid - generate SQL that will fail
+                # Cast an invalid time string to TIME type - this will cause a conversion error
+                return "CAST('INVALID_TIME_WITH_TIMEZONE' AS TIME)"
 
         # Map FHIRPath types to SQL type checks
         # Use dialect's generate_scalar_type_check if available, otherwise construct directly
@@ -853,6 +870,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Will need full UCUM library support
         return None
 
+    def _evaluate_literal_to_date(self, value: Any) -> Optional[str]:
+        """Evaluate toDate() for literal values.
+
+        SP-103-006: Implement toDate() literal evaluation.
+        Converts a valid date string to ISO 8601 date format.
+        Only accepts date strings without time component.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            # Validate ISO 8601 date format (no time component)
+            stripped = value.strip()
+            # Pattern: YYYY, YYYY-MM, or YYYY-MM-DD (no 'T' or time allowed)
+            if re.match(r'^\d{4}(-\d{2}(-\d{2})?)?$', stripped):
+                # Ensure it doesn't have time component
+                if 'T' not in stripped:
+                    return stripped
+            return None
+        return None
+
     def _evaluate_literal_to_datetime(self, value: Any) -> Optional[str]:
         """Evaluate toDateTime() for literal values."""
         if value is None:
@@ -893,10 +930,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Returns:
             True if node is an empty collection literal
         """
-        if isinstance(node, LiteralNode):
-            # Check for empty collection marker: text is '{}' or value is {}
-            return (node.text == '{}' or
-                    (isinstance(node.value, str) and node.value == '{}'))
+        # Check for empty collection by text or literal_type attribute
+        # This handles both LiteralNode and LiteralNodeAdapter
+        text = getattr(node, 'text', None)
+        literal_type = getattr(node, 'literal_type', None)
+
+        # Check by text value
+        if text == '{}':
+            return True
+
+        # Check by literal_type (for LiteralNodeAdapter)
+        if literal_type == 'empty_collection':
+            return True
+
+        # Check by value attribute
+        value = getattr(node, 'value', None)
+        if isinstance(value, str) and value == '{}':
+            return True
+
         return False
 
     def _translate_empty_collection(self, context: str = "default") -> str:
@@ -1382,6 +1433,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
+                metadata={"source_path": self._build_json_path(processed_components)},
             )
 
             self.fragments.append(final_fragment)
@@ -1443,6 +1495,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         identifier_value = node.identifier or node.text
         logger.debug(f"Translating identifier: {identifier_value}")
+        logger.debug(f"SP-103-005: visit_identifier: identifier_value='{identifier_value}', parent_path={self.context.parent_path}")
+
+        # SP-103-005: Skip empty identifiers and structural nodes (parentheses, etc.)
+        # These are part of the AST structure but not actual path components
+        if not identifier_value or identifier_value in ['( )', 'ofType', 'as', 'is']:
+            logger.debug(f"SP-103-005: Skipping structural identifier: '{identifier_value}'")
+            # Return a placeholder that doesn't modify the path
+            return SQLFragment(
+                expression=self.context.current_table,
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False
+            )
 
         # Split compound identifiers (e.g., "Patient.name.family", "$this.given") into components
         components = [part.strip().strip('`') for part in identifier_value.split('.') if part.strip()]
@@ -1729,10 +1794,38 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 polymorphic_idx = idx
                 break
 
+        logger.debug(f"SP-103-005: visit_identifier checking for polymorphic: identifier={identifier_value}, parent_path={self.context.parent_path}, polymorphic_idx={polymorphic_idx}")
+
         if polymorphic_idx is not None:
             poly_prop = normalized_components[polymorphic_idx]
             remaining = normalized_components[polymorphic_idx + 1:]
             variants = resolve_polymorphic_property(poly_prop) or []
+
+            # SP-103-005: Check if there's a resolved polymorphic field from ofType()
+            if hasattr(self.context, 'polymorphic_field_mappings') and poly_prop in self.context.polymorphic_field_mappings:
+                resolved_field = self.context.polymorphic_field_mappings[poly_prop]
+                logger.debug(f"SP-103-005: Found resolved polymorphic field: {poly_prop} -> {resolved_field}")
+                logger.debug(f"SP-103-005: normalized_components={normalized_components}, polymorphic_idx={polymorphic_idx}, remaining={remaining}")
+
+                # Build path using the resolved field instead of COALESCE
+                path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
+                resolved_path = ".".join(path_parts)
+                resolved_expr = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=resolved_path
+                )
+                logger.debug(f"SP-103-005: Generated resolved field extraction: {resolved_expr}")
+                logger.debug(f"SP-103-005: Resolved path: {resolved_path}")
+
+                field_path = '.'.join(normalized_components) if normalized_components else ''
+                source_path = "$." + field_path
+                return SQLFragment(
+                    expression=resolved_expr,
+                    source_table=self.context.current_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    metadata={"is_json_string": True, "source_path": source_path}
+                )
 
             if variants:
                 # Build paths for all variants
@@ -1752,12 +1845,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 sql_expr = f"COALESCE({', '.join(variant_exprs)})"
                 logger.debug(f"Generated polymorphic COALESCE for {poly_prop}: {sql_expr}")
 
+                # SP-103-004: Include source_path for type validation
+                field_path = '.'.join(normalized_components) if normalized_components else ''
+                source_path = "$." + field_path
                 return SQLFragment(
                     expression=sql_expr,
                     source_table=self.context.current_table,
                     requires_unnest=False,
                     is_aggregate=False,
-                    metadata={"is_json_string": True}
+                    metadata={"is_json_string": True, "source_path": source_path}
                 )
 
         # Check if we're accessing a FHIR primitive type field
@@ -1788,12 +1884,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Return SQL fragment with JSON extraction expression
         # This is not an unnest operation and not an aggregate
         # Mark as JSON-extracted string for type-aware comparison casting
+        # SP-103-004: Include source_path in metadata for type validation
+        source_path = "$." + field_path if field_path else json_path
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"is_json_string": True}
+            metadata={"is_json_string": True, "source_path": source_path}
         )
 
     def visit_generic(self, node: Any) -> SQLFragment:
@@ -1926,6 +2024,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_converts_to_function(node, target_type="Decimal")
         elif function_name == "convertstoquantity":
             return self._translate_converts_to_function(node, target_type="Quantity")
+        elif function_name == "convertstodate":
+            return self._translate_converts_to_function(node, target_type="Date")
         elif function_name == "convertstodatetime":
             return self._translate_converts_to_function(node, target_type="DateTime")
         elif function_name == "convertstotime":
@@ -1940,6 +2040,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_to_decimal(node)
         elif function_name == "toquantity":
             return self._translate_to_quantity(node)
+        elif function_name == "todate":
+            return self._translate_to_date(node)
         elif function_name == "todatetime":
             return self._translate_to_datetime(node)
         elif function_name == "totime":
@@ -2631,8 +2733,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if temporal_fragment is not None:
                 return temporal_fragment
 
-        # Translate both operands
+        # SP-103-005: Save context state before translating operands
+        # This prevents path pollution where the right operand inherits
+        # parent_path modifications from the left operand.
+        # Example: value.ofType(Range).low.value + value.ofType(Range).high.value
+        # Without this isolation, the right operand incorrectly starts with
+        # parent_path=['valueRange', 'low', 'value'] instead of [].
+        saved_path = self.context.parent_path.copy()
+        saved_table = self.context.current_table
+        saved_element_column = self.context.current_element_column
+        saved_element_type = self.context.current_element_type
+
+        # Translate left operand
         left_fragment = self.visit(node.children[0])
+
+        # Restore context before translating right operand
+        self.context.parent_path = saved_path.copy()
+        self.context.current_table = saved_table
+        self.context.current_element_column = saved_element_column
+        self.context.current_element_type = saved_element_type
+
+        # Translate right operand with clean context
         right_fragment = self.visit(node.children[1])
 
         # SP-022-007: Fix column reference for first()/last()/skip()/take() + comparison
@@ -2825,12 +2946,28 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 left_is_empty = left_metadata.get("is_empty_collection") is True
                 right_is_empty = right_metadata.get("is_empty_collection") is True
 
+                # SP-103-007: Validate that comparison operators (<, >, <=, >=) are not used on booleans
+                # According to FHIRPath spec, only = and != are allowed for boolean comparisons
+                comparison_operators = {"<", ">", "<=", ">="}
+                if operator_lower in comparison_operators:
+                    left_literal_type = left_metadata.get("literal_type")
+                    right_literal_type = right_metadata.get("literal_type")
+                    if left_literal_type == "boolean" or right_literal_type == "boolean":
+                        from ..exceptions import FHIRPathEvaluationError
+                        raise FHIRPathEvaluationError(
+                            f"Comparison operator '{operator_lower}' cannot be used with boolean values. "
+                            f"Only equality operators (=, !=) are supported for boolean comparisons."
+                        )
+
                 # SP-100-003: Handle empty collections in comparisons
-                # Empty collections don't match anything in comparisons
+                # SP-103-007: Comparisons with empty collections return empty collections
+                # According to FHIRPath spec, comparisons involving empty collections
+                # should return empty collections (not FALSE)
+                # {} = 5 -> {}, {} = {} -> {}, 5 = {} -> {}
                 if left_is_empty or right_is_empty:
-                    # Empty collections compared with anything return FALSE
-                    # {} = 5 -> FALSE, {} = {} -> FALSE, 5 = {} -> FALSE
-                    sql_expr = "FALSE"
+                    # Return NULL to represent empty collection result
+                    # This will be filtered out in the final result
+                    sql_expr = "NULL"
                 elif operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
                     sql_expr = self._generate_collection_comparison(
                         left_fragment.expression,
@@ -2859,17 +2996,39 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     left_literal_type = left_metadata.get("literal_type")
                     right_literal_type = right_metadata.get("literal_type")
 
-                    # Cast left JSON string to match right literal type
-                    if left_is_json and right_is_literal and right_literal_type:
-                        left_expr = self._apply_safe_cast_for_type(
-                            left_expr, right_literal_type
-                        )
+                    # SP-103-004: Handle comparison of numeric JSON values with string literals
+                    # When comparing a path ending in .value (which should be numeric) with a
+                    # string literal, we need to cast to numeric type first to ensure proper
+                    # type validation. If the string literal is not a valid number, this will
+                    # cause a SQL execution error as expected by FHIRPath semantics.
 
-                    # Cast right JSON string to match left literal type
-                    if right_is_json and left_is_literal and left_literal_type:
-                        right_expr = self._apply_safe_cast_for_type(
-                            right_expr, left_literal_type
-                        )
+                    # Check if left is JSON numeric value and right is string literal
+                    if (left_is_json and right_is_literal and
+                        right_literal_type == "string" and
+                        left_metadata.get("source_path", "").endswith(".value")):
+                        # Try strict cast to DECIMAL - will error if right is not numeric
+                        left_expr = self.dialect.strict_cast_to_decimal(left_expr)
+
+                    # Check if right is JSON numeric value and left is string literal
+                    elif (right_is_json and left_is_literal and
+                          left_literal_type == "string" and
+                          right_metadata.get("source_path", "").endswith(".value")):
+                        # Try strict cast to DECIMAL - will error if left is not numeric
+                        right_expr = self.dialect.strict_cast_to_decimal(right_expr)
+
+                    else:
+                        # Standard safe casting for non-error cases
+                        # Cast left JSON string to match right literal type
+                        if left_is_json and right_is_literal and right_literal_type:
+                            left_expr = self._apply_safe_cast_for_type(
+                                left_expr, right_literal_type
+                            )
+
+                        # Cast right JSON string to match left literal type
+                        if right_is_json and left_is_literal and left_literal_type:
+                            right_expr = self._apply_safe_cast_for_type(
+                                right_expr, left_literal_type
+                            )
 
                     # SP-022-010: Handle datetime function comparisons
                     # When comparing a datetime function (today(), now(), timeOfDay())
@@ -5832,8 +5991,45 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return False
 
         if target_type == "Quantity":
-            # For now, return False - Quantity conversion needs UCUM support
-            # Will be enhanced in future iterations
+            # SP-103-003: Implement Quantity type conversion
+            # According to FHIRPath spec, the following can convert to Quantity:
+            # - Integer literals (e.g., 1, 5, 10)
+            # - Decimal literals (e.g., 1.0, 5.5, 10.25)
+            # - Boolean literals (true, false) - convert to 1.0 and 0.0
+            # - String representations of integers (e.g., '1', '5')
+            # - String representations of decimals (e.g., '1.0', '5.5')
+            # - String representations of quantities (e.g., '1 day', '4 days', '1 \'wk\'')
+
+            if isinstance(value, bool):
+                # Booleans can convert to Quantity (true -> 1.0, false -> 0.0)
+                return True
+            if isinstance(value, (int, float)):
+                # Numbers can convert to Quantity
+                return True
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return False
+
+                # Check if it's a valid quantity string
+                # Format: <number> [<unit>] or <number> '<unit>'
+                # Examples: '1', '1.0', '1 day', '4 days', '1 \'wk\''
+
+                # Try to match: number followed by optional unit
+                # Pattern: optional +/-, digits with optional decimal, optional space, optional unit in quotes or plain text
+                quantity_pattern = r'^[\+\-]?(\d+\.?\d*|\.\d+)(\s+[a-zA-Z]+|\s+\'[a-zA-Z]+\'|\s+\"[a-zA-Z]+\")?$'
+                if re.match(quantity_pattern, stripped):
+                    return True
+
+            return False
+
+        if target_type == "Date":
+            if isinstance(value, str):
+                stripped = value.strip()
+                # SP-103-006: Support Date formats (no time component)
+                # Accepts: YYYY, YYYY-MM, YYYY-MM-DD
+                # Pattern: Year required, month/day optional, no 'T' or time allowed
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)(?!T)$', stripped))
             return False
 
         if target_type == "DateTime":
@@ -5867,6 +6063,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._build_converts_to_decimal_expression(value_expr)
         if target_type == "Quantity":
             return self._build_converts_to_quantity_expression(value_expr)
+        if target_type == "Date":
+            return self._build_converts_to_date_expression(value_expr)
         if target_type == "DateTime":
             return self._build_converts_to_datetime_expression(value_expr)
         if target_type == "Time":
@@ -5930,11 +6128,102 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         decimal_cast = self.dialect.generate_type_cast(value_expr, "Decimal")
         return f"CASE WHEN {decimal_cast} IS NOT NULL THEN TRUE ELSE FALSE END"
 
+    def _build_converts_to_date_expression(self, value_expr: str) -> str:
+        """Generate SQL for convertsToDate() checks.
+
+        SP-103-006: Implement date conversion checking.
+        A value can convert to Date if:
+        - It's a string matching ISO 8601 date format (YYYY, YYYY-MM, YYYY-MM-DD)
+        - Does NOT include time component (no 'T' or time allowed)
+
+        According to FHIRPath spec:
+        - '2015' converts to Date (year only)
+        - '2015-02' converts to Date (year-month)
+        - '2015-02-04' converts to Date (full date)
+        - '2015T' does NOT convert to Date (has time separator)
+        - '2015-02-04T10:00' does NOT convert to Date (has time)
+        """
+        # First, try to cast as string
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Use regex to check if it matches a Date pattern
+        # Pattern: YYYY(-MM(-DD)?)? without 'T' (time separator)
+        # Matches: 2015, 2015-02, 2015-02-04
+        # Does NOT match: 2015T, 2015-02T, 2015-02-04T10:00:00
+        # Note: Using simple string matching instead of regex for better compatibility
+        # Check for: starts with 4 digits, optionally followed by -MM, optionally followed by -DD, and no 'T'
+        # The negative lookahead (?!T) doesn't work well in all SQL regex engines, so we use a different approach
+
+        # First check: matches basic date pattern (YYYY-MM-DD with optional parts)
+        date_pattern_basic = "^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?$"
+        # Second check: does NOT contain 'T' (time separator)
+        contains_t = "POSITION('T' IN " + trimmed_string + ") > 0"
+        regex_match = self.dialect.generate_regex_match(trimmed_string, "'" + date_pattern_basic + "'")
+
+        return (
+            "CASE "
+            "WHEN " + trimmed_string + " IS NULL THEN FALSE "
+            "WHEN " + regex_match + " AND NOT " + contains_t + " THEN TRUE "
+            "ELSE FALSE "
+            "END"
+        )
+
     def _build_converts_to_quantity_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToQuantity() checks."""
-        # For now, always return FALSE - Quantity conversion needs UCUM support
-        # Will be enhanced in future iterations
-        return "FALSE"
+        """Generate SQL for convertsToQuantity() checks.
+
+        SP-103-003: Implement quantity conversion checking.
+        A value can convert to Quantity if:
+        - It's a number (integer or decimal)
+        - It's a boolean
+        - It's a string that represents a number or number with unit
+
+        According to FHIRPath spec and test cases:
+        - '1' converts to Quantity (just a number)
+        - '1.0' converts to Quantity (decimal number)
+        - '1 day' converts to Quantity (number + space + date/time precision unit)
+        - '1 'wk'' converts to Quantity (number + space + single-quoted unit)
+        - '1 wk' does NOT convert to Quantity (unquoted non-date/time unit)
+        """
+        # Cast to string first
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Check if it's a valid quantity string using regex
+        # Pattern: optional +/-, digits with optional decimal, optional space, optional unit
+        # Units allowed:
+        # 1. Date/time precision words (year, month, week, day, hour, minute, second, millisecond)
+        # 2. Plural date/time precision words (years, months, weeks, days, hours, minutes, seconds, milliseconds)
+        # 3. Single-quoted units (e.g., '1 'wk'')
+        # 4. Double-quoted units (e.g., '1 "kg"')
+        #
+        # Note: Unquoted non-date/time units like '1 wk' should NOT match (per test cases)
+        #
+        # IMPORTANT: In SQL string literals, single quotes are escaped by doubling them
+        # So \s+'[a-zA-Z]+' becomes \s+''[a-zA-Z]+''
+        quantity_pattern = r"^[\+\-]?(\d+\.?\d*|\.\d+)(\s+(year|years|month|months|week|weeks|day|days|hour|hours|minute|minutes|second|seconds|millisecond|milliseconds)|\s+''[a-zA-Z]+''|\s+\"[a-zA-Z]+\")?$"
+
+        # Also check if it's a boolean
+        lowered_string = f"LOWER({trimmed_string})"
+        is_boolean = f"({lowered_string} IN ('true', 'false', 't', 'f', '1', '0'))"
+
+        # Check if it matches quantity pattern - need to quote the pattern as a string literal
+        # SQL escaping: single quotes within string are doubled
+        is_quantity = self.dialect.generate_regex_match(trimmed_string, f"'{quantity_pattern}'")
+
+        # Combine checks: boolean OR matches quantity pattern OR is a number
+        decimal_cast = self.dialect.generate_type_cast(value_expr, "Decimal")
+        is_number = f"({decimal_cast} IS NOT NULL)"
+
+        return (
+            f"CASE "
+            f"WHEN {value_expr} IS NULL THEN FALSE "
+            f"WHEN {is_boolean} THEN TRUE "
+            f"WHEN {is_number} THEN TRUE "
+            f"WHEN {is_quantity} THEN TRUE "
+            f"ELSE FALSE "
+            f"END"
+        )
 
     def _build_converts_to_datetime_expression(self, value_expr: str) -> str:
         """Generate SQL for convertsToDateTime() checks.
@@ -6119,6 +6408,40 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 raise ValueError("toQuantity() requires a resolvable target expression")
 
             sql_expr = self._build_to_quantity_expression(value_expr)
+            return SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=dependencies
+            )
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_to_date(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate toDate() function to SQL conversion.
+
+        SP-103-006: Implement toDate() conversion.
+        Converts a value to a Date string (ISO 8601 format).
+        """
+        value_expr, dependencies, literal_value, snapshot, _, _ = self._resolve_function_target(node)
+        source_table = snapshot["current_table"]
+
+        try:
+            if literal_value is not None:
+                result = self._evaluate_literal_to_date(literal_value)
+                sql_expr = self._to_sql_literal(result, "string") if result else "NULL"
+                return SQLFragment(
+                    expression=sql_expr,
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False
+                )
+
+            if not value_expr:
+                raise ValueError("toDate() requires a resolvable target expression")
+
+            sql_expr = self._build_to_date_expression(value_expr)
             return SQLFragment(
                 expression=sql_expr,
                 source_table=source_table,
@@ -6386,6 +6709,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # For now, always return NULL - Quantity conversion needs UCUM support
         # Will be enhanced in future iterations
         return "NULL"
+
+    def _build_to_date_expression(self, value_expr: str) -> str:
+        """Generate SQL for toDate() conversion.
+
+        SP-103-006: Implement toDate() SQL conversion.
+        Converts a value to a Date string (ISO 8601 format).
+        Only converts strings that match date format without time component.
+        """
+        # Cast to string first
+        string_cast = self.dialect.generate_type_cast(value_expr, "String")
+        trimmed_string = self.dialect.generate_trim(string_cast)
+
+        # Check if it matches date pattern (YYYY, YYYY-MM, YYYY-MM-DD) without 'T'
+        # Use regex to validate and return the trimmed string if valid, NULL otherwise
+        date_pattern_basic = "^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?$"
+        # Check for time separator 'T'
+        contains_t = "POSITION('T' IN " + trimmed_string + ") > 0"
+        regex_match = self.dialect.generate_regex_match(trimmed_string, "'" + date_pattern_basic + "'")
+
+        return (
+            "CASE "
+            "WHEN " + regex_match + " AND NOT " + contains_t + " THEN " + trimmed_string + " "
+            "ELSE NULL "
+            "END"
+        )
 
     def _build_to_datetime_expression(self, value_expr: str) -> str:
         """Generate SQL for toDateTime() conversion."""
@@ -6970,7 +7318,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             - Database-specific type checking functions (json_type vs jsonb_typeof)
             - Database-specific casting syntax
         """
+        # SP-103-005: Debug node structure
         logger.debug(f"Translating type operation: {node.operation} with target type: {node.target_type}")
+        logger.debug(f"SP-103-005: node type: {type(node).__name__}")
+        logger.debug(f"SP-103-005: node.text: {getattr(node, 'text', 'N/A')}")
+        logger.debug(f"SP-103-005: node.children: {len(node.children) if hasattr(node, 'children') else 'N/A'}")
+        logger.debug(f"SP-103-005: hasattr enhanced_node: {hasattr(node, 'enhanced_node')}")
+        if hasattr(node, 'enhanced_node'):
+            logger.debug(f"SP-103-005: enhanced_node.parent: {node.enhanced_node.parent}")
+            logger.debug(f"SP-103-005: enhanced_node.parent.text: {getattr(node.enhanced_node.parent, 'text', 'N/A') if node.enhanced_node.parent else 'N/A'}")
+            if node.enhanced_node.parent and hasattr(node.enhanced_node.parent, 'children'):
+                logger.debug(f"SP-103-005: enhanced_node.parent.children: {len(node.enhanced_node.parent.children)}")
+                for i, child in enumerate(node.enhanced_node.parent.children):
+                    logger.debug(f"SP-103-005: enhanced_node.parent child {i}: '{child.text}'")
 
         # Validate operation
         if not node.operation:
@@ -7168,6 +7528,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Capture parent_path BEFORE visiting child to detect if we're at root level
         parent_path_before_child = self.context.parent_path.copy()
 
+        logger.debug(f"SP-103-005: _translate_oftype_operation: parent_path_before_child={parent_path_before_child}")
+
         # Get the collection expression to filter
         expr_fragment = self.visit(node.children[0])
 
@@ -7182,6 +7544,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             identifier_value = child_node.identifier or child_node.text or ""
             if identifier_value:
                 property_name = identifier_value.split(".")[-1].strip("`")
+        else:
+            # SP-103-005: Handle TypeOperationNodeAdapter wrapping EnhancedASTNode
+            # The adapter wraps the ofType() node, which is child 1 of the parent.
+            # Child 0 of the parent is the identifier (e.g., 'value').
+            logger.debug(f"SP-103-005: child_node type: {type(child_node).__name__}, text: {getattr(child_node, 'text', 'N/A')}")
+
+            # Access the parent through enhanced_node
+            if hasattr(node, 'enhanced_node') and node.enhanced_node.parent:
+                parent = node.enhanced_node.parent
+                logger.debug(f"SP-103-005: Found parent through enhanced_node: {parent.text}")
+
+                # The parent should have 2 children: [identifier, ofType()]
+                if hasattr(parent, 'children') and len(parent.children) >= 1:
+                    identifier_child = parent.children[0]
+                    identifier_text = getattr(identifier_child, 'text', '')
+                    if identifier_text and 'ofType' not in identifier_text:
+                        property_name = identifier_text.split(".")[-1].strip("`")
+                        logger.debug(f"SP-103-005: Extracted property_name from parent child 0: {property_name}")
+
+        logger.debug(f"SP-103-005: _translate_oftype_operation: property_name={property_name}, is_polymorphic={is_polymorphic_property(property_name) if property_name else False}")
 
         # POLYMORPHIC FIELD HANDLING:
         # If the child is a polymorphic property (e.g., "value"), use type-specific field resolution
@@ -7191,16 +7573,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # IMPORTANT: Only apply this for direct property access (e.g., $.value), not nested
         # (e.g., $.component.value) to avoid breaking collection filtering
         if property_name and is_polymorphic_property(property_name):
-            # Check if this is a direct property access by checking if parent_path was empty
-            # before we visited the child node
-            # Direct access: parent_path_before_child is empty (e.g., value.ofType(integer))
-            # Nested access: parent_path_before_child has elements (e.g., component.value.ofType(integer))
-            is_direct_access = len(parent_path_before_child) == 0
+            # Check if this is a direct property access
+            # Direct access: parent_path contains only the property name (e.g., ['value'])
+            # Nested access: parent_path contains multiple elements (e.g., ['component', 'value'])
+            is_direct_access = (
+                len(parent_path_before_child) == 1 and
+                parent_path_before_child[0] == property_name
+            )
 
             if is_direct_access:
                 polymorphic_field = resolve_polymorphic_field_for_type(property_name, canonical_type)
                 if polymorphic_field:
                     logger.debug(f"Resolved polymorphic field: {property_name} + {canonical_type} → {polymorphic_field}")
+                    logger.debug(f"Parent path before: {self.context.parent_path}")
 
                     # Build JSON path for the polymorphic field
                     # Need to extract the source table from the expression
@@ -7215,6 +7600,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     )
 
                     logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+
+                    # SP-103-005: Update parent_path to reflect the resolved type
+                    # The current path ends with the base property name (e.g., 'value'),
+                    # and we need to replace it with the polymorphic field (e.g., 'valueRange')
+                    if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                        # Replace the last element
+                        self.context.parent_path[-1] = polymorphic_field
+                    else:
+                        # Append if the structure is different than expected
+                        self.context.parent_path.append(polymorphic_field)
+                    logger.debug(f"Parent path after: {self.context.parent_path}")
+
+                    # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
+                    # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
+                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                        self.context.polymorphic_field_mappings = {}
+                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                    logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
 
                     return SQLFragment(
                         expression=poly_field_sql,
@@ -7796,7 +8199,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # SP-022-003: For literal values, use simplified type checking that
         # doesn't involve json_type() which fails on non-JSON values
         if self._is_sql_literal_expression(value_expr):
-            type_check_sql = self._generate_literal_type_check(value_expr, canonical_type)
+            # SP-103-001: Extract original literal text for timezone detection
+            original_literal = None
+            if self.fragments and len(self.fragments) > 0:
+                # Find the fragment that matches the value_expr
+                # The literal might not be the last fragment (could be earlier in the chain)
+                for frag in self.fragments:
+                    if hasattr(frag, 'expression') and str(frag.expression) == str(value_expr):
+                        # Try to get original literal from metadata first
+                        if hasattr(frag, 'metadata') and frag.metadata:
+                            original_literal = frag.metadata.get('source_text') or frag.metadata.get('text')
+                        # If not in metadata, try extracting from the expression itself
+                        if not original_literal and hasattr(frag, 'expression'):
+                            expr_str = str(frag.expression)
+                            # Strip SQL quotes to get the actual FHIRPath literal
+                            # SQL string literals are wrapped in single quotes: '@T14:34:28Z'
+                            unquoted = expr_str.strip("'\"")
+                            # Check if it looks like a FHIRPath literal (starts with @)
+                            if unquoted.startswith('@'):
+                                original_literal = unquoted
+                        break
+            type_check_sql = self._generate_literal_type_check(value_expr, canonical_type, original_literal)
         # Route to appropriate type check based on type classification
         # Maintains thin dialect principle - business logic in translator
         elif self._is_primitive_type(canonical_type):

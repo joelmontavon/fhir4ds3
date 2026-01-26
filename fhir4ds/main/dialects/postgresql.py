@@ -1415,6 +1415,20 @@ class PostgreSQLDialect(DatabaseDialect):
             f"THEN ({expression})::BIGINT ELSE NULL END)"
         )
 
+    def strict_cast_to_decimal(self, expression: str) -> str:
+        """Strictly cast expression to DECIMAL in PostgreSQL.
+
+        SP-103-004: Uses direct cast which throws error on type mismatch.
+        """
+        return f"({expression})::DECIMAL"
+
+    def strict_cast_to_integer(self, expression: str) -> str:
+        """Strictly cast expression to BIGINT in PostgreSQL.
+
+        SP-103-004: Uses direct cast which throws error on type mismatch.
+        """
+        return f"({expression})::BIGINT"
+
     def safe_cast_to_date(self, expression: str) -> str:
         """Safely cast expression to DATE in PostgreSQL.
 

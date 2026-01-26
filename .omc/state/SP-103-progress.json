@@ -1,0 +1,32 @@
+{
+  "sprint": "SP-103",
+  "name": "Official FHIRPath Test Suite Compliance",
+  "start_compliance": 67.1,
+  "current_compliance": 83.0,
+  "target_compliance": 100.0,
+  "total_tests": 934,
+  "current_passing": 775,
+  "current_failing": 159,
+  "tasks_completed": [
+    "SP-103-001: DateTime Literals",
+    "SP-103-002: Unary Polarity",
+    "SP-103-003: Quantity Literals"
+  ],
+  "tasks_remaining": [
+    "SP-103-004: Semantic Validation",
+    "SP-103-005: Simple Arithmetic",
+    "SP-103-006: Type Conversion System",
+    "SP-103-007: Boolean Equality",
+    "SP-103-008: String Type Checks",
+    "SP-103-009: Numeric Type Checks",
+    "SP-103-010: Collection Functions",
+    "SP-103-011: Aggregate Functions",
+    "SP-103-012: Collection Comparisons",
+    "SP-103-013: Nested Collections",
+    "SP-103-014: Collection Edge Cases",
+    "SP-103-015: String Functions",
+    "SP-103-016: Date/Time Functions",
+    "SP-103-017: Remaining Edge Cases"
+  ],
+  "last_updated": "2026-01-25"
+}

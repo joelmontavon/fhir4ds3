@@ -651,7 +651,7 @@ class EnhancedOfficialTestRunner:
                 exc_type_name = type(exc).__name__
                 sql_execution_errors = {
                     'BinderException', 'CatalogException', 'ConstraintException',
-                    'DataException', 'DependencyException', 'IOException',
+                    'ConversionException', 'DataException', 'DependencyException', 'IOException',
                     'InterruptedException', 'NumericException', 'OptimizerException',
                     'OutOfWorkMemoryException', 'ParserException', 'PermissionException',
                     'PlannerException', 'SequenceException', 'SerializationException',

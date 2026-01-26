@@ -193,6 +193,7 @@ class EnhancedASTNode:
 
                         SP-023-006: Enhanced to handle FHIR temporal literals.
                         SP-100-003: Enhanced to handle empty collection literals.
+                        SP-103-003: Enhanced to properly process escape sequences in string literals.
                         """
                         if not text:
                             return None, "unknown", None
@@ -213,7 +214,17 @@ class EnhancedASTNode:
 
                         # Handle string literals (quoted)
                         if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
-                            return text[1:-1], "string", None
+                            # SP-103-003: Use ast.literal_eval to properly process escape sequences
+                            # The parser returns strings like "'1 \\'wk\\''" which need to be evaluated
+                            # to get the actual string value "1 'wk'"
+                            import ast as python_ast
+                            try:
+                                # Evaluate the string literal to process escape sequences
+                                evaluated_value = python_ast.literal_eval(text)
+                                return evaluated_value, "string", None
+                            except (ValueError, SyntaxError):
+                                # Fallback to simple stripping if evaluation fails
+                                return text[1:-1], "string", None
 
                         # Handle boolean literals
                         if text.lower() == 'true':
@@ -557,8 +568,18 @@ class EnhancedASTNode:
                 return OperatorNodeAdapter(self).accept(visitor)
 
             elif category in [NodeCategory.FUNCTION_CALL, NodeCategory.CONDITIONAL]:
-                # Special handling for CONDITIONAL category
+                # SP-103-008: Special handling for CONDITIONAL category
+                # Check if this is an InvocationExpression containing a type operation
                 if category == NodeCategory.CONDITIONAL and self.node_type == 'InvocationExpression':
+                    # SP-103-008: Check if any child is a TYPE_OPERATION (e.g., is(), as(), ofType())
+                    # If so, unwrap to that child instead of visiting generically
+                    if self.children:
+                        for child in self.children:
+                            if (child.metadata and
+                                child.metadata.node_category == NodeCategory.TYPE_OPERATION):
+                                # Unwrap to the type operation child
+                                return child.accept(visitor)
+
                     # Container node marked as CONDITIONAL should be visited generically to traverse children
                     return visitor.visit_generic(self)
 
@@ -794,6 +815,7 @@ class EnhancedASTNode:
                         """Extract the type operation and target type.
 
                         SP-023-006: Replicated from ASTAdapter._convert_type_expression().
+                        SP-103-005: Enhanced to handle ofType() with nested type structure.
                         """
                         text = node.text or ""
 
@@ -806,16 +828,17 @@ class EnhancedASTNode:
                                 target_type = self._extract_type_from_children(node)
                                 return op, target_type
 
-                        # Parse from text
+                        # SP-103-005: Check for ofType operation first
+                        # The text for ofType() is 'ofType()' so we check for that pattern
+                        if text == 'ofType()' or 'ofType(' in text:
+                            target_type = self._extract_type_from_children(node)
+                            return 'ofType', target_type or 'Unknown'
+
+                        # Parse from text for other operations
                         if ' is ' in text:
                             return 'is', text.split(' is ')[-1].strip()
                         elif ' as ' in text:
                             return 'as', text.split(' as ')[-1].strip()
-                        elif 'ofType(' in text:
-                            start = text.find('ofType(') + 7
-                            end = text.find(')', start)
-                            if end > start:
-                                return 'ofType', text[start:end].strip()
 
                         # Try to get type from children (TypeSpecifier)
                         target_type = self._extract_type_from_children(node)
@@ -825,6 +848,15 @@ class EnhancedASTNode:
 
                     def _extract_type_from_children(self, node):
                         """Extract target type from TypeSpecifier child node."""
+                        # SP-103-005: Handle nested structure for type operations like ofType(Range)
+                        # The AST structure for ofType(Range) is:
+                        # - node (ofType())
+                        #   - children[0] (parentheses)
+                        #     - children[0] (operation name: ofType)
+                        #     - children[1] (type specifier)
+                        #       - children[0] (type name: Range)
+
+                        # First, try the original structure (TypeSpecifier as second child)
                         if len(node.children) >= 2:
                             type_spec = node.children[1]
                             if type_spec.text:
@@ -833,6 +865,26 @@ class EnhancedASTNode:
                                 for child in type_spec.children:
                                     if child.text:
                                         return child.text.strip()
+
+                        # SP-103-005: Try nested structure (parentheses as first child)
+                        if len(node.children) >= 1 and node.children[0].children:
+                            parens_node = node.children[0]
+                            # Look for the type in the second child of the parentheses node
+                            if len(parens_node.children) >= 2:
+                                type_spec = parens_node.children[1]
+                                if type_spec.text:
+                                    return type_spec.text.strip()
+                                # Recursively search for the type name
+                                if type_spec.children:
+                                    for child in type_spec.children:
+                                        if child.text and child.text not in ['(', ')', '']:
+                                            return child.text.strip()
+                                        # Search deeper
+                                        if child.children:
+                                            for grandchild in child.children:
+                                                if grandchild.text and grandchild.text not in ['(', ')', '']:
+                                                    return grandchild.text.strip()
+
                         return None
 
                     def accept(self, v):
@@ -1052,7 +1104,10 @@ class ASTNodeFactory:
         hints = {OptimizationHint.PROJECTION_SAFE}
         sql_type = SQLDataType.UNKNOWN
 
-        if function_name in ['count', 'sum', 'avg', 'min', 'max']:
+        # SP-103-005: Check for type operations before other categories
+        if function_name.lower() in ['is', 'as', 'oftype']:
+            category = NodeCategory.TYPE_OPERATION
+        elif function_name in ['count', 'sum', 'avg', 'min', 'max']:
             category = NodeCategory.AGGREGATION
             hints.add(OptimizationHint.AGGREGATION_CANDIDATE)
             sql_type = SQLDataType.INTEGER if function_name == 'count' else SQLDataType.DECIMAL
@@ -1188,7 +1243,37 @@ class ASTNodeFactory:
                 metadata=metadata
             )
         elif 'literal' in node_type.lower():
-            node = ASTNodeFactory.create_literal_node(text, text)
+            # Special handling for QuantityLiteral nodes
+            if node_type == 'QuantityLiteral':
+                # Extract value and unit from the quantity literal structure
+                value_str, unit_str = ASTNodeFactory._extract_quantity_info(fhirpath_node)
+
+                # Create quantity metadata
+                metadata = MetadataBuilder() \
+                    .with_category(NodeCategory.LITERAL) \
+                    .with_type_info(TypeInformation(
+                        sql_data_type=SQLDataType.TEXT,  # Quantities stored as text
+                        is_collection=False,
+                        is_nullable=False,
+                        fhir_type='Quantity'
+                    )) \
+                    .with_optimization_hint(OptimizationHint.PROJECTION_SAFE) \
+                    .with_source_location(text) \
+                    .build()
+
+                # Store quantity info in custom_attributes for later use
+                metadata.custom_attributes['literal_type'] = 'quantity'
+                metadata.custom_attributes['quantity_value'] = value_str
+                metadata.custom_attributes['quantity_unit'] = unit_str
+
+                node = EnhancedASTNode(
+                    node_type="literal",
+                    text=text,
+                    metadata=metadata
+                )
+            else:
+                # Regular literal (string, number, boolean, etc.)
+                node = ASTNodeFactory.create_literal_node(text, text)
         elif 'identifier' in node_type.lower() or 'path' in node_type.lower():
             node = ASTNodeFactory.create_path_node(text)
         else:
@@ -1247,6 +1332,68 @@ class ASTNodeFactory:
         return 'unknown'
 
     @staticmethod
+    def _extract_quantity_info(fhirpath_node: Union[Dict[str, Any], Any]) -> tuple[Optional[str], Optional[str]]:
+        """Extract quantity value and unit from a QuantityLiteral node.
+
+        Returns:
+            Tuple of (value_str, unit_str) where value_str is the numeric value as string
+            and unit_str is the unit (e.g., 'days', 'wk'). Returns (None, None) if not found.
+        """
+        if isinstance(fhirpath_node, dict):
+            children = fhirpath_node.get('children', [])
+            terminal_node_text = fhirpath_node.get('terminalNodeText', [])
+        else:
+            children = getattr(fhirpath_node, 'children', [])
+            terminal_node_text = getattr(fhirpath_node, 'terminalNodeText', [])
+
+        # Extract value from terminalNodeText (should be the number)
+        value_str = None
+        if terminal_node_text and len(terminal_node_text) > 0:
+            value_str = terminal_node_text[0].strip()
+
+        # Extract unit from children (look for Unit node)
+        unit_str = None
+        for child in children:
+            if isinstance(child, dict):
+                child_type = child.get('type', '')
+                child_children = child.get('children', [])
+            else:
+                child_type = getattr(child, 'type', '')
+                child_children = getattr(child, 'children', [])
+
+            if child_type == 'Unit':
+                # Look for DateTimePrecision or PluralDateTimePrecision
+                for grandchild in child_children:
+                    if isinstance(grandchild, dict):
+                        gc_type = grandchild.get('type', '')
+                        gc_terminal = grandchild.get('terminalNodeText', [])
+                    else:
+                        gc_type = getattr(grandchild, 'type', '')
+                        gc_terminal = getattr(grandchild, 'terminalNodeText', [])
+
+                    if gc_type in ['DateTimePrecision', 'PluralDateTimePrecision']:
+                        if gc_terminal and len(gc_terminal) > 0:
+                            unit_str = gc_terminal[0].strip()
+                            break
+
+                # Also check if unit is a string literal (e.g., '1 \'wk\'')
+                if not unit_str:
+                    for grandchild in child_children:
+                        if isinstance(grandchild, dict):
+                            gc_type = grandchild.get('type', '')
+                            gc_terminal = grandchild.get('terminalNodeText', [])
+                        else:
+                            gc_type = getattr(grandchild, 'type', '')
+                            gc_terminal = getattr(grandchild, 'terminalNodeText', [])
+
+                        if gc_type == 'StringLiteral' and gc_terminal and len(gc_terminal) > 0:
+                            # Remove quotes from string literal
+                            unit_str = gc_terminal[0].strip().strip('\'"')
+                            break
+
+        return value_str, unit_str
+
+    @staticmethod
     def _classify_node_category(node_type: str, text: str) -> NodeCategory:
         """Classify a node into appropriate category based on type and text"""
         node_type_lower = node_type.lower()
@@ -1257,8 +1404,12 @@ class ASTNodeFactory:
         elif 'identifier' in node_type_lower:
             return NodeCategory.PATH_EXPRESSION
         elif 'invocation' in node_type_lower or 'function' in node_type_lower:
+            # SP-103-005: Check for type operations (is, as, ofType) before aggregation
+            # Match patterns like "is(", "as(", "oftype(", "is()", "as()", "oftype()"
+            if any(pattern in text_lower for pattern in ['is(', 'as(', 'oftype(', 'is()', 'as()', 'oftype()']):
+                return NodeCategory.TYPE_OPERATION
             # Check if it's an aggregation function
-            if any(func in text_lower for func in ['count', 'sum', 'avg', 'min', 'max']):
+            elif any(func in text_lower for func in ['count', 'sum', 'avg', 'min', 'max']):
                 return NodeCategory.AGGREGATION
             else:
                 return NodeCategory.FUNCTION_CALL

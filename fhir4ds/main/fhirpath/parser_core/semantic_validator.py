@@ -37,8 +37,8 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     # Type conversion functions
     'convertsToBoolean', 'toBoolean', 'convertsToInteger', 'toInteger',
     'convertsToDecimal', 'toDecimal', 'convertsToString', 'toString',
-    'convertsToQuantity', 'toQuantity', 'convertsToDateTime', 'toDateTime',
-    'convertsToTime', 'toTime',
+    'convertsToQuantity', 'toQuantity', 'convertsToDate', 'toDate',
+    'convertsToDateTime', 'toDateTime', 'convertsToTime', 'toTime',
     # String functions
     'startsWith', 'endsWith', 'contains', 'substring', 'length', 'upper',
     'lower', 'matches', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',
@@ -546,6 +546,18 @@ class SemanticValidator:
         masked_with_backticks: str,
     ) -> None:
         """Validate element navigation against the type registry."""
+        # SP-103-005: Check if expression contains type-changing functions
+        # These functions (ofType, as, etc.) make static validation unreliable
+        # without full type inference, so we skip path validation when present.
+        collapsed = re.sub(r'\s+', '', expression or '')
+        has_type_changing_function = any(
+            f'{func}(' in collapsed for func in ('ofType', 'as(', 'asType(', 'convertsTo(')
+        )
+
+        if has_type_changing_function:
+            # Skip path validation - type changes make it unreliable
+            return
+
         # Absolute paths (Patient.name.given)
         for match in self._absolute_path_rgx.finditer(masked_with_backticks):
             path = match.group(1)
@@ -609,6 +621,11 @@ class SemanticValidator:
             segment = raw_segment.strip("`")
             if not segment:
                 continue
+
+            # SP-103-007: Skip validation for boolean literals (true, false)
+            # These are not path elements but literal values
+            if segment.lower() in {"true", "false"}:
+                break
 
             element_type = registry.get_element_type(current_type, segment)
             if element_type is None:
@@ -702,6 +719,36 @@ class SemanticValidator:
                     raise FHIRPathParseError(
                         "Incomplete expression: missing right operand for division operator"
                     )
+
+    def _validate_time_literal_timezones(self, raw_expression: str) -> None:
+        """
+        SP-103-001: Validate that Time literals do not have timezone suffixes.
+
+        According to the FHIRPath specification, Time literals (@THH:MM:SS) cannot
+        have timezone suffixes (Z or +/-HH:MM). If a time-like literal has a
+        timezone suffix, it's considered invalid.
+
+        Args:
+            raw_expression: Original expression text
+
+        Raises:
+            FHIRPathParseError: When a Time literal has a timezone suffix
+        """
+        # Match time literals with timezone suffixes
+        # Pattern: @T followed by time (HH:MM:SS or partial) and timezone (Z or +/-HH:MM)
+        # Group 1: optional fractional seconds
+        # Group 2: timezone suffix
+        pattern = r'@T\d{2}(?::\d{2})?(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})'
+
+        match = re.search(pattern, raw_expression)
+        if match:
+            tz_suffix = match.group(1)  # Timezone is now group 1
+            literal = match.group(0)
+
+            raise FHIRPathParseError(
+                f"Time literal '{literal}' is invalid: Time literals cannot have timezone suffixes. "
+                f"Use DateTime literal format (e.g., @2015-02-04T{tz_suffix}) for time with timezone."
+            )
 
     def _validate_unary_operators_on_literals(
         self,
