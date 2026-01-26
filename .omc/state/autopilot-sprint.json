@@ -1,34 +1,77 @@
 {
   "sprint_id": "SP-104",
   "sprint_name": "FHIRPath High-Impact Compliance Improvements",
-  "phase": "completed",
+  "phase": "2",
+  "phase_name": "Parallel Execution",
   "started_at": "2026-01-26T10:30:00Z",
-  "completed_at": "2026-01-26T14:00:00Z",
-  "current_compliance": 58.4,
+  "current_compliance": 55.7,
   "target_compliance": 70.0,
   "total_tests": 934,
-  "passing_tests": 545,
-  "failing_tests": 389,
-  "tasks_completed": 4,
+  "passing_tests": 520,
+  "failing_tests": 414,
+  "tasks_completed": 0,
   "tasks_total": 5,
-  "baseline_compliance": 56.6,
-  "baseline_passing": 529,
-  "improvement": 16,
-  "completed_tasks": [
-    "SP-104-001: Fix CTE Column Propagation Bug (+9 tests)",
-    "SP-104-002: Fix is() Type Function for Temporal Literals (+13 tests)",
-    "SP-104-003: Fix Date/Time Arithmetic (+3 tests)",
-    "SP-104-004: Fix Comparison Type Coercion for Partial Dates (0 tests, fixed for future)"
-  ],
-  "remaining_tasks": [],
+  "tasks_in_progress": ["worker_1", "worker_2", "worker_3", "worker_4", "worker_5"],
+  "pending_tasks": [],
+  "completed_tasks": [],
   "worktree": "/mnt/d/sprint-SP-104",
   "branch": "sprint/SP-104",
-  "status": "completed",
-  "gap_to_target": 105,
-  "recommendations": [
-    "Continue with SP-105 to close remaining gap to 70%",
-    "Focus on type function improvements (is, as, ofType)",
-    "Implement remaining comparison type coercion edge cases",
-    "Fix date/time arithmetic edge cases"
+  "status": "parallel_execution",
+  "baseline_analysis": {
+    "total_failed": 414,
+    "target_improvement": 130,
+    "high_impact_areas": {
+      "comparison_operators": 93,
+      "type_functions": 81,
+      "collection_functions": 81,
+      "arithmetic_operators": 46
+    },
+    "error_types": {
+      "no_error": 175,
+      "parse": 131,
+      "execution": 87
+    }
+  },
+  "worker_assignments": [
+    {
+      "id": "worker_1",
+      "status": "pending",
+      "task": "Fix Collection Functions Column Propagation",
+      "files": ["fhir4ds/main/fhirpath/sql/cte.py", "fhir4ds/main/fhirpath/sql/translator.py"],
+      "focus": "take(), skip(), combine(), exclude(), union(), intersect()",
+      "target_tests": 81
+    },
+    {
+      "id": "worker_2",
+      "status": "pending",
+      "task": "Fix Type Functions",
+      "files": ["fhir4ds/main/fhirpath/types/type_registry.py", "fhir4ds/main/fhirpath/sql/translator.py"],
+      "focus": "is(), as(), ofType(), convertsTo()",
+      "target_tests": 81
+    },
+    {
+      "id": "worker_3",
+      "status": "pending",
+      "task": "Fix Date/Time Arithmetic",
+      "files": ["fhir4ds/main/fhirpath/types/temporal_parser.py", "fhir4ds/main/fhirpath/sql/translator.py"],
+      "focus": "date + duration, INTERVAL handling",
+      "target_tests": 26
+    },
+    {
+      "id": "worker_4",
+      "status": "pending",
+      "task": "Fix Comparison Operators",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "focus": "Type coercion for comparisons",
+      "target_tests": 93
+    },
+    {
+      "id": "worker_5",
+      "status": "pending",
+      "task": "Fix Arithmetic Operators",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "focus": "Operator precedence and type handling",
+      "target_tests": 46
+    }
   ]
 }
