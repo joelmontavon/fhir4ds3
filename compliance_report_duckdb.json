@@ -1,18 +1,18 @@
 {
   "total_tests": 934,
-  "passed_tests": 627,
-  "failed_tests": 307,
-  "compliance_percentage": 67.1,
-  "execution_time_seconds": 370.26,
+  "passed_tests": 624,
+  "failed_tests": 310,
+  "compliance_percentage": 66.8,
+  "execution_time_seconds": 364.08,
   "failed_tests_by_category": {
     "Other": 78,
-    "Type Checking": 13,
+    "Type Checking": 10,
     "Unary Polarity": 32,
     "Type Conversion": 9,
+    "DateTime Literals": 20,
     "Comparison Operators": 44,
-    "DateTime Literals": 18,
     "Collection Functions": 20,
-    "Quantity Literals": 80,
+    "Quantity Literals": 84,
     "Arithmetic Operators": 13
   },
   "sample_failures": [
@@ -77,6 +77,18 @@
       "error": "[parse] [FP070] parse stage failed for expression 'false.convertsToBoolean()'"
     },
     {
+      "name": "testLiteralTimeUTC",
+      "expression": "@T14:34:28Z.is(Time)",
+      "error": "Expected semantic failure but expression was accepted",
+      "invalid_type": "execution"
+    },
+    {
+      "name": "testLiteralTimeTimezoneOffset",
+      "expression": "@T14:34:28+10:00.is(Time)",
+      "error": "Expected semantic failure but expression was accepted",
+      "invalid_type": "execution"
+    },
+    {
       "name": "testLiteralQuantityDay",
       "expression": "4 days.convertsToQuantity()",
       "error": "[parse] [FP070] parse stage failed for expression '4 days.convertsToQuantity()'"
@@ -105,16 +117,6 @@
       "name": "testDateNotEqualTimeSecond",
       "expression": "Patient.birthDate != @T12:14:15",
       "error": "[execute] [FP070] execute stage failed for expression 'Patient.birthDate != @T12:14:15'"
-    },
-    {
-      "name": "testDateNotEqualTimeMinute",
-      "expression": "Patient.birthDate != @T12:14",
-      "error": "[execute] [FP070] execute stage failed for expression 'Patient.birthDate != @T12:14'"
-    },
-    {
-      "name": "testCollectionNotEqualEmpty",
-      "expression": "Patient.name.given != {}",
-      "error": "[execute] [FP070] execute stage failed for expression 'Patient.name.given != {}'"
     }
   ]
 }
