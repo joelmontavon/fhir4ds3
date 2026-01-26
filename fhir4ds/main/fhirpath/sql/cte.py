@@ -74,12 +74,15 @@ Author: FHIR4DS Development Team
 from dataclasses import dataclass, field
 import inspect
 import heapq
+import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
 # Import SQLFragment for type hints (will be used by CTEBuilder)
 from fhir4ds.fhirpath.sql.fragments import SQLFragment
 from fhir4ds.dialects.base import DatabaseDialect
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -614,6 +617,11 @@ class CTEManager:
         clause to filter rows (used by first()/last()/skip()/take() on unnested
         collections).
 
+        SP-105 FIX: When a fragment has "subset_filter" and the expression is a
+        simple column reference (like "name_item"), preserve that column in the
+        SELECT clause so subsequent operations can access it. This fixes the
+        "Referenced column 'name_item' not found" error after take()/first()/last().
+
         Args:
             fragment: SQL fragment to wrap.
             source_table: Table or CTE providing input rows for this fragment.
@@ -632,6 +640,38 @@ class CTEManager:
             return expression
 
         result_alias = fragment.metadata.get("result_alias", "result")
+
+        # SP-105: Check if this fragment references a collection item column that needs to be preserved
+        # This happens when take()/first()/last()/skip() operate on unnested collections
+        # The expression will be something like "name_item" (a column reference, not a complex expression)
+        subset_filter = fragment.metadata.get("subset_filter")
+        preserve_item_column = False
+        item_column_name = None
+
+        if subset_filter:
+            # Check if the expression is a simple column reference (not a function call or complex expression)
+            # Simple column references: name_item, cte_1_item, etc.
+            # Complex expressions: json_extract(...), CASE WHEN..., etc.
+            import re
+            is_simple_column_ref = (
+                expression and
+                not expression.upper().startswith("SELECT") and
+                not expression.upper().startswith("CASE") and
+                not expression.upper().startswith("JSON_") and
+                not expression.upper().startswith("COALESCE") and
+                not expression.upper().startswith("CAST") and
+                not "(" in expression and  # No function calls
+                not " " in expression     # No spaces (single word)
+            )
+
+            if is_simple_column_ref:
+                # This looks like a column reference - preserve it in the SELECT
+                preserve_item_column = True
+                item_column_name = expression
+                logger.info(
+                    f"SP-105: Preserving collection item column '{item_column_name}' "
+                    f"for subset_filter '{subset_filter}'"
+                )
 
         # SP-025-003 FIX: When source_table is an actual resource type (not "resource" placeholder),
         # qualify bare "resource" references in fragment expressions.
@@ -680,7 +720,19 @@ class CTEManager:
             columns.append(f"{source_table}.resource")
 
         columns.extend(ordering_columns)
-        columns.append(f"{expression} AS {result_alias}")
+
+        # SP-105: Include the collection item column in SELECT if we need to preserve it
+        # This fixes "Referenced column 'name_item' not found" after take()/first()/last()
+        if preserve_item_column and item_column_name:
+            # Add the item column to SELECT so subsequent operations can reference it
+            # Also alias it as 'result' so the standard result column is available
+            columns.append(f"{item_column_name} AS {result_alias}")
+            logger.info(
+                f"SP-105: Preserved collection item column '{item_column_name}' as '{result_alias}'"
+            )
+        else:
+            # Standard case: add the expression as result
+            columns.append(f"{expression} AS {result_alias}")
 
         query = (
             "SELECT "

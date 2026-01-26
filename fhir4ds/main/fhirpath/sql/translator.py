@@ -3821,77 +3821,98 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         This handles cases where distinct() chains after select(), combine(), etc.
         The input is a complete SELECT statement with aggregation like:
-            SELECT id, resource, json_agg(x) as result FROM ... GROUP BY id, resource
+            SELECT id, resource, json_agg(x ORDER BY idx) as result FROM ... GROUP BY id, resource
 
-        We need to modify it to:
+        We need to modify it to remove duplicates while preserving order:
+            SELECT id, resource, json_agg(x) FROM (
+                SELECT DISTINCT ON (x) x ORDER BY x, idx
+            ) subq GROUP BY id, resource
+
+        For simple cases without ORDER BY, we can use DISTINCT directly:
             SELECT id, resource, json_agg(DISTINCT x) as result FROM ... GROUP BY id, resource
 
-        Preserves order by using ROW_NUMBER() to track first occurrence.
+        SP-105: Fixed ORDER BY issue with DISTINCT aggregates.
         """
-        # Find the aggregation function call (json_agg, json_group_array, list())
-        # and wrap the value to add DISTINCT while preserving order
-
-        # Pattern 1: json_agg(value ORDER BY idx) -> use DISTINCT ON or subquery
-        # Pattern 2: json_group_array(value ORDER BY idx) -> similar for DuckDB
-        # Pattern 3: list(value ORDER BY idx) -> DuckDB LIST aggregate
-
         import re
 
-        # For json_agg with ORDER BY, we need a subquery with DISTINCT ON
-        if "json_agg(" in select_sql:
-            # Extract the aggregation expression
-            match = re.search(r'json_agg\(([^)]+)(\s+ORDER\s+BY\s+[^)]+)?\)', select_sql)
-            if match:
-                inner_expr = match.group(1).strip()
-                order_clause = match.group(2) or ""
+        # SP-105: Use a more robust approach to remove ORDER BY from DISTINCT aggregates
+        # The issue is that ORDER BY can appear at any nesting level, and simple regex
+        # doesn't handle nested parentheses well. We'll use a recursive approach to find
+        # and remove ORDER BY clauses at all nesting levels.
 
-                # Create a wrapper that uses DISTINCT ON (value) ORDER BY idx
-                # This preserves first occurrence order while removing duplicates
-                table_alias = self._generate_internal_alias("distinct_wrapper")
-                column_alias = self._generate_internal_alias("distinct_val")
+        def remove_order_by_in_aggregates(sql, agg_func):
+            """Recursively remove ORDER BY clauses in aggregate functions."""
+            pattern = f"{agg_func}\\s*\\("
 
-                # Build the new aggregation with DISTINCT
-                new_agg = f"json_agg(DISTINCT {inner_expr}{order_clause})"
+            # Find all aggregate function calls
+            results = []
+            pos = 0
+            while True:
+                match = re.search(pattern, sql[pos:], re.IGNORECASE)
+                if not match:
+                    break
 
-                # Replace the aggregation in the SQL
-                new_sql = select_sql.replace(
-                    f"json_agg({inner_expr}{order_clause})",
-                    new_agg
-                )
-                return new_sql
+                func_start = pos + match.start()
+                paren_depth = 1
+                i = func_start + len(match.group(0))
 
-        # For DuckDB list() or json_group_array
-        if "list(" in select_sql or "json_group_array(" in select_sql:
-            # Similar approach for DuckDB
-            func_name = "list(" if "list(" in select_sql else "json_group_array("
-            match = re.search(re.escape(func_name) + r'([^)]+)(\s+ORDER\s+BY\s+[^)]+)?\)', select_sql)
-            if match:
-                inner_expr = match.group(1).strip()
-                order_clause = match.group(2) or ""
+                # Find the matching closing parenthesis
+                while i < len(sql) and paren_depth > 0:
+                    if sql[i] == '(':
+                        paren_depth += 1
+                    elif sql[i] == ')':
+                        paren_depth -= 1
+                    i += 1
 
-                # DuckDB LIST supports DISTINCT directly
-                new_agg = f"{func_name.rstrip('(')}(DISTINCT {inner_expr}{order_clause})"
+                if paren_depth == 0:
+                    func_content = sql[func_start + len(match.group(0)):i-1]
 
-                new_sql = select_sql.replace(
-                    f"{func_name.rstrip('(')}({inner_expr}{order_clause})",
-                    new_agg
-                )
-                return new_sql
+                    # Check if there's an ORDER BY clause in this function
+                    # We need to be careful not to remove ORDER BY in nested SELECTs
+                    order_by_match = re.search(
+                        r'ORDER\s+BY\s+[^)]+(?=\s*\)\s*(?:AS\s+\w+)?$',
+                        func_content,
+                        re.IGNORECASE
+                    )
 
-        # Fallback: try to add DISTINCT to the aggregation function
-        # Simple pattern: find aggregate( and add DISTINCT after it
-        for agg_func in ['json_agg(', 'json_group_array(', 'list(']:
-            if agg_func in select_sql:
-                # Check if DISTINCT is already present
-                if f'{agg_func}DISTINCT' in select_sql:
-                    return select_sql  # Already has DISTINCT
+                    if order_by_match and "SELECT" not in func_content:
+                        # Remove the ORDER BY clause
+                        new_content = func_content[:order_by_match.start()]
+                        new_func = f"{agg_func}({new_content})"
 
-                # Add DISTINCT after the function name
-                new_sql = select_sql.replace(agg_func, f'{agg_func}DISTINCT ')
-                return new_sql
+                        # Replace in the SQL
+                        sql = sql[:func_start] + new_func + sql[i:]
 
-        # If we can't modify it, return as-is and let the SQL execution handle it
-        logger.warning(f"Could not add DISTINCT to SELECT statement: {select_sql[:200]}")
+                        # Update position to continue searching after the replacement
+                        pos = func_start + len(new_func)
+                        logger.info(
+                            f"SP-105: Removed ORDER BY from DISTINCT aggregate: "
+                            f"{agg_func}(...{order_by_match.group(0)[:50]}...) -> {new_func[:80]}"
+                        )
+                    else:
+                        pos = i
+                else:
+                    break
+
+            return sql
+
+        # Try to fix list() with DISTINCT
+        if "list(" in select_sql and "DISTINCT" in select_sql:
+            # Check if there's an ORDER BY still present
+            if "ORDER BY" in select_sql:
+                # Try to remove ORDER BY clauses in list() functions
+                select_sql = remove_order_by_in_aggregates(select_sql, "list")
+
+        # Try to fix json_agg() with DISTINCT
+        if "json_agg(" in select_sql and "DISTINCT" in select_sql:
+            if "ORDER BY" in select_sql:
+                select_sql = remove_order_by_in_aggregates(select_sql, "json_agg")
+
+        # Try to fix json_group_array() with DISTINCT
+        if "json_group_array(" in select_sql and "DISTINCT" in select_sql:
+            if "ORDER BY" in select_sql:
+                select_sql = remove_order_by_in_aggregates(select_sql, "json_group_array")
+
         return select_sql
 
     def _check_select_is_distinct(self, select_sql: str) -> str:
