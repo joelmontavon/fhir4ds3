@@ -1084,16 +1084,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # Return SQL fragment marked as empty collection
             # The actual SQL expression depends on context (handled by consumers)
+            # SP-104-002: Include source text for consistency
+            empty_metadata = {
+                "literal_type": "empty_collection",
+                "is_literal": True,
+                "is_empty_collection": True
+            }
+            if node.text:
+                empty_metadata["source_text"] = node.text
+                empty_metadata["text"] = node.text
+
             return SQLFragment(
                 expression="NULL",  # Default - consumers will override
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                metadata={
-                    "literal_type": "empty_collection",
-                    "is_literal": True,
-                    "is_empty_collection": True
-                }
+                metadata=empty_metadata
             )
 
         # Handle different literal types
@@ -1150,12 +1156,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Return SQL fragment with literal expression
         # Literals don't require unnesting and are not aggregate operations
         # Include literal_type in metadata for type-aware comparison casting
+        # SP-104-002: Include source text and temporal_info for type checking
+        fragment_metadata = {
+            "literal_type": node.literal_type,
+            "is_literal": True
+        }
+        # Include source text for temporal literals to support type checking
+        if node.text:
+            fragment_metadata["source_text"] = node.text
+        if node.text:
+            fragment_metadata["text"] = node.text
+        # Include temporal_info if available (for date/time literals)
+        if hasattr(node, 'temporal_info') and node.temporal_info:
+            fragment_metadata["temporal_info"] = node.temporal_info
+
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"literal_type": node.literal_type, "is_literal": True}
+            metadata=fragment_metadata
         )
 
     def _path_requires_unnest(self, path_components: List[str]) -> bool:
@@ -7415,9 +7435,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if not node.children:
             raise ValueError("is() operation requires an expression to check")
 
-        expr_fragment = self.visit(node.children[0])
+        # SP-104-002: Check if node has value_expression attribute (from parent InvocationExpression)
+        # This handles cases like "@2015.is(Date)" where the literal is a sibling in the parent
+        if hasattr(node, 'value_expression') and node.value_expression is not None:
+            # Visit the value expression from the parent
+            expr_fragment = self.visit(node.value_expression)
+        elif node.children:
+            # Fall back to visiting the first child
+            expr_fragment = self.visit(node.children[0])
+        else:
+            raise ValueError("is() operation requires an expression to check")
+
         canonical_type = self._resolve_canonical_type(node.target_type)
         normalized = canonical_type.lower()
+
+        # SP-104-002: Extract original literal for temporal type checking
+        original_literal = None
+        if hasattr(expr_fragment, 'metadata') and expr_fragment.metadata:
+            if expr_fragment.metadata.get('is_literal'):
+                original_literal = (
+                    expr_fragment.metadata.get('source_text') or
+                    expr_fragment.metadata.get('text') or
+                    expr_fragment.metadata.get('temporal_info', {}).get('original') if expr_fragment.metadata.get('temporal_info') else None
+                )
 
         primitive_families = {
             "uri",
@@ -7437,6 +7477,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         elif normalized == "collection":
             type_check_sql = (
                 f"CASE WHEN {expr_fragment.expression} IS NULL THEN false ELSE true END"
+            )
+        # SP-104-002: Check for temporal literals first
+        elif original_literal and original_literal.startswith('@'):
+            # Temporal literal - use literal type check
+            type_check_sql = self._generate_literal_type_check(
+                expr_fragment.expression,
+                canonical_type,
+                original_literal
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -8208,12 +8256,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Example: "Observation.value.is(Quantity)" → path="Observation.value"
         path_expr = self._extract_path_before_function(node.text, node.function_name)
 
+        # SP-104-002: Track original literal text for temporal type checking
+        original_literal = None
+
         # Get the value expression
         # SP-022-003: When is() is called as a method on a literal (e.g., 1.is(Integer)),
         # the function call node only contains "is()" as text, not "1.is(Integer)".
-        # In this case, check if there's a previous fragment that contains the
-        # expression we should be type-checking.
-        if path_expr:
+        # SP-104-002: Check pending_literal_value first for temporal literals
+        if self.context.pending_literal_value is not None:
+            # Use the pending literal value
+            literal_value, value_expr = self.context.pending_literal_value
+            # The pending_literal_value is a tuple (value, sql_expr)
+            # For temporal literals, the sql_expr contains the DATE/TIMESTAMP/TIME literal
+            # We need to preserve the original literal text for type checking
+            # Check if there's temporal_info in the most recent fragment
+            if self.fragments and len(self.fragments) > 0:
+                last_frag = self.fragments[-1]
+                if hasattr(last_frag, 'metadata') and last_frag.metadata:
+                    original_literal = (
+                        last_frag.metadata.get('source_text') or
+                        last_frag.metadata.get('text') or
+                        last_frag.metadata.get('temporal_info', {}).get('original') if last_frag.metadata.get('temporal_info') else None
+                    )
+            # Clear the pending value after using it
+            self.context.pending_literal_value = None
+        elif path_expr:
             # Parse and translate the path expression to update context
             # SP-023-004B: Use EnhancedASTNode directly - accept() handles dispatch
             from ..parser import FHIRPathParser
@@ -8223,12 +8290,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Visit the path to update context
             path_fragment = self.visit(path_ast)
             value_expr = path_fragment.expression
+            # Check if path_fragment has temporal literal metadata
+            if hasattr(path_fragment, 'metadata') and path_fragment.metadata:
+                original_literal = (
+                    path_fragment.metadata.get('source_text') or
+                    path_fragment.metadata.get('text') or
+                    path_fragment.metadata.get('temporal_info', {}).get('original') if path_fragment.metadata.get('temporal_info') else None
+                )
         elif self.fragments:
             # SP-022-003: No path in node.text, but we have previous fragments.
             # This happens with invocation patterns like "1.is(Integer)" where
             # the AST has the literal as a sibling node that was already visited.
             # Use the previous fragment's expression as the value to type-check.
             value_expr = self.fragments[-1].expression
+            # Check if the last fragment has temporal literal metadata
+            if hasattr(self.fragments[-1], 'metadata') and self.fragments[-1].metadata:
+                original_literal = (
+                    self.fragments[-1].metadata.get('source_text') or
+                    self.fragments[-1].metadata.get('text') or
+                    self.fragments[-1].metadata.get('temporal_info', {}).get('original') if self.fragments[-1].metadata.get('temporal_info') else None
+                )
         else:
             # No explicit path and no previous fragments, use current context
             current_path = self.context.get_json_path()
@@ -8242,39 +8323,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # SP-022-003: For literal values, use simplified type checking that
         # doesn't involve json_type() which fails on non-JSON values
-        # SP-104-002: Also check if path_fragment has literal metadata
-        path_has_literal_metadata = (
-            'path_fragment' in locals() and
-            hasattr(path_fragment, 'metadata') and
-            path_fragment.metadata.get('is_literal', False)
-        )
-        if self._is_sql_literal_expression(value_expr) or path_has_literal_metadata:
-            # SP-103-001: Extract original literal text for timezone detection
-            # SP-104-002: Check path_fragment for original literal text first
-            original_literal = None
-            if 'path_fragment' in locals() and hasattr(path_fragment, 'metadata'):
-                original_literal = (
-                    path_fragment.metadata.get('source_text') or
-                    path_fragment.metadata.get('text')
-                )
-            if not original_literal and self.fragments and len(self.fragments) > 0:
-                # Find the fragment that matches the value_expr
-                # The literal might not be the last fragment (could be earlier in the chain)
-                for frag in self.fragments:
-                    if hasattr(frag, 'expression') and str(frag.expression) == str(value_expr):
-                        # Try to get original literal from metadata first
-                        if hasattr(frag, 'metadata') and frag.metadata:
-                            original_literal = frag.metadata.get('source_text') or frag.metadata.get('text')
-                        # If not in metadata, try extracting from the expression itself
-                        if not original_literal and hasattr(frag, 'expression'):
-                            expr_str = str(frag.expression)
-                            # Strip SQL quotes to get the actual FHIRPath literal
-                            # SQL string literals are wrapped in single quotes: '@T14:34:28Z'
-                            unquoted = expr_str.strip("'\"")
-                            # Check if it looks like a FHIRPath literal (starts with @)
-                            if unquoted.startswith('@'):
-                                original_literal = unquoted
-                        break
+        # SP-104-002: Check if value_expr is a literal or if we have original_literal
+        if self._is_sql_literal_expression(value_expr) or original_literal:
             type_check_sql = self._generate_literal_type_check(value_expr, canonical_type, original_literal)
         # Route to appropriate type check based on type classification
         # Maintains thin dialect principle - business logic in translator
