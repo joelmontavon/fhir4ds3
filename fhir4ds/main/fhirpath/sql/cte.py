@@ -1467,6 +1467,10 @@ class CTEManager:
             Adds ORDER BY clause when ordering columns are present to preserve
             array element ordering from UNNEST operations.
 
+        SP-104-001: Only add WHERE result IS NOT NULL if the result column exists.
+            Not all CTEs create a result column, so we must check before adding
+            the WHERE clause to avoid "column not found" errors.
+
         Example:
             For a final CTE named ``cte_final`` the method returns::
 
@@ -1488,7 +1492,19 @@ class CTEManager:
 
         # SP-103-007: Filter out NULL results to represent empty collections
         # This handles cases like {} = {} which should return empty results
-        select_statement += " WHERE result IS NOT NULL"
+        # SP-104-001: Only add WHERE clause if result column exists in CTE
+        # Check if the CTE query creates a result column by looking for:
+        # 1. Explicit " AS result" alias
+        # 2. result in the column list
+        has_result_column = (
+            " AS result" in final_cte.query or 
+            " AS  result" in final_cte.query or  # double space handling
+            ",result" in final_cte.query.replace(" ", "") or  # comma-separated
+            final_cte.query.strip().endswith("result")
+        )
+        
+        if has_result_column:
+            select_statement += " WHERE result IS NOT NULL"
 
         # SP-020-DEBUG: Add ORDER BY if ordering columns are present
         if ordering_columns:

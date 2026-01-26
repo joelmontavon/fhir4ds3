@@ -1,0 +1,76 @@
+{
+  "sprint": "SP-104",
+  "baseline": {
+    "compliance": 55.7,
+    "passing": 520,
+    "total": 934,
+    "target": 70.0,
+    "target_passing": 650
+  },
+  "progress": [
+    {
+      "timestamp": "2026-01-26T10:40:00Z",
+      "task": "SP-104-001: Fix CTE Column Propagation",
+      "compliance": 56.6,
+      "passing": 529,
+      "improvement": 9
+    },
+    {
+      "timestamp": "2026-01-26T11:00:00Z",
+      "task": "SP-104-002: Fix is() Type Function",
+      "status": "testing"
+    }
+  ],
+  "todos": [
+    {
+      "id": "SP-104-001",
+      "title": "Fix CTE Column Propagation Bug",
+      "priority": 1,
+      "impact": 22,
+      "status": "complete",
+      "description": "Fixed 'Referenced column result not found' error by checking if result column exists before adding WHERE clause.",
+      "files": ["fhir4ds/main/fhirpath/sql/cte.py"],
+      "actual_improvement": 9
+    },
+    {
+      "id": "SP-104-002",
+      "title": "Fix is() Type Function",
+      "priority": 2,
+      "impact": 30,
+      "status": "testing",
+      "description": "Fixed temporal literal type checks by using typeof() directly instead of regex patterns.",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "expected_improvement": 30
+    },
+    {
+      "id": "SP-104-003",
+      "title": "Fix Date/Time Arithmetic",
+      "priority": 3,
+      "impact": 28,
+      "status": "pending",
+      "description": "Implement date + duration arithmetic (e.g., @1973-12-25 + 7 days). Need to parse quantity literals and add INTERVAL support.",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py", "fhir4ds/main/fhirpath/types/temporal_parser.py"],
+      "test_patterns": ["+ days", "+ second", "+ month"]
+    },
+    {
+      "id": "SP-104-004",
+      "title": "Fix Comparison Type Coercion",
+      "priority": 4,
+      "impact": 145,
+      "status": "pending",
+      "description": "Fix comparison operators to properly coerce types, especially for date/time comparisons with timezone offsets.",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "test_patterns": ["!=", "<", ">", "=@"]
+    },
+    {
+      "id": "SP-104-005",
+      "title": "Fix as() and ofType() Type Functions",
+      "priority": 5,
+      "impact": 28,
+      "status": "pending",
+      "description": "Fix as() and ofType() functions to properly handle type conversions and filtering.",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "test_patterns": ["as(", "ofType("]
+    }
+  ]
+}
