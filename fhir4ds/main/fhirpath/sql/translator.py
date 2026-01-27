@@ -23,6 +23,7 @@ Author: FHIR4DS Development Team
 
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -260,11 +261,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Reset context to initial state
         self.context.reset()
 
-        logger.debug(f"Starting translation of AST: {ast_root.node_type}")
+        # Handle FHIRPathExpression wrapper - extract the underlying AST
+        if hasattr(ast_root, 'parse_result') and hasattr(ast_root, 'get_ast'):
+            # This is a FHIRPathExpression wrapper, get the actual AST
+            logger.debug(f"Starting translation of FHIRPathExpression: {ast_root.expression if hasattr(ast_root, 'expression') else 'unknown'}")
+            actual_ast = ast_root.get_ast()
+        else:
+            actual_ast = ast_root
+            logger.debug(f"Starting translation of AST: {actual_ast.node_type if hasattr(actual_ast, 'node_type') else type(actual_ast).__name__}")
 
         # Visit root node to start translation
         # The visit may accumulate multiple fragments for expression chains
-        fragment = self.visit(ast_root)
+        fragment = self.visit(actual_ast)
 
         # Accumulate the final fragment if it wasn't already added
         # (Some visitor methods add fragments during traversal)
@@ -1935,13 +1943,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 logger.debug(f"SP-103-005: Found resolved polymorphic field: {poly_prop} -> {resolved_field}")
                 logger.debug(f"SP-103-005: normalized_components={normalized_components}, polymorphic_idx={polymorphic_idx}, remaining={remaining}")
 
-                # Build path using the resolved field instead of COALESCE
-                path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
-                resolved_path = ".".join(path_parts)
-                resolved_expr = self.dialect.extract_json_field(
-                    column=self.context.current_table,
-                    path=resolved_path
-                )
+                # SP-105-004: Use parent_path instead of normalized_components when available
+                # This handles cases where ofType() has resolved the polymorphic field and
+                # subsequent navigation has built up the parent_path (e.g., ['valueRange', 'low'])
+                # We need to use the full parent_path to build the correct JSON path
+                if self.context.parent_path and len(self.context.parent_path) > 0:
+                    # parent_path contains the resolved field (e.g., ['valueRange', 'low'])
+                    # Build path from parent_path
+                    path_parts = ["$"] + self.context.parent_path
+                    resolved_path = ".".join(path_parts)
+                    resolved_expr = self.dialect.extract_json_field(
+                        column=self.context.current_table,
+                        path=resolved_path
+                    )
+                    logger.debug(f"SP-105-004: Using parent_path to build resolved path: {resolved_path}")
+                else:
+                    # Fallback to original logic using normalized_components
+                    # Build path using the resolved field instead of COALESCE
+                    path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
+                    resolved_path = ".".join(path_parts)
+                    resolved_expr = self.dialect.extract_json_field(
+                        column=self.context.current_table,
+                        path=resolved_path
+                    )
                 logger.debug(f"SP-103-005: Generated resolved field extraction: {resolved_expr}")
                 logger.debug(f"SP-103-005: Resolved path: {resolved_path}")
 
@@ -2931,7 +2955,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # before visiting children (see SP-022-013). This dead code block is kept for
         # reference but should never be reached.
 
-        # Handle temporal arithmetic (e.g., date - quantity with time unit)
+        # Handle temporal arithmetic (e.g., date + quantity, date - quantity with time unit)
+        if node.operator == "+":
+            temporal_fragment = self._translate_temporal_quantity_addition(
+                left_fragment,
+                right_fragment,
+                node.children[0],
+                node.children[1]
+            )
+            if temporal_fragment is not None:
+                return temporal_fragment
+
         if node.operator == "-":
             temporal_fragment = self._translate_temporal_quantity_subtraction(
                 left_fragment,
@@ -4332,7 +4366,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # integer op integer = integer
         # integer op decimal = decimal
         # decimal op decimal = decimal
-        prefers_decimal = "decimal" in {left_type, right_type}
+        # unknown op * = decimal (safe cast for JSON-extracted numeric values)
+        prefers_decimal = "decimal" in {left_type, right_type} or "unknown" in {left_type, right_type}
         if prefers_decimal:
             left_numeric = self._ensure_decimal_expression(left_expr, left_type)
             right_numeric = self._ensure_decimal_expression(right_expr, right_type)
@@ -4464,6 +4499,82 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return expression
         return self.dialect.generate_type_cast(expression, "Decimal")
 
+    def _translate_temporal_quantity_addition(
+        self,
+        left_fragment: SQLFragment,
+        right_fragment: SQLFragment,
+        left_node: FHIRPathASTNode,
+        right_node: FHIRPathASTNode
+    ) -> Optional[SQLFragment]:
+        """Translate temporal literal plus quantity expressions to SQL.
+
+        Handles expressions like:
+        - @2023-01-01 + 1 'day'
+        - @1973-12-25T00:00:00.000+10:00 + 10 'ms'
+        - @2023-01-01 + 7 days
+
+        Returns None if this is not a temporal + quantity expression.
+        """
+        # SP-105-005: Detect temporal type from fragment metadata first, then node
+        temporal_type = None
+
+        # Check fragment metadata (set after visiting the node)
+        left_metadata = getattr(left_fragment, "metadata", {}) or {}
+        fragment_literal_type = left_metadata.get("literal_type")
+        if fragment_literal_type in {"date", "datetime", "time"}:
+            temporal_type = fragment_literal_type
+        else:
+            # Fall back to node-based detection
+            temporal_type = self._detect_temporal_type(left_node)
+
+        if temporal_type is None:
+            return None
+
+        # SP-105-005: Parse quantity from fragment metadata first, then node
+        quantity = self._parse_quantity_literal_from_fragment(right_fragment, right_node)
+        if quantity is None:
+            return None
+
+        amount, unit = quantity
+        normalized_unit = self._normalize_quantity_unit(unit)
+        if normalized_unit is None:
+            return None
+
+        # Months and years require whole-number adjustments
+        if normalized_unit in {"year", "month"} and amount % 1 != 0:
+            return None
+
+        interval_expr = self._build_interval_expression(amount, normalized_unit)
+        if interval_expr is None:
+            return None
+
+        sql_expr = f"({left_fragment.expression} + {interval_expr})"
+        if temporal_type == "date":
+            sql_expr = f"CAST({sql_expr} AS DATE)"
+        elif temporal_type == "datetime":
+            sql_expr = f"CAST({sql_expr} AS TIMESTAMP)"
+        elif temporal_type == "time":
+            sql_expr = f"CAST({sql_expr} AS TIME)"
+
+        dependencies: List[str] = []
+        for dep in (*left_fragment.dependencies, *right_fragment.dependencies):
+            if dep not in dependencies:
+                dependencies.append(dep)
+
+        source_table = (
+            left_fragment.source_table
+            or right_fragment.source_table
+            or self.context.current_table
+        )
+
+        return SQLFragment(
+            expression=sql_expr,
+            source_table=source_table,
+            requires_unnest=left_fragment.requires_unnest or right_fragment.requires_unnest,
+            is_aggregate=left_fragment.is_aggregate or right_fragment.is_aggregate,
+            dependencies=dependencies
+        )
+
     def _translate_temporal_quantity_subtraction(
         self,
         left_fragment: SQLFragment,
@@ -4472,11 +4583,23 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         right_node: FHIRPathASTNode
     ) -> Optional[SQLFragment]:
         """Translate temporal literal minus quantity expressions to SQL."""
-        temporal_type = self._detect_temporal_type(left_node)
+        # SP-105-005: Detect temporal type from fragment metadata first, then node
+        temporal_type = None
+
+        # Check fragment metadata (set after visiting the node)
+        left_metadata = getattr(left_fragment, "metadata", {}) or {}
+        fragment_literal_type = left_metadata.get("literal_type")
+        if fragment_literal_type in {"date", "datetime", "time"}:
+            temporal_type = fragment_literal_type
+        else:
+            # Fall back to node-based detection
+            temporal_type = self._detect_temporal_type(left_node)
+
         if temporal_type is None:
             return None
 
-        quantity = self._parse_quantity_literal(right_node)
+        # SP-105-005: Parse quantity from fragment metadata first, then node
+        quantity = self._parse_quantity_literal_from_fragment(right_fragment, right_node)
         if quantity is None:
             return None
 
@@ -4539,8 +4662,57 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return None
 
+    def _parse_quantity_literal_from_fragment(
+        self,
+        fragment: SQLFragment,
+        node: FHIRPathASTNode
+    ) -> Optional[Tuple[Decimal, str]]:
+        """Parse quantity literal from SQL fragment metadata or AST node.
+
+        SP-105-005: Check fragment metadata first for temporal_info, then fall back
+        to node-based parsing. This handles both quoted units (1'd') and unquoted
+        units (7days, 1 second).
+        """
+        # First check fragment metadata (set after visiting the node)
+        fragment_metadata = getattr(fragment, "metadata", {}) or {}
+        temporal_info = fragment_metadata.get("temporal_info")
+        if temporal_info and temporal_info.get("kind") == "duration":
+            value = temporal_info.get("value")
+            unit = temporal_info.get("unit")
+            if value and unit:
+                try:
+                    amount = Decimal(str(value))
+                    return amount, unit
+                except (InvalidOperation, TypeError):
+                    pass
+
+        # Fall back to node-based parsing
+        return self._parse_quantity_literal(node)
+
     def _parse_quantity_literal(self, node: FHIRPathASTNode) -> Optional[Tuple[Decimal, str]]:
-        """Parse quantity literal expressed as <number>'unit'."""
+        """Parse quantity literal expressed as <number>'unit' or <number><unit>.
+
+        SP-105-005: Enhanced to extract quantity from temporal_info in fragment metadata.
+        The quantity literal may have already been visited and converted to a SQLFragment,
+        so we check the node's temporal_info metadata first.
+        """
+        # SP-105-005: Check if the node has temporal_info (set by literal visitor)
+        # This handles both quoted units (1'd') and unquoted units (7days)
+        metadata = getattr(node, "metadata", None)
+        if metadata:
+            custom_attrs = getattr(metadata, "custom_attributes", {})
+            temporal_info = custom_attrs.get("temporal_info")
+            if temporal_info and temporal_info.get("kind") == "duration":
+                value = temporal_info.get("value")
+                unit = temporal_info.get("unit")
+                if value and unit:
+                    try:
+                        amount = Decimal(str(value))
+                        return amount, unit
+                    except (InvalidOperation, TypeError):
+                        pass
+
+        # Fall back to text-based parsing for quoted units
         value = getattr(node, "value", None)
         unit = None
         number = None
@@ -4600,11 +4772,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
     @staticmethod
     def _decimal_to_sql_str(amount: Decimal) -> str:
-        """Convert Decimal to SQL-friendly string without scientific notation."""
-        normalized = amount.normalize()
-        if normalized == normalized.to_integral():
-            return str(normalized.to_integral())
-        return format(normalized, "f").rstrip("0").rstrip(".")
+        """Convert Decimal to SQL-friendly string without scientific notation.
+
+        SP-105-005: Use format() with 'f' to avoid scientific notation that can
+        occur with normalize() for values >= 10.
+        """
+        # Check if it's an integer value
+        if amount == amount.to_integral():
+            # For integers, use format to avoid scientific notation
+            return format(amount.to_integral(), "f")
+        # For decimals, use format and strip trailing zeros
+        return format(amount, "f").rstrip("0").rstrip(".")
 
     def _translate_temporal_literal_comparison_if_applicable(self, node: OperatorNode) -> Optional[SQLFragment]:
         """Translate temporal literal comparisons that require precision-aware semantics."""
@@ -4644,15 +4822,287 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _extract_temporal_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
-        """Extract temporal metadata from AST node if available."""
+        """Extract temporal metadata from AST node if available.
+
+        This method handles both:
+        1. Nodes that have already been visited and have temporal_info attribute
+        2. Raw AST nodes that need temporal info parsed from their text
+
+        For raw nodes, we traverse to find the actual literal and parse its temporal info.
+        """
+        # First, check if temporal_info is already set (visited node)
         temporal_info = getattr(node, "temporal_info", None)
         if temporal_info:
             return temporal_info
 
+        # Check metadata for temporal_info
         metadata = getattr(node, "metadata", None)
         if metadata and getattr(metadata, "custom_attributes", None):
-            return metadata.custom_attributes.get("temporal_info")
+            temporal_info = metadata.custom_attributes.get("temporal_info")
+            if temporal_info:
+                return temporal_info
+
+        # For raw nodes, parse temporal info from text
+        # Traverse to find the actual literal node (deepest nested literal)
+        literal_node = self._find_literal_node(node)
+        if literal_node and hasattr(literal_node, 'text'):
+            text = literal_node.text
+            if text and text.startswith('@'):
+                return self._parse_temporal_literal_from_text(text)
+
         return None
+
+    def _find_literal_node(self, node: FHIRPathASTNode) -> Optional[FHIRPathASTNode]:
+        """Find the actual literal node by traversing TermExpression wrappers.
+
+        AST structure for literals is often:
+        TermExpression -> literal -> literal (actual literal)
+        """
+        if not hasattr(node, 'children') or not node.children:
+            # This is a leaf node, check if it's a literal
+            node_type = getattr(node, 'node_type', '')
+            if node_type == 'literal':
+                return node
+            return None
+
+        # If there's exactly one child, traverse deeper
+        if len(node.children) == 1:
+            return self._find_literal_node(node.children[0])
+
+        # Multiple children - not a simple literal wrapper
+        return None
+
+    def _parse_temporal_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR temporal literal from text, returning metadata for range comparisons.
+
+        This replicates the temporal literal parsing logic from ast_extensions.py
+        to handle raw AST nodes before they're visited.
+
+        Args:
+            text: The temporal literal text (e.g., "@2018-03", "@T10:30")
+
+        Returns:
+            Dict with temporal info including kind, precision, start, end, is_partial
+            or None if not a temporal literal
+        """
+        if not text or not text.startswith("@"):
+            return None
+
+        import re
+        from datetime import datetime, timedelta
+
+        if text.startswith("@T"):
+            return self._parse_time_literal_from_text(text)
+
+        body = text[1:]
+        if "T" in body:
+            # Check for partial DateTime pattern first (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT)
+            partial_datetime_match = re.fullmatch(r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?T$", body)
+            if partial_datetime_match:
+                return self._parse_partial_datetime_literal_from_text(text, body, partial_datetime_match)
+            return self._parse_datetime_literal_from_text(text, body)
+        return self._parse_date_literal_from_text(text, body)
+
+    def _parse_date_literal_from_text(self, original: str, body: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR date literal with optional reduced precision."""
+        import re
+        from datetime import datetime, timedelta
+
+        if re.fullmatch(r"\d{4}$", body):
+            year = int(body)
+            start_dt = datetime(year, 1, 1)
+            end_dt = datetime(year + 1, 1, 1)
+            precision = "year"
+            normalized = f"{year:04d}"
+            literal_type = "date"
+            is_partial = True
+        elif re.fullmatch(r"\d{4}-\d{2}$", body):
+            year, month = map(int, body.split("-"))
+            start_dt = datetime(year, month, 1)
+            if month == 12:
+                end_dt = datetime(year + 1, 1, 1)
+            else:
+                end_dt = datetime(year, month + 1, 1)
+            precision = "month"
+            normalized = f"{year:04d}-{month:02d}"
+            literal_type = "date"
+            is_partial = True
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}$", body):
+            year, month, day = map(int, body.split("-"))
+            start_dt = datetime(year, month, day)
+            end_dt = start_dt + timedelta(days=1)
+            precision = "day"
+            normalized = f"{year:04d}-{month:02d}-{day:02d}"
+            literal_type = "date"
+            is_partial = False
+        else:
+            return None
+
+        return {
+            "kind": "date",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": is_partial,
+            "literal_type": literal_type,
+            "original": original
+        }
+
+    def _parse_time_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR time literal with optional reduced precision."""
+        import re
+        from datetime import datetime, timedelta
+
+        body = text[2:]  # Remove "@T"
+
+        # Match various time precisions
+        if re.fullmatch(r"\d{2}$", body):
+            # Hour precision: T10 -> 10:00:00 to 10:59:59.999...
+            hour = int(body)
+            start_dt = datetime(1, 1, 1, hour, 0, 0)
+            end_dt = datetime(1, 1, 1, hour + 1, 0, 0)
+            precision = "hour"
+            normalized = f"{hour:02d}"
+            is_partial = True
+        elif re.fullmatch(r"\d{2}:\d{2}$", body):
+            # Minute precision: T10:30 -> 10:30:00 to 10:30:59.999...
+            hour, minute = map(int, body.split(":"))
+            start_dt = datetime(1, 1, 1, hour, minute, 0)
+            end_dt = datetime(1, 1, 1, hour, minute + 1, 0)
+            precision = "minute"
+            normalized = f"{hour:02d}:{minute:02d}"
+            is_partial = True
+        elif re.fullmatch(r"\d{2}:\d{2}:\d{2}$", body):
+            # Second precision: T10:30:00 -> 10:30:00 to 10:30:00.999...
+            hour, minute, second = map(int, body.split(":"))
+            start_dt = datetime(1, 1, 1, hour, minute, second)
+            end_dt = start_dt + timedelta(seconds=1)
+            precision = "second"
+            normalized = f"{hour:02d}:{minute:02d}:{second:02d}"
+            is_partial = False
+        else:
+            return None
+
+        return {
+            "kind": "time",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_time_iso(start_dt),
+            "end": self._format_time_iso(end_dt),
+            "is_partial": is_partial,
+            "literal_type": "time",
+            "original": text
+        }
+
+    def _parse_datetime_literal_from_text(self, original: str, body: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR dateTime literal with optional reduced precision and timezone."""
+        import re
+        from datetime import datetime, timedelta
+
+        # Pattern with optional timezone suffix: Z or +/-HH:MM
+        pattern = re.compile(
+            r"^(\d{4})-(\d{2})-(\d{2})T"
+            r"(\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+            r"(?:Z|[+-]\d{2}:\d{2})?$"
+        )
+        match = pattern.fullmatch(body)
+        if not match:
+            return None
+
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        hour = int(match.group(4))
+        minute = int(match.group(5) or 0)
+        second = int(match.group(6) or 0)
+        fraction = match.group(7)
+
+        # Build datetime
+        if fraction:
+            microsecond = int(fraction.ljust(6, '0')[:6])
+            start_dt = datetime(year, month, day, hour, minute, second, microsecond)
+        else:
+            start_dt = datetime(year, month, day, hour, minute, second)
+
+        # Determine precision and end value
+        if fraction:
+            precision = "subsecond"
+            end_dt = start_dt + timedelta(microseconds=1)
+        elif second > 0:
+            precision = "second"
+            end_dt = start_dt + timedelta(seconds=1)
+        elif minute > 0:
+            precision = "minute"
+            end_dt = start_dt + timedelta(minutes=1)
+        elif hour > 0:
+            precision = "hour"
+            end_dt = start_dt + timedelta(hours=1)
+        else:
+            precision = "day"
+            end_dt = start_dt + timedelta(days=1)
+
+        normalized = start_dt.isoformat()
+
+        return {
+            "kind": "datetime",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": precision != "subsecond",
+            "literal_type": "datetime",
+            "original": original
+        }
+
+    def _parse_partial_datetime_literal_from_text(self, original: str, body: str, match) -> Optional[Dict[str, Any]]:
+        """Parse partial dateTime literal (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT)."""
+        from datetime import datetime, timedelta
+
+        year = int(match.group(1))
+        month = int(match.group(2)) if match.group(2) else None
+        day = int(match.group(3)) if match.group(3) else None
+
+        if day is not None:
+            # @YYYY-MM-DDT: day precision
+            start_dt = datetime(year, month, day)
+            end_dt = start_dt + timedelta(days=1)
+            precision = "day"
+            normalized = f"{year:04d}-{month:02d}-{day:02d}"
+        elif month is not None:
+            # @YYYY-MMT: month precision
+            start_dt = datetime(year, month, 1)
+            if month == 12:
+                end_dt = datetime(year + 1, 1, 1)
+            else:
+                end_dt = datetime(year, month + 1, 1)
+            precision = "month"
+            normalized = f"{year:04d}-{month:02d}"
+        else:
+            # @YYYYT: year precision
+            start_dt = datetime(year, 1, 1)
+            end_dt = datetime(year + 1, 1, 1)
+            precision = "year"
+            normalized = f"{year:04d}"
+
+        return {
+            "kind": "datetime",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": True,
+            "literal_type": "datetime",
+            "original": original
+        }
+
+    def _format_datetime_iso(self, dt: datetime) -> str:
+        """Format datetime to ISO string for SQL."""
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_time_iso(self, dt: datetime) -> str:
+        """Format time to ISO string for SQL."""
+        return dt.strftime("%H:%M:%S")
 
     def _build_temporal_conditions(
         self,
@@ -7649,13 +8099,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             Output: SQL that casts Procedure.performed to datetime type
         """
         # Type operation should have exactly one child (the expression to cast)
-        if not node.children:
+        # SP-104-002: Check for value_expression attribute (from parent InvocationExpression)
+        # This handles cases like "@2015.as(Date)" where the literal is a sibling in the parent
+        if hasattr(node, 'value_expression') and node.value_expression is not None:
+            # Use the value expression from the parent
+            child_node = node.value_expression
+        elif node.children:
+            # Fall back to the first child
+            child_node = node.children[0]
+        else:
             raise ValueError("as() operation requires an expression to cast")
 
         # Snapshot context so polymorphic path traversal does not leak state
         snapshot = self._snapshot_context()
         try:
-            child_node = node.children[0]
             expr_fragment = self.visit(child_node)
         finally:
             # Always restore - downstream operations assume original context
@@ -7771,9 +8228,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Check if this is a direct property access
             # Direct access: parent_path contains only the property name (e.g., ['value'])
             # Nested access: parent_path contains multiple elements (e.g., ['component', 'value'])
+            # SP-105-004: Also treat empty parent_path as direct access when property_name matches
+            # This handles cases where the identifier hasn't been visited yet in the current context
             is_direct_access = (
-                len(parent_path_before_child) == 1 and
-                parent_path_before_child[0] == property_name
+                (len(parent_path_before_child) == 0 or len(parent_path_before_child) == 1) and
+                (len(parent_path_before_child) == 0 or parent_path_before_child[0] == property_name)
             )
 
             if is_direct_access:
@@ -7782,45 +8241,80 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     logger.debug(f"Resolved polymorphic field: {property_name} + {canonical_type} → {polymorphic_field}")
                     logger.debug(f"Parent path before: {self.context.parent_path}")
 
-                    # Build JSON path for the polymorphic field
-                    # Need to extract the source table from the expression
-                    source_table = expr_fragment.source_table or self.context.current_table
-                    json_path = f"$.{polymorphic_field}"
+                    # SP-105-004: Check if there's subsequent navigation after ofType()
+                    # We need to look at the parent's parent to see if there are MemberInvocations
+                    has_subsequent_navigation = False
+                    if hasattr(node, 'enhanced_node') and node.enhanced_node:
+                        enhanced_node = node.enhanced_node
+                        if hasattr(enhanced_node, 'parent') and enhanced_node.parent:
+                            grandparent = enhanced_node.parent
+                            # Check if grandparent has more children after the current parent
+                            # This indicates there's more navigation (e.g., .low.value)
+                            if hasattr(grandparent, 'children') and len(grandparent.children) > 1:
+                                has_subsequent_navigation = True
+                                logger.debug(f"SP-105-004: Detected subsequent navigation after ofType(), will continue chain")
 
-                    # Extract the polymorphic field directly - no type filtering needed
-                    # because the field name already guarantees the type!
-                    poly_field_sql = self.dialect.extract_json_object(
-                        column=source_table,
-                        path=json_path
-                    )
+                    if has_subsequent_navigation:
+                        # SP-105-004: When there's subsequent navigation, update parent_path to use
+                        # the resolved polymorphic field, but DON'T return early. Let the navigation
+                        # continue from the resolved field.
+                        if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                            # Replace the last element
+                            self.context.parent_path[-1] = polymorphic_field
+                        else:
+                            # Append if the structure is different than expected
+                            self.context.parent_path.append(polymorphic_field)
+                        logger.debug(f"SP-105-004: Updated parent_path for subsequent navigation: {self.context.parent_path}")
 
-                    logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+                        # Store the polymorphic field mapping for subsequent identifier visits
+                        if not hasattr(self.context, 'polymorphic_field_mappings'):
+                            self.context.polymorphic_field_mappings = {}
+                        self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                        logger.debug(f"SP-105-004: Stored polymorphic mapping for chain: {property_name} -> {polymorphic_field}")
 
-                    # SP-103-005: Update parent_path to reflect the resolved type
-                    # The current path ends with the base property name (e.g., 'value'),
-                    # and we need to replace it with the polymorphic field (e.g., 'valueRange')
-                    if self.context.parent_path and self.context.parent_path[-1] == property_name:
-                        # Replace the last element
-                        self.context.parent_path[-1] = polymorphic_field
+                        # Fall through to continue with navigation after updating context
+                        # Don't return early - let subsequent identifiers build the full path
                     else:
-                        # Append if the structure is different than expected
-                        self.context.parent_path.append(polymorphic_field)
-                    logger.debug(f"Parent path after: {self.context.parent_path}")
+                        # No subsequent navigation - return the polymorphic field extraction
+                        # Build JSON path for the polymorphic field
+                        # Need to extract the source table from the expression
+                        source_table = expr_fragment.source_table or self.context.current_table
+                        json_path = f"$.{polymorphic_field}"
 
-                    # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
-                    # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
-                    if not hasattr(self.context, 'polymorphic_field_mappings'):
-                        self.context.polymorphic_field_mappings = {}
-                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
-                    logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
+                        # Extract the polymorphic field directly - no type filtering needed
+                        # because the field name already guarantees the type!
+                        poly_field_sql = self.dialect.extract_json_object(
+                            column=source_table,
+                            path=json_path
+                        )
 
-                    return SQLFragment(
-                        expression=poly_field_sql,
-                        source_table=source_table,
-                        requires_unnest=False,
-                        is_aggregate=False,
-                        dependencies=expr_fragment.dependencies
-                    )
+                        logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+
+                        # SP-103-005: Update parent_path to reflect the resolved type
+                        # The current path ends with the base property name (e.g., 'value'),
+                        # and we need to replace it with the polymorphic field (e.g., 'valueRange')
+                        if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                            # Replace the last element
+                            self.context.parent_path[-1] = polymorphic_field
+                        else:
+                            # Append if the structure is different than expected
+                            self.context.parent_path.append(polymorphic_field)
+                        logger.debug(f"Parent path after: {self.context.parent_path}")
+
+                        # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
+                        # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
+                        if not hasattr(self.context, 'polymorphic_field_mappings'):
+                            self.context.polymorphic_field_mappings = {}
+                        self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                        logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
+
+                        return SQLFragment(
+                            expression=poly_field_sql,
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=expr_fragment.dependencies
+                        )
 
         type_metadata: Dict[str, Any] = {}
         if canonical_type:
@@ -8621,20 +9115,35 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         f"Generated polymorphic .as() SQL with path_after: {sql_expr}"
                     )
 
-                    # Create and return the fragment
-                    fragment = SQLFragment(
+                    # Build a proper expression fragment for type casting
+                    # This ensures we get the full complex type metadata
+                    expr_fragment = SQLFragment(
                         expression=sql_expr,
                         source_table=self.context.current_table,
                         requires_unnest=False,
                         is_aggregate=False,
                         dependencies=[],
-                        metadata={
-                            'type_operation': 'as',
-                            'target_type': canonical_type,
-                            'polymorphic_resolution': polymorphic_field,
-                            'json_path': json_path,
-                            'path_after_as': path_after
-                        }
+                        metadata={}
+                    )
+
+                    # Use _build_type_cast_fragment to get proper metadata including mode='complex'
+                    # Create an identifier node representing the polymorphic field
+                    identifier_node = IdentifierNode(
+                        node_type="identifier",
+                        text=path_expr,
+                        identifier=last_component
+                    )
+
+                    # Get type metadata
+                    type_metadata = self.type_registry.get_type_metadata(canonical_type) or {}
+
+                    # Build complex type cast fragment with proper metadata
+                    fragment = self._build_complex_type_cast_fragment(
+                        identifier_node=identifier_node,
+                        expr_fragment=expr_fragment,
+                        canonical_type=canonical_type,
+                        type_metadata=type_metadata,
+                        original_expression=node.text,
                     )
 
                     return fragment
@@ -11325,15 +11834,20 @@ END"""
                 if hasattr(length_fragment, "dependencies"):
                     dependencies.extend(length_fragment.dependencies)
 
-            start_condition = f"({start_expr})"
+            # SP-106-003: Cast start expression to BIGINT for substring compatibility
+            # length() returns DOUBLE, but substring expects BIGINT
+            start_cast = f"TRY_CAST({start_expr} AS BIGINT)"
+            start_condition = f"({start_cast})"
             start_plus_one = f"({start_condition} + 1)"
 
             if length_expr is not None:
+                # SP-106-003: Cast length expression to BIGINT
+                length_cast = f"TRY_CAST({length_expr} AS BIGINT)"
                 substring_sql = self.dialect.generate_string_function(
                     'substring',
                     string_expr,
                     start_plus_one,
-                    length_expr
+                    length_cast
                 )
             else:
                 substring_sql = self.dialect.generate_string_function(
