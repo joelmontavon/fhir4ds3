@@ -1,6 +1,6 @@
 {
   "env": {
-    "ANTHROPIC_AUTH_TOKEN": "7a49915721d04c7799ebde904d8492ed.D0c22kiAb7567kcD",
+    "ANTHROPIC_AUTH_TOKEN": "51902c40276c45abbc38395f90e5ba61.fe90VYbW58aff0sY",
     "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
     "API_TIMEOUT_MS": "3000000",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",

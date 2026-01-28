@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-01-27T23:46:38.314063",
+  "total_expressions": 41,
+  "overall_success_rate": 97.5609756097561,
+  "category_breakdown": {
+    "healthcare_use_case": {
+      "total": 41,
+      "success": 40,
+      "failed": 1,
+      "success_rate": 97.5609756097561
+    }
+  },
+  "failed_expressions": [
+    {
+      "name": "Procedure - Performer",
+      "expression": "Procedure.performer.actor",
+      "category": "healthcare_use_case",
+      "error": "Incomplete expression: expression ends with 'or' operator"
+    }
+  ]
+}

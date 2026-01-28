@@ -2900,9 +2900,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # {} implies false -> {} (propagate empty)
                 return "NULL"
             else:
-                # {} implies true -> true (empty antecedent is true)
-                # Also handles {} implies (non-false expression) -> (NOT NULL) OR expr -> expr
-                return right_sql
+                # {} implies true -> (NOT left) OR right
+                # Empty antecedent is treated as true, but we generate the full expression
+                # to properly demonstrate empty collection handling in SQL
+                not_left = self.dialect.generate_boolean_not(left_sql)
+                return f"({not_left}) OR ({right_sql})"
         elif left_is_true_literal and right_is_empty:
             # true implies {} -> {} (propagate empty)
             return "NULL"
@@ -5262,7 +5264,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
     def _format_datetime_iso(self, dt: datetime) -> str:
         """Format datetime to ISO string for SQL."""
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return dt.isoformat()
 
     def _format_time_iso(self, dt: datetime) -> str:
         """Format time to ISO string for SQL."""
@@ -11857,6 +11859,22 @@ END"""
                     f"Function 'power' invoked as method requires exactly 1 argument, got {len(args)}"
                 )
             exponent_node = args[0]
+        elif self.fragments:
+            # Method invocation like 2.power(3) where base is in fragments
+            base_fragment = self.fragments[-1]
+            base_expr = base_fragment.expression
+            if hasattr(base_fragment, "dependencies"):
+                for dep in base_fragment.dependencies:
+                    if dep not in dependencies:
+                        dependencies.append(dep)
+            # Remove the base fragment since we're incorporating it into power()
+            self.fragments.pop()
+
+            if len(args) != 1:
+                raise ValueError(
+                    f"Function 'power' invoked as method on context requires exactly 1 argument, got {len(args)}"
+                )
+            exponent_node = args[0]
         else:
             if len(args) != 2:
                 raise ValueError(
@@ -12050,54 +12068,70 @@ END"""
                 self.context.pending_fragment_result = None
                 if source_table is None:
                     source_table = self.context.current_table
-            # SP-102-001: Check if we're in a lambda scope with $this bound
-            # This handles cases like substring($this.length()-3) where the string
-            # argument is implicit and should be $this
-            elif func_name in ("substring", "indexof", "replace"):
-                logger.debug(f"SP-102-001 DEBUG: substring checking for $this, func_name={func_name}")
-                this_binding = self.context.get_variable("$this")
-                if this_binding is not None:
-                    # Use $this as the implicit string argument
-                    # SP-102-001: $this might be a column reference (like 'given_item') or an expression
-                    # For column references from UNNEST, we need to unwrap the JSON to get the string value
-                    this_expr = this_binding.expression
-                    # Check if this is a simple column reference (no parentheses, no function calls)
-                    is_simple_column = this_expr and not any(c in this_expr for c in '()')
-
-                    if is_simple_column:
-                        # Simple column reference - need to unwrap JSON
-                        # Use extract_json_string to get the scalar value from the JSON column
-                        string_expr = self.dialect.extract_json_string(this_expr, "$")
-                        logger.debug(
-                            f"SP-102-001: Unwrapped $this column {this_expr} -> {string_expr}"
-                        )
-                    else:
-                        # Complex expression - use as-is
-                        string_expr = this_expr
-                        logger.debug(
-                            f"SP-102-001: Using $this expression directly: {string_expr}"
-                        )
-
-                    source_table = this_binding.source_table or self.context.current_table
-                    requires_unnest = this_binding.requires_unnest
-                    is_aggregate = this_binding.is_aggregate
-                    if this_binding.dependencies:
-                        dependencies.extend(this_binding.dependencies)
-                    logger.debug(
-                        f"SP-102-001: Using $this as implicit string argument for {func_name}"
-                    )
             else:
+                # SP-107-005: Check context path BEFORE $this to avoid using default $this binding
+                # when there's a meaningful context path available
                 current_path = self.context.get_json_path()
                 if current_path and current_path != "$":
+                    # Use the context path if available
                     string_expr = self.dialect.extract_json_field(
                         column=self.context.current_table,
                         path=current_path
                     )
+                    source_table = self.context.current_table
+                    requires_unnest = False
+                    is_aggregate = False
+                    logger.debug(
+                        f"Using context path for string function: {current_path} -> {string_expr}"
+                    )
+                # SP-102-001: Check if we're in a lambda scope with $this bound
+                # This handles cases like substring($this.length()-3) where the string
+                # argument is implicit and should be $this
+                elif func_name in ("substring", "indexof", "replace"):
+                    logger.debug(f"SP-102-001 DEBUG: substring checking for $this, func_name={func_name}")
+                    this_binding = self.context.get_variable("$this")
+                    if this_binding is not None:
+                        # Use $this as the implicit string argument
+                        # SP-102-001: $this might be a column reference (like 'given_item') or an expression
+                        # For column references from UNNEST, we need to unwrap the JSON to get the string value
+                        this_expr = this_binding.expression
+                        # Check if this is a simple column reference (no parentheses, no function calls)
+                        is_simple_column = this_expr and not any(c in this_expr for c in '()')
+
+                        if is_simple_column:
+                            # Simple column reference - need to unwrap JSON
+                            # Use extract_json_string to get the scalar value from the JSON column
+                            string_expr = self.dialect.extract_json_string(this_expr, "$")
+                            logger.debug(
+                                f"SP-102-001: Unwrapped $this column {this_expr} -> {string_expr}"
+                            )
+                        else:
+                            # Complex expression - use as-is
+                            string_expr = this_expr
+                            logger.debug(
+                                f"SP-102-001: Using $this expression directly: {string_expr}"
+                            )
+
+                        source_table = this_binding.source_table or self.context.current_table
+                        requires_unnest = this_binding.requires_unnest
+                        is_aggregate = this_binding.is_aggregate
+                        if this_binding.dependencies:
+                            dependencies.extend(this_binding.dependencies)
+                        logger.debug(
+                            f"SP-102-001: Using $this as implicit string argument for {func_name}"
+                        )
+                    else:
+                        # No context path and no $this, use current table directly
+                        string_expr = self.context.current_table
+                        source_table = self.context.current_table
+                        requires_unnest = False
+                        is_aggregate = False
                 else:
+                    # For other functions (length), use current table if no context path
                     string_expr = self.context.current_table
-                source_table = self.context.current_table
-                requires_unnest = False
-                is_aggregate = False
+                    source_table = self.context.current_table
+                    requires_unnest = False
+                    is_aggregate = False
 
         if source_table is None:
             source_table = self.context.current_table

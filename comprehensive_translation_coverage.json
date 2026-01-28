@@ -1,0 +1,375 @@
+{
+  "timestamp": "2026-01-27T23:54:09.432035",
+  "total_expressions": 934,
+  "overall_success_rate": 83.61884368308351,
+  "category_breakdown": {
+    "comments_syntax": {
+      "total": 32,
+      "success": 24,
+      "failed": 8,
+      "success_rate": 75.0
+    },
+    "arithmetic_operators": {
+      "total": 91,
+      "success": 66,
+      "failed": 25,
+      "success_rate": 72.52747252747253
+    },
+    "basic_expressions": {
+      "total": 34,
+      "success": 34,
+      "failed": 0,
+      "success_rate": 100.0
+    },
+    "path_navigation": {
+      "total": 135,
+      "success": 92,
+      "failed": 43,
+      "success_rate": 68.14814814814815
+    },
+    "type_functions": {
+      "total": 125,
+      "success": 97,
+      "failed": 28,
+      "success_rate": 77.60000000000001
+    },
+    "collection_functions": {
+      "total": 92,
+      "success": 83,
+      "failed": 9,
+      "success_rate": 90.21739130434783
+    },
+    "comparison_operators": {
+      "total": 365,
+      "success": 325,
+      "failed": 40,
+      "success_rate": 89.04109589041096
+    },
+    "datetime_functions": {
+      "total": 8,
+      "success": 8,
+      "failed": 0,
+      "success_rate": 100.0
+    },
+    "boolean_logic": {
+      "total": 6,
+      "success": 6,
+      "failed": 0,
+      "success_rate": 100.0
+    },
+    "string_functions": {
+      "total": 37,
+      "success": 37,
+      "failed": 0,
+      "success_rate": 100.0
+    },
+    "math_functions": {
+      "total": 9,
+      "success": 9,
+      "failed": 0,
+      "success_rate": 100.0
+    }
+  },
+  "failed_expressions": [
+    {
+      "name": "testComment7",
+      "expression": "2 + 2 /",
+      "category": "arithmetic_operators",
+      "error": "Incomplete expression: expression ends with '/' operator"
+    },
+    {
+      "name": "testComment8",
+      "expression": "2 + 2 /* not finished",
+      "category": "comments_syntax",
+      "error": "Unterminated block comment starting at line 1, column 7."
+    },
+    {
+      "name": "testSimpleFail",
+      "expression": "name.given1",
+      "category": "path_navigation",
+      "error": "Invalid element name 'given1'. FHIR element names do not end with digits."
+    },
+    {
+      "name": "testSimpleWithWrongContext",
+      "expression": "Encounter.name.given",
+      "category": "path_navigation",
+      "error": "Unknown element 'name' on type 'Encounter' at line 1, column 21. Did you mean: meta?"
+    },
+    {
+      "name": "testPolymorphismB",
+      "expression": "Observation.valueQuantity.unit",
+      "category": "path_navigation",
+      "error": "Direct access to choice-type alias 'valueQuantity' is not supported. Use type functions like value.as(Quantity) instead."
+    },
+    {
+      "name": "testPolymorphismAsB",
+      "expression": "(Observation.value as Period).unit",
+      "category": "type_functions",
+      "error": "Property 'unit' is invalid for Period. Allowed properties are: start, end."
+    },
+    {
+      "name": "testDollarOrderNotAllowed",
+      "expression": "Patient.children().skip(1)",
+      "category": "path_navigation",
+      "error": "Unknown function 'children' at line 1, column 9. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testLiteralTimeUTC",
+      "expression": "@T14:34:28Z.is(Time)",
+      "category": "type_functions",
+      "error": "Time literal '@T14:34:28Z' is invalid: Time literals cannot have timezone suffixes. Use DateTime literal format (e.g., @2015-02-04TZ) for time with timezone."
+    },
+    {
+      "name": "testLiteralTimeTimezoneOffset",
+      "expression": "@T14:34:28+10:00.is(Time)",
+      "category": "type_functions",
+      "error": "Time literal '@T14:34:28+10:00' is invalid: Time literals cannot have timezone suffixes. Use DateTime literal format (e.g., @2015-02-04T+10:00) for time with timezone."
+    },
+    {
+      "name": "testExists4",
+      "expression": "Patient.maritalStatus.coding.exists(code = 'P' and system = 'http://terminology.hl7.org/CodeSystem/v3-MaritalStatus')\n\t\t\tor Patient.maritalStatus.coding.exists(code = 'A' and system = 'http://terminology.hl7.org/CodeSystem/v3-MaritalStatus')",
+      "category": "comments_syntax",
+      "error": "Invalid element name 'hl7'. FHIR element names do not end with digits."
+    },
+    {
+      "name": "testDistinct2",
+      "expression": "Questionnaire.descendants().linkId.isDistinct()",
+      "category": "type_functions",
+      "error": "Unknown function 'descendants' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDistinct3",
+      "expression": "Questionnaire.descendants().linkId.select(substring(0,1)).isDistinct().not()",
+      "category": "collection_functions",
+      "error": "Unknown function 'descendants' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDistinct5",
+      "expression": "Questionnaire.descendants().linkId.distinct().count()",
+      "category": "type_functions",
+      "error": "Unknown function 'descendants' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDistinct6",
+      "expression": "Questionnaire.descendants().linkId.select(substring(0,1)).distinct().count()",
+      "category": "collection_functions",
+      "error": "Unknown function 'descendants' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testRepeat3",
+      "expression": "Questionnaire.descendants().code.count() = 23",
+      "category": "comparison_operators",
+      "error": "Unknown function 'descendants' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testRepeat4",
+      "expression": "Questionnaire.children().code.count() = 2",
+      "category": "comparison_operators",
+      "error": "Unknown function 'children' at line 1, column 15. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testSkip3",
+      "expression": "Patient.name.skip(1).given.trace('test') = 'Jim' | 'Peter' | 'James'",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trace' at line 1, column 28. Did you mean 'take'?"
+    },
+    {
+      "name": "testIif3",
+      "expression": "iif(true, true, (1 | 2).toString())",
+      "category": "path_navigation",
+      "error": "iif() cannot be called on a collection with multiple items"
+    },
+    {
+      "name": "testIif4",
+      "expression": "iif(false, (1 | 2).toString(), true)",
+      "category": "path_navigation",
+      "error": "iif() cannot be called on a collection with multiple items"
+    },
+    {
+      "name": "testIif6",
+      "expression": "iif('non boolean criteria', 'true-result', 'true-result')",
+      "category": "arithmetic_operators",
+      "error": "[FP030] iif() criterion must be a boolean expression, got: TermExpression"
+    },
+    {
+      "name": "testIif10",
+      "expression": "('item1' | 'item2').iif(true, 'true-result', 'false-result')",
+      "category": "arithmetic_operators",
+      "error": "iif() cannot be called on a collection with multiple items"
+    },
+    {
+      "name": "testMatchesFullWithinUrl1",
+      "expression": "'http://fhir.org/guides/cqf/common/Library/FHIR-ModelInfo|4.0.1'.matchesFull('library')",
+      "category": "comments_syntax",
+      "error": "Unknown function 'matchesFull' at line 1, column 66. Did you mean 'matches'?"
+    },
+    {
+      "name": "testMatchesFullWithinUrl3",
+      "expression": "'http://fhir.org/guides/cqf/common/Library/FHIR-ModelInfo|4.0.1'.matchesFull('Library')",
+      "category": "comments_syntax",
+      "error": "Unknown function 'matchesFull' at line 1, column 66. Did you mean 'matches'?"
+    },
+    {
+      "name": "testMatchesFullWithinUrl4",
+      "expression": "'http://fhir.org/guides/cqf/common/Library/FHIR-ModelInfo|4.0.1'.matchesFull('^Library$')",
+      "category": "comments_syntax",
+      "error": "Unknown function 'matchesFull' at line 1, column 66. Did you mean 'matches'?"
+    },
+    {
+      "name": "testMatchesFullWithinUrl1a",
+      "expression": "'http://fhir.org/guides/cqf/common/Library/FHIR-ModelInfo|4.0.1'.matchesFull('.*Library.*')",
+      "category": "comments_syntax",
+      "error": "Unknown function 'matchesFull' at line 1, column 66. Did you mean 'matches'?"
+    },
+    {
+      "name": "testMatchesFullWithinUrl2",
+      "expression": "'http://fhir.org/guides/cqf/common/Library/FHIR-ModelInfo|4.0.1'.matchesFull('Measure')",
+      "category": "comments_syntax",
+      "error": "Unknown function 'matchesFull' at line 1, column 66. Did you mean 'matches'?"
+    },
+    {
+      "name": "testEncodeBase64A",
+      "expression": "'test'.encode('base64')",
+      "category": "type_functions",
+      "error": "Unknown function 'encode' at line 1, column 8. Did you mean 'exclude'?"
+    },
+    {
+      "name": "testEncodeHex",
+      "expression": "'test'.encode('hex')",
+      "category": "path_navigation",
+      "error": "Unknown function 'encode' at line 1, column 8. Did you mean 'exclude'?"
+    },
+    {
+      "name": "testEncodeBase64B",
+      "expression": "'subjects?_d'.encode('base64')",
+      "category": "type_functions",
+      "error": "Unknown function 'encode' at line 1, column 15. Did you mean 'exclude'?"
+    },
+    {
+      "name": "testEncodeUrlBase64",
+      "expression": "'subjects?_d'.encode('urlbase64')",
+      "category": "type_functions",
+      "error": "Unknown function 'encode' at line 1, column 15. Did you mean 'exclude'?"
+    },
+    {
+      "name": "testDecodeBase64A",
+      "expression": "'dGVzdA=='.decode('base64')",
+      "category": "type_functions",
+      "error": "Unknown function 'decode' at line 1, column 12. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDecodeHex",
+      "expression": "'74657374'.decode('hex')",
+      "category": "path_navigation",
+      "error": "Unknown function 'decode' at line 1, column 12. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDecodeBase64B",
+      "expression": "'c3ViamVjdHM/X2Q='.decode('base64')",
+      "category": "type_functions",
+      "error": "Unknown function 'decode' at line 1, column 20. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testDecodeUrlBase64",
+      "expression": "'c3ViamVjdHM_X2Q='.decode('urlbase64')",
+      "category": "type_functions",
+      "error": "Unknown function 'decode' at line 1, column 20. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testEscapeHtml",
+      "expression": "'\"1<2\"'.escape('html')",
+      "category": "comparison_operators",
+      "error": "Unknown function 'escape' at line 1, column 9. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testEscapeJson",
+      "expression": "'\"1<2\"'.escape('json')",
+      "category": "comparison_operators",
+      "error": "Unknown function 'escape' at line 1, column 9. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testUnescapeHtml",
+      "expression": "'&quot;1&lt;2&quot;'.unescape('html')",
+      "category": "path_navigation",
+      "error": "Unknown function 'unescape' at line 1, column 22. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testUnescapeJson",
+      "expression": "'\\\"1<2\\\"'.unescape('json')",
+      "category": "comparison_operators",
+      "error": "Unknown function 'unescape' at line 1, column 11. Refer to the FHIRPath specification for supported functions."
+    },
+    {
+      "name": "testTrim1",
+      "expression": "'123456'.trim().length() = 6",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trim' at line 1, column 10. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testTrim2",
+      "expression": "'123 456'.trim().length() = 7",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trim' at line 1, column 11. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testTrim3",
+      "expression": "' 123456 '.trim().length() = 6",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trim' at line 1, column 12. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testTrim4",
+      "expression": "'  '.trim().length() = 0",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trim' at line 1, column 6. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testTrim5",
+      "expression": "{}.trim().empty() = true",
+      "category": "collection_functions",
+      "error": "Unknown function 'trim' at line 1, column 4. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testTrim6",
+      "expression": "'      '.trim() = ''",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trim' at line 1, column 10. Did you mean 'toTime'?"
+    },
+    {
+      "name": "testSplit3",
+      "expression": "'[stop]ONE[stop][stop]TWO[stop][stop][stop]THREE[stop][stop]'.split('[stop]').trace('n').count() = 9",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trace' at line 1, column 79. Did you mean 'take'?"
+    },
+    {
+      "name": "testTrace1",
+      "expression": "name.given.trace('test').count() = 5",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trace' at line 1, column 12. Did you mean 'take'?"
+    },
+    {
+      "name": "testTrace2",
+      "expression": "name.trace('test', given).count() = 3",
+      "category": "comparison_operators",
+      "error": "Unknown function 'trace' at line 1, column 6. Did you mean 'take'?"
+    },
+    {
+      "name": "testSort1",
+      "expression": "(1 | 2 | 3).sort() = (1 | 2 | 3)",
+      "category": "comparison_operators",
+      "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
+    },
+    {
+      "name": "testSort2",
+      "expression": "(3 | 2 | 1).sort() = (1 | 2 | 3)",
+      "category": "comparison_operators",
+      "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
+    },
+    {
+      "name": "testSort3",
+      "expression": "(1 | 2 | 3).sort($this) = (1 | 2 | 3)",
+      "category": "type_functions",
+      "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
+    }
+  ]
+}

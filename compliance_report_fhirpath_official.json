@@ -1,0 +1,210 @@
+{
+  "total_tests": 934,
+  "passed_tests": 536,
+  "failed_tests": 398,
+  "compliance_percentage": 57.38758029978587,
+  "execution_time_total_ms": 327590.2154445648,
+  "execution_time_average_ms": 350.6977915508589,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-27T13:58:22.561797",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 30,
+      "failed": 42
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 51,
+      "failed": 65
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 64,
+      "failed": 77
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 59,
+      "failed": 54
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 232,
+      "failed": 106
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 19,
+      "failed": 9
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.01430511474609375,
+    "max_execution_time_ms": 763.0770206451416,
+    "median_execution_time_ms": 412.3347997665405,
+    "std_dev_execution_time_ms": 161.77795082461492
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testLiteralDateTimeYear",
+      "expression": "@2015T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 393.51391792297363,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-01-01T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeMonth",
+      "expression": "@2015-02T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 413.06257247924805,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-02-01T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeDay",
+      "expression": "@2015-02-04T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 418.34378242492676,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-02-04T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralTimeUTC",
+      "expression": "@T14:34:28Z.is(Time)",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 367.0010566711426,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralTimeTimezoneOffset",
+      "expression": "@T14:34:28+10:00.is(Time)",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 384.40465927124023,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralQuantityDecimal",
+      "expression": "10.1 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 362.1501922607422,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Conversion Error: extract specifier \"mg\" not recognized",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testLiteralQuantityInteger",
+      "expression": "10 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 367.04063415527344,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Conversion Error: extract specifier \"mg\" not recognized",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testPolarityPrecedence",
+      "expression": "-Patient.name.given.count() = -5",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 421.9362735748291,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "testLiteralIntegerGreaterThan",
+      "expression": "Patient.name.given.count() > -3",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 440.4416084289551,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          5
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqual",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 478.41525077819824,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,204 @@
+{
+  "total_tests": 934,
+  "passed_tests": 520,
+  "failed_tests": 414,
+  "compliance_percentage": 55.6745182012848,
+  "execution_time_total_ms": 292035.55059432983,
+  "execution_time_average_ms": 312.6447721518082,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-26T10:29:44.598278",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 26,
+      "failed": 46
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 4,
+      "failed": 6
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 35,
+      "failed": 81
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 60,
+      "failed": 81
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 59,
+      "failed": 54
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 245,
+      "failed": 93
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 19,
+      "failed": 9
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.014066696166992188,
+    "max_execution_time_ms": 604.4981479644775,
+    "median_execution_time_ms": 368.78299713134766,
+    "std_dev_execution_time_ms": 142.75321973815767
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testSimple",
+      "expression": "name.given",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 348.6676216125488,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 10: SELECT * FROM cte_2 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testSimpleNone",
+      "expression": "name.suffix",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 346.3451862335205,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"suffix_item\"\n\nLINE 10: SELECT * FROM cte_2 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testEscapedIdentifier",
+      "expression": "name.`given`",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 396.81053161621094,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 10: SELECT * FROM cte_2 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testSimpleBackTick1",
+      "expression": "`Patient`.name.`given`",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 339.40863609313965,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 10: SELECT * FROM cte_2 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testSimpleWithContext",
+      "expression": "Patient.name.given",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 345.6573486328125,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 10: SELECT * FROM cte_2 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testPolymorphismIsA1",
+      "expression": "Observation.value.is(Quantity)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 322.8888511657715,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testPolymorphismAsA",
+      "expression": "Observation.value.as(Quantity).unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 343.0178165435791,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testDollarThis1",
+      "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 335.8569145202637,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 15: SELECT * FROM cte_3 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testDollarThis2",
+      "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 336.80224418640137,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 15: SELECT * FROM cte_3 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_2_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testDollarOrderAllowed",
+      "expression": "Patient.name.skip(1).given",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 402.38070487976074,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Referenced column \"result\" not found in FROM clause!\nCandidate bindings: \"resource\", \"given_item\"\n\nLINE 15: SELECT * FROM cte_3 WHERE result IS NOT NULL ORDER BY cte_1_order, cte_3_order;\n                                   ^",
+        "error_type": "execution",
+        "result": null
+      }
+    }
+  ]
+}

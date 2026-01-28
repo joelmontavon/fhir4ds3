@@ -44,7 +44,7 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     'lower', 'matches', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',
     'toChars',
     # Math functions
-    'abs', 'ceiling', 'floor', 'round', 'sqrt', 'ln', 'log', 'power',
+    'abs', 'ceiling', 'exp', 'floor', 'ln', 'log', 'power', 'round', 'sqrt', 'truncate',
     # Type functions
     'is', 'as', 'ofType', 'conformsTo',
     # Date/time functions
