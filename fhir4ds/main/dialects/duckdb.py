@@ -1405,10 +1405,11 @@ class DuckDBDialect(DatabaseDialect):
         """
         # Map FHIRPath types to DuckDB type names (uppercase)
         # This mapping is part of syntax adaptation, not business logic
+        # SP-106-004: Use DECIMAL for FHIRPath decimal type to maintain precision
         type_map = {
             "string": "VARCHAR",
             "integer": "INTEGER",
-            "decimal": "DOUBLE",
+            "decimal": "DECIMAL",
             "boolean": "BOOLEAN",
             "datetime": "TIMESTAMP",
             "date": "DATE",

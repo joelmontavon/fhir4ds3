@@ -23,6 +23,7 @@ Author: FHIR4DS Development Team
 
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +45,7 @@ from ..types import (
 from ..types.fhir_types import resolve_polymorphic_property, is_polymorphic_property, resolve_polymorphic_field_for_type
 from ..types.type_discriminators import get_type_discriminator
 from ..types.structure_loader import StructureDefinitionLoader
+from ..types.quantity_builder import build_quantity_json_string
 from pathlib import Path
 from .fragments import SQLFragment
 from .context import TranslationContext, VariableBinding
@@ -260,11 +262,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Reset context to initial state
         self.context.reset()
 
-        logger.debug(f"Starting translation of AST: {ast_root.node_type}")
+        # Handle FHIRPathExpression wrapper - extract the underlying AST
+        if hasattr(ast_root, 'parse_result') and hasattr(ast_root, 'get_ast'):
+            # This is a FHIRPathExpression wrapper, get the actual AST
+            logger.debug(f"Starting translation of FHIRPathExpression: {ast_root.expression if hasattr(ast_root, 'expression') else 'unknown'}")
+            actual_ast = ast_root.get_ast()
+        else:
+            actual_ast = ast_root
+            logger.debug(f"Starting translation of AST: {actual_ast.node_type if hasattr(actual_ast, 'node_type') else type(actual_ast).__name__}")
 
         # Visit root node to start translation
         # The visit may accumulate multiple fragments for expression chains
-        fragment = self.visit(ast_root)
+        fragment = self.visit(actual_ast)
 
         # Accumulate the final fragment if it wasn't already added
         # (Some visitor methods add fragments during traversal)
@@ -397,7 +406,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return False
 
-    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None) -> str:
+    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None, node: Optional[TypeOperationNode] = None) -> str:
         """Generate SQL type check for literal values.
 
         SP-022-003: This method generates simplified type checks for SQL literals
@@ -469,52 +478,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             duckdb_type, pg_type = temporal_types[normalized_type]
             if dialect_name == 'DUCKDB':
                 # SP-104-002: Check typeof() first for native types, then fallback to regex
-                # For temporal literals, we also need to handle the original_literal pattern
-                # because temporal literals like @2015 are stored as DATE '2015-01-01'
-                # The original_literal preserves the "@2015" pattern for partial date detection
+                # SP-106-001: Check T-suffix mapping for partial DateTimes
+                # The ANTLR lexer strips 'T' from @YYYYT, making it look like @YYYY (a Date).
+                # We use metadata to track the original form and restore correct type checking.
+                # Key rules:
+                # - @YYYY is Date (NOT DateTime)
+                # - @YYYYT is DateTime (NOT Date)
+                # - The .is() operator checks EXACT type, not type compatibility
                 if original_literal and original_literal.startswith('@'):
-                    # SP-104-006: Workaround for ANTLR lexer stripping 'T' suffix from partial DateTimes
-                    # If original_literal is @YYYY (Date pattern) but we're checking for DateTime,
-                    # it might have been @YYYYT originally. Check if expression is a TIMESTAMP type.
-                    # This handles cases like @2015T.is(DateTime) where lexer strips the T.
-                    if normalized_type == 'datetime':
-                        # Check if the SQL expression is a TIMESTAMP (would be generated from @YYYYT)
-                        # If so, the original was likely a partial DateTime, not a Date
-                        if f"TIMESTAMP '" in expression or "TIMESTAMP '" in str(expression):
-                            # This is a TIMESTAMP literal, so it's a DateTime type
-                            return "true"
-
-                    # Parse the temporal literal to determine its type
-                    parsed = self.temporal_parser.parse(original_literal)
-                    if parsed:
-                        # Check if the parsed type matches the target type
-                        parsed_type = parsed.temporal_type.lower()  # 'date', 'datetime', 'time'
-                        if parsed_type == normalized_type or (
-                            normalized_type == 'datetime' and parsed_type == 'instant'
-                        ):
-                            # Exact type match - return true
-                            return "true"
-                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
-                            # DateTime can match Date or Time in some contexts
-                            # This is per FHIRPath specification
-                            return "true"
+                    type_check = self._check_temporal_literal_type(original_literal, normalized_type, node)
+                    if type_check is not None:
+                        return type_check
 
                 # Default: Check typeof() for native SQL types
                 return (
                     f"typeof({expression}) = '{duckdb_type}'"
                 )
             else:  # PostgreSQL
-                # SP-104-002: Check pg_typeof() first for native types, also handle original_literal
+                # SP-106-001: Check T-suffix mapping for partial DateTimes
+                # Same logic as DuckDB - use shared helper method
                 if original_literal and original_literal.startswith('@'):
-                    parsed = self.temporal_parser.parse(original_literal)
-                    if parsed:
-                        parsed_type = parsed.temporal_type.lower()
-                        if parsed_type == normalized_type or (
-                            normalized_type == 'datetime' and parsed_type == 'instant'
-                        ):
-                            return "true"
-                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
-                            return "true"
+                    type_check = self._check_temporal_literal_type(original_literal, normalized_type, node)
+                    if type_check is not None:
+                        return type_check
+
                 return (
                     f"pg_typeof({expression})::text LIKE '{pg_type}%'"
                 )
@@ -555,6 +542,74 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """Check whether the canonical type represents a FHIR resource."""
         metadata = self._get_type_metadata(canonical_type)
         return bool(metadata.get("is_resource", False))
+
+    def _check_temporal_literal_type(self, original_literal: str, normalized_type: str, node: Optional[TypeOperationNode] = None) -> Optional[str]:
+        """Check if a temporal literal matches the target type.
+
+        This implements SP-106-001: Correct type checking for Date vs DateTime.
+        The ANTLR lexer strips 'T' from @YYYYT, making both @YYYY and @YYYYT
+        appear as @YYYY in original_literal. We use metadata tracking to restore
+        the original form and determine the correct type.
+
+        Type Rules:
+        - @YYYY (or @YYYY-MM-DD) is Date, NOT DateTime
+        - @YYYYT (or @YYYY-MM-DDT...) is DateTime, NOT Date
+        - The .is() operator checks EXACT type, not type compatibility
+
+        Args:
+            original_literal: The literal with @ prefix (e.g., '@2015', '@2015-02-03T')
+            normalized_type: The target type to check against ('date', 'datetime', 'time')
+
+        Returns:
+            "CASE WHEN TRUE THEN TRUE ELSE FALSE END" if type matches
+            "CASE WHEN FALSE THEN TRUE ELSE FALSE END" if type doesn't match
+            None if cannot determine from literal (should fall back to typeof check)
+        """
+        # Step 1: Check datetime_t_mapping for T-suffix restoration
+        # This tracks literals that were originally @YYYYT but lexer made them @YYYY
+        datetime_t_mapping = None
+        if node:
+            try:
+                # The node might be an adapter with an enhanced_node attribute
+                root_node = None
+                if hasattr(node, 'get_root'):
+                    root_node = node.get_root()
+                elif hasattr(node, 'enhanced_node') and hasattr(node.enhanced_node, 'get_root'):
+                    root_node = node.enhanced_node.get_root()
+
+                if root_node and hasattr(root_node, 'metadata') and root_node.metadata:
+                    if hasattr(root_node.metadata, 'custom_attributes'):
+                        datetime_t_mapping = root_node.metadata.custom_attributes.get('datetime_t_mapping')
+            except Exception:
+                pass  # If we can't get root, fall back to literal parsing
+
+        # Step 2: If checking for DateTime and literal was originally @YYYYT, it's a match
+        if normalized_type == 'datetime' and datetime_t_mapping and original_literal in datetime_t_mapping:
+            return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+        # Step 3: Parse the temporal literal to determine its actual type
+        parsed = self.temporal_parser.parse(original_literal)
+        if parsed:
+            parsed_type = parsed.temporal_type.lower()  # 'date', 'datetime', 'time', 'instant'
+
+            # Exact type match (including instant -> datetime mapping)
+            if parsed_type == normalized_type:
+                return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+            # FHIRPath treats 'instant' as a subtype of 'datetime' for .is() checks
+            if normalized_type == 'datetime' and parsed_type == 'instant':
+                return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+            # Explicitly NOT treating Date as DateTime - they are distinct types
+            # This is the key fix for SP-106-001
+            if normalized_type == 'datetime' and parsed_type == 'date':
+                return "CASE WHEN FALSE THEN TRUE ELSE FALSE END"
+
+            if normalized_type == 'date' and parsed_type == 'datetime':
+                return "CASE WHEN FALSE THEN TRUE ELSE FALSE END"
+
+        # Step 4: Cannot determine from literal - let caller fall back to typeof check
+        return None
 
     def _should_accumulate_as_separate_fragment(self, node: FHIRPathASTNode) -> bool:
         """Determine if a node should generate a separate fragment in the chain.
@@ -773,40 +828,43 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         target_ast = self._parse_function_target_ast(node)
 
-        if target_ast is None:
-            # SP-022-015: Check for pending fragment result FIRST from invocation chain
-            # This handles expressions like (1|2|3).aggregate() where the union result
-            # is a complete expression that should take priority over pending_literal_value.
-            # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
-            if self.context.pending_fragment_result is not None:
-                target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
-                # If the pending fragment is from a multi-item collection, this is an error for iif()
-                # We need to pass this information to the caller
-                # Store this in a temporary attribute for _translate_iif to check
-                self._pending_target_is_multi_item = is_multi_item_collection
-                # Clear both pending values after consuming (fragment result takes priority)
-                self.context.pending_fragment_result = None
-                self.context.pending_literal_value = None
-            # SP-022-009: Check for pending literal value from invocation chain
-            # This handles expressions like 1.convertsToInteger() where the literal
-            # was visited in visit_generic before this function call
-            elif self.context.pending_literal_value is not None:
-                literal_value, target_expression = self.context.pending_literal_value
-                # Clear the pending value after consuming it
-                self.context.pending_literal_value = None
+        # SP-106-003: Check for pending literal value FIRST, before checking target_ast
+        # This handles expressions like "10 'mg'.convertsToQuantity()" where the literal
+        # is visited as part of the target_ast, and we need to capture the pending_literal_value
+        # that was set during the visit.
+        # SP-022-015: Check for pending fragment result FIRST from invocation chain
+        # This handles expressions like (1|2|3).aggregate() where the union result
+        # is a complete expression that should take priority over pending_literal_value.
+        # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
+        if self.context.pending_fragment_result is not None:
+            target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
+            # If the pending fragment is from a multi-item collection, this is an error for iif()
+            # We need to pass this information to the caller
+            # Store this in a temporary attribute for _translate_iif to check
+            self._pending_target_is_multi_item = is_multi_item_collection
+            # Clear both pending values after consuming (fragment result takes priority)
+            self.context.pending_fragment_result = None
+            self.context.pending_literal_value = None
+        # SP-022-009: Check for pending literal value from invocation chain
+        # This handles expressions like 1.convertsToInteger() where the literal
+        # was visited in visit_generic before this function call
+        elif self.context.pending_literal_value is not None:
+            literal_value, target_expression = self.context.pending_literal_value
+            # Clear the pending value after consuming it
+            self.context.pending_literal_value = None
+        elif target_ast is None:
+            # No explicit path provided; rely on current context
+            json_path = self.context.get_json_path()
+            if json_path and json_path != "$":
+                target_expression = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=json_path
+                )
+                # SP-101-002: Set target_path from current context when using context path
+                # This allows first(), last(), etc. to work on the current path
+                target_path = self.context.parent_path.copy()
             else:
-                # No explicit path provided; rely on current context
-                json_path = self.context.get_json_path()
-                if json_path and json_path != "$":
-                    target_expression = self.dialect.extract_json_field(
-                        column=self.context.current_table,
-                        path=json_path
-                    )
-                    # SP-101-002: Set target_path from current context when using context path
-                    # This allows first(), last(), etc. to work on the current path
-                    target_path = self.context.parent_path.copy()
-                else:
-                    target_expression = self.context.current_table
+                target_expression = self.context.current_table
         elif isinstance(target_ast, LiteralNode):
             # Literal expressions can be evaluated directly
             literal_value = target_ast.value
@@ -924,6 +982,42 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # For now, return None - Quantity conversion is complex
         # Will need full UCUM library support
         return None
+
+    def _extract_preserved_columns(self, *fragments: SQLFragment) -> List[str]:
+        """Extract column names that need to be preserved through CTEs.
+
+        SP-105: Analyzes fragments to find columns from UNNEST operations (ending with _item)
+        that must be preserved in CTE SELECT clauses. This fixes "column not found" errors
+        in combine() and exclude() operations.
+
+        Args:
+            *fragments: Variable number of SQLFragments to analyze
+
+        Returns:
+            List of column names to preserve (e.g., ['name_item', 'given_item'])
+        """
+        preserved = set()
+
+        for frag in fragments:
+            # Check source_table for _item columns
+            if frag.source_table and frag.source_table.endswith('_item'):
+                preserved.add(frag.source_table)
+
+            # Check dependencies for _item columns
+            for dep in frag.dependencies:
+                if dep.endswith('_item'):
+                    preserved.add(dep)
+
+            # Check expression for direct column references
+            # Pattern: matches column_name followed by punctuation or space
+            # Specifically looks for _item suffix which indicates UNNEST results
+            import re
+            # Find all potential column references
+            # This regex matches identifiers ending with _item
+            column_refs = re.findall(r'\b(\w+_item)\b', frag.expression)
+            preserved.update(column_refs)
+
+        return list(preserved)
 
     def _evaluate_literal_to_date(self, value: Any) -> Optional[str]:
         """Evaluate toDate() for literal values.
@@ -1085,6 +1179,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             True
         """
         logger.debug(f"Translating literal: type={node.literal_type}, value={node.value}, text={node.text}")
+
+        # SP-106-003: Check for quantity literals that weren't properly identified by parser
+        # The parser may treat quantity literals (e.g., "10 'mg'") as string literals
+        # We detect them here and handle them appropriately
+        if node.literal_type == "string" and node.text:
+            quantity_info = self._extract_quantity_from_text(node.text)
+            if quantity_info:
+                # This is actually a quantity literal - handle it as such
+                return self._handle_quantity_literal(node, quantity_info)
 
         # SP-100-003: Check for empty collection literal before type-based handling
         if self._is_empty_collection_literal(node):
@@ -1899,13 +2002,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 logger.debug(f"SP-103-005: Found resolved polymorphic field: {poly_prop} -> {resolved_field}")
                 logger.debug(f"SP-103-005: normalized_components={normalized_components}, polymorphic_idx={polymorphic_idx}, remaining={remaining}")
 
-                # Build path using the resolved field instead of COALESCE
-                path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
-                resolved_path = ".".join(path_parts)
-                resolved_expr = self.dialect.extract_json_field(
-                    column=self.context.current_table,
-                    path=resolved_path
-                )
+                # SP-105-004: Use parent_path instead of normalized_components when available
+                # This handles cases where ofType() has resolved the polymorphic field and
+                # subsequent navigation has built up the parent_path (e.g., ['valueRange', 'low'])
+                # We need to use the full parent_path to build the correct JSON path
+                if self.context.parent_path and len(self.context.parent_path) > 0:
+                    # parent_path contains the resolved field (e.g., ['valueRange', 'low'])
+                    # Build path from parent_path
+                    path_parts = ["$"] + self.context.parent_path
+                    resolved_path = ".".join(path_parts)
+                    resolved_expr = self.dialect.extract_json_field(
+                        column=self.context.current_table,
+                        path=resolved_path
+                    )
+                    logger.debug(f"SP-105-004: Using parent_path to build resolved path: {resolved_path}")
+                else:
+                    # Fallback to original logic using normalized_components
+                    # Build path using the resolved field instead of COALESCE
+                    path_parts = ["$"] + normalized_components[:polymorphic_idx] + [resolved_field] + remaining
+                    resolved_path = ".".join(path_parts)
+                    resolved_expr = self.dialect.extract_json_field(
+                        column=self.context.current_table,
+                        path=resolved_path
+                    )
                 logger.debug(f"SP-103-005: Generated resolved field extraction: {resolved_expr}")
                 logger.debug(f"SP-103-005: Resolved path: {resolved_path}")
 
@@ -2011,7 +2130,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # of toInteger() needs to flow to the subsequent empty() function call
                     # SP-100-002: Only set pending values for non-function-call children
                     # Function calls should consume pending values, not overwrite them
-                    if not hasattr(child, 'node_type') or child.node_type not in ('function_call', 'functionCall'):
+                    # SP-106-003: Don't set pending_fragment_result for quantity literals - they use pending_literal_value instead
+                    if (not hasattr(child, 'node_type') or child.node_type not in ('function_call', 'functionCall')) and \
+                       fragment.metadata.get('literal_type') != 'quantity':
                         # SP-100-002: Check if this child is a multi-item collection (e.g., union operator)
                         is_multi_item = self._is_multi_item_collection(child)
                         # Store as tuple (expression, parent_path, is_multi_item) for cardinality validation
@@ -2625,6 +2746,109 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         pattern = r"\s*(-?\d+(?:\.\d+)?)\s*'([^']+)'\s*"
         return re.fullmatch(pattern, value or "")
 
+    def _extract_quantity_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract quantity information from text that may represent a quantity literal.
+
+        SP-106-003: Detect quantity literals that were not properly identified by the parser.
+        The parser treats expressions like "10 'mg'" as string literals, but we can
+        detect the pattern and extract the quantity value and unit.
+
+        Args:
+            text: The text representation of the literal (e.g., "10'mg'", "10.5 'kg'")
+
+        Returns:
+            Dictionary with 'value' (Decimal) and 'unit' (str) if text matches quantity pattern,
+            None otherwise
+
+        Example:
+            >>> self._extract_quantity_from_text("10'mg'")
+            {'value': Decimal('10'), 'unit': 'mg'}
+            >>> self._extract_quantity_from_text("10.5 'kg'")
+            {'value': Decimal('10.5'), 'unit': 'kg'}
+        """
+        if not text:
+            return None
+
+        # Try to match the quantity pattern: NUMBER 'UNIT'
+        # The parser may remove spaces, so we handle both "10'mg'" and "10 'mg'"
+        match = self._match_quantity_literal(text)
+        if match:
+            try:
+                value_str = match.group(1)
+                unit = match.group(2)
+                return {
+                    'value': Decimal(value_str),
+                    'unit': unit
+                }
+            except (ValueError, InvalidOperation):
+                return None
+
+        return None
+
+    def _handle_quantity_literal(self, node: LiteralNode, quantity_info: Dict[str, Any]) -> SQLFragment:
+        """Handle a quantity literal by generating proper FHIR Quantity JSON structure.
+
+        SP-106-003: Generate SQL that creates a FHIR Quantity JSON object for literals
+        like "10 'mg'". This enables proper type checking and comparison operations.
+
+        Delegates to FHIR-specific business logic layer (quantity_builder) to maintain
+        thin dialect principle - the translator contains only syntax translation logic.
+
+        Args:
+            node: The literal node (still has literal_type="string" from parser)
+            quantity_info: Dict with 'value' (Decimal) and 'unit' (str)
+
+        Returns:
+            SQLFragment with the quantity represented as JSON
+
+        Example:
+            >>> # For "10 'mg'"
+            >>> fragment = self._handle_quantity_literal(node, {'value': Decimal('10'), 'unit': 'mg'})
+            >>> fragment.expression
+            '{"value": 10, "unit": "mg", "system": "http://unitsofmeasure.org", "code": "mg"}'
+        """
+        value = quantity_info['value']
+        unit = quantity_info['unit']
+
+        # Generate FHIR Quantity JSON structure using FHIR-specific business logic
+        # This ensures the translator remains "thin" - only syntax translation, no FHIR rules
+        quantity_json_str = build_quantity_json_string(value, unit)
+
+        # Convert to SQL expression
+        sql_expr = f"'{quantity_json_str}'"
+
+        # Store quantity info in context for function calls like convertsToQuantity()
+        # SP-106-003: Store a special marker to indicate this is a quantity literal
+        # This allows convertsToQuantity() to recognize it and return TRUE
+        class QuantityLiteralMarker:
+            def __init__(self, value, unit):
+                self.value = value
+                self.unit = unit
+                self.is_quantity_literal = True
+
+        self.context.pending_literal_value = (QuantityLiteralMarker(value, unit), sql_expr)
+
+        # Create metadata with quantity information
+        fragment_metadata = {
+            'literal_type': 'quantity',
+            'is_literal': True,
+            'quantity_value': str(value),
+            'quantity_unit': unit
+        }
+        if node.text:
+            fragment_metadata['source_text'] = node.text
+            fragment_metadata['text'] = node.text
+
+        logger.debug(f"Generated quantity literal SQL: {sql_expr}")
+
+        return SQLFragment(
+            expression=sql_expr,
+            source_table=self.context.current_table,
+            requires_unnest=False,
+            is_aggregate=False,
+            metadata=fragment_metadata
+        )
+
     def _build_implies_sql(
         self,
         left_sql: str,
@@ -2895,7 +3119,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # before visiting children (see SP-022-013). This dead code block is kept for
         # reference but should never be reached.
 
-        # Handle temporal arithmetic (e.g., date - quantity with time unit)
+        # Handle temporal arithmetic (e.g., date + quantity, date - quantity with time unit)
+        if node.operator == "+":
+            temporal_fragment = self._translate_temporal_quantity_addition(
+                left_fragment,
+                right_fragment,
+                node.children[0],
+                node.children[1]
+            )
+            if temporal_fragment is not None:
+                return temporal_fragment
+
         if node.operator == "-":
             temporal_fragment = self._translate_temporal_quantity_subtraction(
                 left_fragment,
@@ -3821,77 +4055,98 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         This handles cases where distinct() chains after select(), combine(), etc.
         The input is a complete SELECT statement with aggregation like:
-            SELECT id, resource, json_agg(x) as result FROM ... GROUP BY id, resource
+            SELECT id, resource, json_agg(x ORDER BY idx) as result FROM ... GROUP BY id, resource
 
-        We need to modify it to:
+        We need to modify it to remove duplicates while preserving order:
+            SELECT id, resource, json_agg(x) FROM (
+                SELECT DISTINCT ON (x) x ORDER BY x, idx
+            ) subq GROUP BY id, resource
+
+        For simple cases without ORDER BY, we can use DISTINCT directly:
             SELECT id, resource, json_agg(DISTINCT x) as result FROM ... GROUP BY id, resource
 
-        Preserves order by using ROW_NUMBER() to track first occurrence.
+        SP-105: Fixed ORDER BY issue with DISTINCT aggregates.
         """
-        # Find the aggregation function call (json_agg, json_group_array, list())
-        # and wrap the value to add DISTINCT while preserving order
-
-        # Pattern 1: json_agg(value ORDER BY idx) -> use DISTINCT ON or subquery
-        # Pattern 2: json_group_array(value ORDER BY idx) -> similar for DuckDB
-        # Pattern 3: list(value ORDER BY idx) -> DuckDB LIST aggregate
-
         import re
 
-        # For json_agg with ORDER BY, we need a subquery with DISTINCT ON
-        if "json_agg(" in select_sql:
-            # Extract the aggregation expression
-            match = re.search(r'json_agg\(([^)]+)(\s+ORDER\s+BY\s+[^)]+)?\)', select_sql)
-            if match:
-                inner_expr = match.group(1).strip()
-                order_clause = match.group(2) or ""
+        # SP-105: Use a more robust approach to remove ORDER BY from DISTINCT aggregates
+        # The issue is that ORDER BY can appear at any nesting level, and simple regex
+        # doesn't handle nested parentheses well. We'll use a recursive approach to find
+        # and remove ORDER BY clauses at all nesting levels.
 
-                # Create a wrapper that uses DISTINCT ON (value) ORDER BY idx
-                # This preserves first occurrence order while removing duplicates
-                table_alias = self._generate_internal_alias("distinct_wrapper")
-                column_alias = self._generate_internal_alias("distinct_val")
+        def remove_order_by_in_aggregates(sql, agg_func):
+            """Recursively remove ORDER BY clauses in aggregate functions."""
+            pattern = f"{agg_func}\\s*\\("
 
-                # Build the new aggregation with DISTINCT
-                new_agg = f"json_agg(DISTINCT {inner_expr}{order_clause})"
+            # Find all aggregate function calls
+            results = []
+            pos = 0
+            while True:
+                match = re.search(pattern, sql[pos:], re.IGNORECASE)
+                if not match:
+                    break
 
-                # Replace the aggregation in the SQL
-                new_sql = select_sql.replace(
-                    f"json_agg({inner_expr}{order_clause})",
-                    new_agg
-                )
-                return new_sql
+                func_start = pos + match.start()
+                paren_depth = 1
+                i = func_start + len(match.group(0))
 
-        # For DuckDB list() or json_group_array
-        if "list(" in select_sql or "json_group_array(" in select_sql:
-            # Similar approach for DuckDB
-            func_name = "list(" if "list(" in select_sql else "json_group_array("
-            match = re.search(re.escape(func_name) + r'([^)]+)(\s+ORDER\s+BY\s+[^)]+)?\)', select_sql)
-            if match:
-                inner_expr = match.group(1).strip()
-                order_clause = match.group(2) or ""
+                # Find the matching closing parenthesis
+                while i < len(sql) and paren_depth > 0:
+                    if sql[i] == '(':
+                        paren_depth += 1
+                    elif sql[i] == ')':
+                        paren_depth -= 1
+                    i += 1
 
-                # DuckDB LIST supports DISTINCT directly
-                new_agg = f"{func_name.rstrip('(')}(DISTINCT {inner_expr}{order_clause})"
+                if paren_depth == 0:
+                    func_content = sql[func_start + len(match.group(0)):i-1]
 
-                new_sql = select_sql.replace(
-                    f"{func_name.rstrip('(')}({inner_expr}{order_clause})",
-                    new_agg
-                )
-                return new_sql
+                    # Check if there's an ORDER BY clause in this function
+                    # We need to be careful not to remove ORDER BY in nested SELECTs
+                    order_by_match = re.search(
+                        r'ORDER\s+BY\s+[^)]+(?=\s*\)\s*(?:AS\s+\w+)?$',
+                        func_content,
+                        re.IGNORECASE
+                    )
 
-        # Fallback: try to add DISTINCT to the aggregation function
-        # Simple pattern: find aggregate( and add DISTINCT after it
-        for agg_func in ['json_agg(', 'json_group_array(', 'list(']:
-            if agg_func in select_sql:
-                # Check if DISTINCT is already present
-                if f'{agg_func}DISTINCT' in select_sql:
-                    return select_sql  # Already has DISTINCT
+                    if order_by_match and "SELECT" not in func_content:
+                        # Remove the ORDER BY clause
+                        new_content = func_content[:order_by_match.start()]
+                        new_func = f"{agg_func}({new_content})"
 
-                # Add DISTINCT after the function name
-                new_sql = select_sql.replace(agg_func, f'{agg_func}DISTINCT ')
-                return new_sql
+                        # Replace in the SQL
+                        sql = sql[:func_start] + new_func + sql[i:]
 
-        # If we can't modify it, return as-is and let the SQL execution handle it
-        logger.warning(f"Could not add DISTINCT to SELECT statement: {select_sql[:200]}")
+                        # Update position to continue searching after the replacement
+                        pos = func_start + len(new_func)
+                        logger.info(
+                            f"SP-105: Removed ORDER BY from DISTINCT aggregate: "
+                            f"{agg_func}(...{order_by_match.group(0)[:50]}...) -> {new_func[:80]}"
+                        )
+                    else:
+                        pos = i
+                else:
+                    break
+
+            return sql
+
+        # Try to fix list() with DISTINCT
+        if "list(" in select_sql and "DISTINCT" in select_sql:
+            # Check if there's an ORDER BY still present
+            if "ORDER BY" in select_sql:
+                # Try to remove ORDER BY clauses in list() functions
+                select_sql = remove_order_by_in_aggregates(select_sql, "list")
+
+        # Try to fix json_agg() with DISTINCT
+        if "json_agg(" in select_sql and "DISTINCT" in select_sql:
+            if "ORDER BY" in select_sql:
+                select_sql = remove_order_by_in_aggregates(select_sql, "json_agg")
+
+        # Try to fix json_group_array() with DISTINCT
+        if "json_group_array(" in select_sql and "DISTINCT" in select_sql:
+            if "ORDER BY" in select_sql:
+                select_sql = remove_order_by_in_aggregates(select_sql, "json_group_array")
+
         return select_sql
 
     def _check_select_is_distinct(self, select_sql: str) -> str:
@@ -4275,7 +4530,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # integer op integer = integer
         # integer op decimal = decimal
         # decimal op decimal = decimal
-        prefers_decimal = "decimal" in {left_type, right_type}
+        # unknown op * = decimal (safe cast for JSON-extracted numeric values)
+        prefers_decimal = "decimal" in {left_type, right_type} or "unknown" in {left_type, right_type}
         if prefers_decimal:
             left_numeric = self._ensure_decimal_expression(left_expr, left_type)
             right_numeric = self._ensure_decimal_expression(right_expr, right_type)
@@ -4407,6 +4663,82 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return expression
         return self.dialect.generate_type_cast(expression, "Decimal")
 
+    def _translate_temporal_quantity_addition(
+        self,
+        left_fragment: SQLFragment,
+        right_fragment: SQLFragment,
+        left_node: FHIRPathASTNode,
+        right_node: FHIRPathASTNode
+    ) -> Optional[SQLFragment]:
+        """Translate temporal literal plus quantity expressions to SQL.
+
+        Handles expressions like:
+        - @2023-01-01 + 1 'day'
+        - @1973-12-25T00:00:00.000+10:00 + 10 'ms'
+        - @2023-01-01 + 7 days
+
+        Returns None if this is not a temporal + quantity expression.
+        """
+        # SP-105-005: Detect temporal type from fragment metadata first, then node
+        temporal_type = None
+
+        # Check fragment metadata (set after visiting the node)
+        left_metadata = getattr(left_fragment, "metadata", {}) or {}
+        fragment_literal_type = left_metadata.get("literal_type")
+        if fragment_literal_type in {"date", "datetime", "time"}:
+            temporal_type = fragment_literal_type
+        else:
+            # Fall back to node-based detection
+            temporal_type = self._detect_temporal_type(left_node)
+
+        if temporal_type is None:
+            return None
+
+        # SP-105-005: Parse quantity from fragment metadata first, then node
+        quantity = self._parse_quantity_literal_from_fragment(right_fragment, right_node)
+        if quantity is None:
+            return None
+
+        amount, unit = quantity
+        normalized_unit = self._normalize_quantity_unit(unit)
+        if normalized_unit is None:
+            return None
+
+        # Months and years require whole-number adjustments
+        if normalized_unit in {"year", "month"} and amount % 1 != 0:
+            return None
+
+        interval_expr = self._build_interval_expression(amount, normalized_unit)
+        if interval_expr is None:
+            return None
+
+        sql_expr = f"({left_fragment.expression} + {interval_expr})"
+        if temporal_type == "date":
+            sql_expr = f"CAST({sql_expr} AS DATE)"
+        elif temporal_type == "datetime":
+            sql_expr = f"CAST({sql_expr} AS TIMESTAMP)"
+        elif temporal_type == "time":
+            sql_expr = f"CAST({sql_expr} AS TIME)"
+
+        dependencies: List[str] = []
+        for dep in (*left_fragment.dependencies, *right_fragment.dependencies):
+            if dep not in dependencies:
+                dependencies.append(dep)
+
+        source_table = (
+            left_fragment.source_table
+            or right_fragment.source_table
+            or self.context.current_table
+        )
+
+        return SQLFragment(
+            expression=sql_expr,
+            source_table=source_table,
+            requires_unnest=left_fragment.requires_unnest or right_fragment.requires_unnest,
+            is_aggregate=left_fragment.is_aggregate or right_fragment.is_aggregate,
+            dependencies=dependencies
+        )
+
     def _translate_temporal_quantity_subtraction(
         self,
         left_fragment: SQLFragment,
@@ -4415,11 +4747,23 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         right_node: FHIRPathASTNode
     ) -> Optional[SQLFragment]:
         """Translate temporal literal minus quantity expressions to SQL."""
-        temporal_type = self._detect_temporal_type(left_node)
+        # SP-105-005: Detect temporal type from fragment metadata first, then node
+        temporal_type = None
+
+        # Check fragment metadata (set after visiting the node)
+        left_metadata = getattr(left_fragment, "metadata", {}) or {}
+        fragment_literal_type = left_metadata.get("literal_type")
+        if fragment_literal_type in {"date", "datetime", "time"}:
+            temporal_type = fragment_literal_type
+        else:
+            # Fall back to node-based detection
+            temporal_type = self._detect_temporal_type(left_node)
+
         if temporal_type is None:
             return None
 
-        quantity = self._parse_quantity_literal(right_node)
+        # SP-105-005: Parse quantity from fragment metadata first, then node
+        quantity = self._parse_quantity_literal_from_fragment(right_fragment, right_node)
         if quantity is None:
             return None
 
@@ -4482,8 +4826,57 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return None
 
+    def _parse_quantity_literal_from_fragment(
+        self,
+        fragment: SQLFragment,
+        node: FHIRPathASTNode
+    ) -> Optional[Tuple[Decimal, str]]:
+        """Parse quantity literal from SQL fragment metadata or AST node.
+
+        SP-105-005: Check fragment metadata first for temporal_info, then fall back
+        to node-based parsing. This handles both quoted units (1'd') and unquoted
+        units (7days, 1 second).
+        """
+        # First check fragment metadata (set after visiting the node)
+        fragment_metadata = getattr(fragment, "metadata", {}) or {}
+        temporal_info = fragment_metadata.get("temporal_info")
+        if temporal_info and temporal_info.get("kind") == "duration":
+            value = temporal_info.get("value")
+            unit = temporal_info.get("unit")
+            if value and unit:
+                try:
+                    amount = Decimal(str(value))
+                    return amount, unit
+                except (InvalidOperation, TypeError):
+                    pass
+
+        # Fall back to node-based parsing
+        return self._parse_quantity_literal(node)
+
     def _parse_quantity_literal(self, node: FHIRPathASTNode) -> Optional[Tuple[Decimal, str]]:
-        """Parse quantity literal expressed as <number>'unit'."""
+        """Parse quantity literal expressed as <number>'unit' or <number><unit>.
+
+        SP-105-005: Enhanced to extract quantity from temporal_info in fragment metadata.
+        The quantity literal may have already been visited and converted to a SQLFragment,
+        so we check the node's temporal_info metadata first.
+        """
+        # SP-105-005: Check if the node has temporal_info (set by literal visitor)
+        # This handles both quoted units (1'd') and unquoted units (7days)
+        metadata = getattr(node, "metadata", None)
+        if metadata:
+            custom_attrs = getattr(metadata, "custom_attributes", {})
+            temporal_info = custom_attrs.get("temporal_info")
+            if temporal_info and temporal_info.get("kind") == "duration":
+                value = temporal_info.get("value")
+                unit = temporal_info.get("unit")
+                if value and unit:
+                    try:
+                        amount = Decimal(str(value))
+                        return amount, unit
+                    except (InvalidOperation, TypeError):
+                        pass
+
+        # Fall back to text-based parsing for quoted units
         value = getattr(node, "value", None)
         unit = None
         number = None
@@ -4543,11 +4936,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
     @staticmethod
     def _decimal_to_sql_str(amount: Decimal) -> str:
-        """Convert Decimal to SQL-friendly string without scientific notation."""
-        normalized = amount.normalize()
-        if normalized == normalized.to_integral():
-            return str(normalized.to_integral())
-        return format(normalized, "f").rstrip("0").rstrip(".")
+        """Convert Decimal to SQL-friendly string without scientific notation.
+
+        SP-105-005: Use format() with 'f' to avoid scientific notation that can
+        occur with normalize() for values >= 10.
+        """
+        # Check if it's an integer value
+        if amount == amount.to_integral():
+            # For integers, use format to avoid scientific notation
+            return format(amount.to_integral(), "f")
+        # For decimals, use format and strip trailing zeros
+        return format(amount, "f").rstrip("0").rstrip(".")
 
     def _translate_temporal_literal_comparison_if_applicable(self, node: OperatorNode) -> Optional[SQLFragment]:
         """Translate temporal literal comparisons that require precision-aware semantics."""
@@ -4587,15 +4986,287 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _extract_temporal_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
-        """Extract temporal metadata from AST node if available."""
+        """Extract temporal metadata from AST node if available.
+
+        This method handles both:
+        1. Nodes that have already been visited and have temporal_info attribute
+        2. Raw AST nodes that need temporal info parsed from their text
+
+        For raw nodes, we traverse to find the actual literal and parse its temporal info.
+        """
+        # First, check if temporal_info is already set (visited node)
         temporal_info = getattr(node, "temporal_info", None)
         if temporal_info:
             return temporal_info
 
+        # Check metadata for temporal_info
         metadata = getattr(node, "metadata", None)
         if metadata and getattr(metadata, "custom_attributes", None):
-            return metadata.custom_attributes.get("temporal_info")
+            temporal_info = metadata.custom_attributes.get("temporal_info")
+            if temporal_info:
+                return temporal_info
+
+        # For raw nodes, parse temporal info from text
+        # Traverse to find the actual literal node (deepest nested literal)
+        literal_node = self._find_literal_node(node)
+        if literal_node and hasattr(literal_node, 'text'):
+            text = literal_node.text
+            if text and text.startswith('@'):
+                return self._parse_temporal_literal_from_text(text)
+
         return None
+
+    def _find_literal_node(self, node: FHIRPathASTNode) -> Optional[FHIRPathASTNode]:
+        """Find the actual literal node by traversing TermExpression wrappers.
+
+        AST structure for literals is often:
+        TermExpression -> literal -> literal (actual literal)
+        """
+        if not hasattr(node, 'children') or not node.children:
+            # This is a leaf node, check if it's a literal
+            node_type = getattr(node, 'node_type', '')
+            if node_type == 'literal':
+                return node
+            return None
+
+        # If there's exactly one child, traverse deeper
+        if len(node.children) == 1:
+            return self._find_literal_node(node.children[0])
+
+        # Multiple children - not a simple literal wrapper
+        return None
+
+    def _parse_temporal_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR temporal literal from text, returning metadata for range comparisons.
+
+        This replicates the temporal literal parsing logic from ast_extensions.py
+        to handle raw AST nodes before they're visited.
+
+        Args:
+            text: The temporal literal text (e.g., "@2018-03", "@T10:30")
+
+        Returns:
+            Dict with temporal info including kind, precision, start, end, is_partial
+            or None if not a temporal literal
+        """
+        if not text or not text.startswith("@"):
+            return None
+
+        import re
+        from datetime import datetime, timedelta
+
+        if text.startswith("@T"):
+            return self._parse_time_literal_from_text(text)
+
+        body = text[1:]
+        if "T" in body:
+            # Check for partial DateTime pattern first (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT)
+            partial_datetime_match = re.fullmatch(r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?T$", body)
+            if partial_datetime_match:
+                return self._parse_partial_datetime_literal_from_text(text, body, partial_datetime_match)
+            return self._parse_datetime_literal_from_text(text, body)
+        return self._parse_date_literal_from_text(text, body)
+
+    def _parse_date_literal_from_text(self, original: str, body: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR date literal with optional reduced precision."""
+        import re
+        from datetime import datetime, timedelta
+
+        if re.fullmatch(r"\d{4}$", body):
+            year = int(body)
+            start_dt = datetime(year, 1, 1)
+            end_dt = datetime(year + 1, 1, 1)
+            precision = "year"
+            normalized = f"{year:04d}"
+            literal_type = "date"
+            is_partial = True
+        elif re.fullmatch(r"\d{4}-\d{2}$", body):
+            year, month = map(int, body.split("-"))
+            start_dt = datetime(year, month, 1)
+            if month == 12:
+                end_dt = datetime(year + 1, 1, 1)
+            else:
+                end_dt = datetime(year, month + 1, 1)
+            precision = "month"
+            normalized = f"{year:04d}-{month:02d}"
+            literal_type = "date"
+            is_partial = True
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}$", body):
+            year, month, day = map(int, body.split("-"))
+            start_dt = datetime(year, month, day)
+            end_dt = start_dt + timedelta(days=1)
+            precision = "day"
+            normalized = f"{year:04d}-{month:02d}-{day:02d}"
+            literal_type = "date"
+            is_partial = False
+        else:
+            return None
+
+        return {
+            "kind": "date",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": is_partial,
+            "literal_type": literal_type,
+            "original": original
+        }
+
+    def _parse_time_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR time literal with optional reduced precision."""
+        import re
+        from datetime import datetime, timedelta
+
+        body = text[2:]  # Remove "@T"
+
+        # Match various time precisions
+        if re.fullmatch(r"\d{2}$", body):
+            # Hour precision: T10 -> 10:00:00 to 10:59:59.999...
+            hour = int(body)
+            start_dt = datetime(1, 1, 1, hour, 0, 0)
+            end_dt = datetime(1, 1, 1, hour + 1, 0, 0)
+            precision = "hour"
+            normalized = f"{hour:02d}"
+            is_partial = True
+        elif re.fullmatch(r"\d{2}:\d{2}$", body):
+            # Minute precision: T10:30 -> 10:30:00 to 10:30:59.999...
+            hour, minute = map(int, body.split(":"))
+            start_dt = datetime(1, 1, 1, hour, minute, 0)
+            end_dt = datetime(1, 1, 1, hour, minute + 1, 0)
+            precision = "minute"
+            normalized = f"{hour:02d}:{minute:02d}"
+            is_partial = True
+        elif re.fullmatch(r"\d{2}:\d{2}:\d{2}$", body):
+            # Second precision: T10:30:00 -> 10:30:00 to 10:30:00.999...
+            hour, minute, second = map(int, body.split(":"))
+            start_dt = datetime(1, 1, 1, hour, minute, second)
+            end_dt = start_dt + timedelta(seconds=1)
+            precision = "second"
+            normalized = f"{hour:02d}:{minute:02d}:{second:02d}"
+            is_partial = False
+        else:
+            return None
+
+        return {
+            "kind": "time",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_time_iso(start_dt),
+            "end": self._format_time_iso(end_dt),
+            "is_partial": is_partial,
+            "literal_type": "time",
+            "original": text
+        }
+
+    def _parse_datetime_literal_from_text(self, original: str, body: str) -> Optional[Dict[str, Any]]:
+        """Parse FHIR dateTime literal with optional reduced precision and timezone."""
+        import re
+        from datetime import datetime, timedelta
+
+        # Pattern with optional timezone suffix: Z or +/-HH:MM
+        pattern = re.compile(
+            r"^(\d{4})-(\d{2})-(\d{2})T"
+            r"(\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+            r"(?:Z|[+-]\d{2}:\d{2})?$"
+        )
+        match = pattern.fullmatch(body)
+        if not match:
+            return None
+
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        hour = int(match.group(4))
+        minute = int(match.group(5) or 0)
+        second = int(match.group(6) or 0)
+        fraction = match.group(7)
+
+        # Build datetime
+        if fraction:
+            microsecond = int(fraction.ljust(6, '0')[:6])
+            start_dt = datetime(year, month, day, hour, minute, second, microsecond)
+        else:
+            start_dt = datetime(year, month, day, hour, minute, second)
+
+        # Determine precision and end value
+        if fraction:
+            precision = "subsecond"
+            end_dt = start_dt + timedelta(microseconds=1)
+        elif second > 0:
+            precision = "second"
+            end_dt = start_dt + timedelta(seconds=1)
+        elif minute > 0:
+            precision = "minute"
+            end_dt = start_dt + timedelta(minutes=1)
+        elif hour > 0:
+            precision = "hour"
+            end_dt = start_dt + timedelta(hours=1)
+        else:
+            precision = "day"
+            end_dt = start_dt + timedelta(days=1)
+
+        normalized = start_dt.isoformat()
+
+        return {
+            "kind": "datetime",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": precision != "subsecond",
+            "literal_type": "datetime",
+            "original": original
+        }
+
+    def _parse_partial_datetime_literal_from_text(self, original: str, body: str, match) -> Optional[Dict[str, Any]]:
+        """Parse partial dateTime literal (@YYYYT, @YYYY-MMT, @YYYY-MM-DDT)."""
+        from datetime import datetime, timedelta
+
+        year = int(match.group(1))
+        month = int(match.group(2)) if match.group(2) else None
+        day = int(match.group(3)) if match.group(3) else None
+
+        if day is not None:
+            # @YYYY-MM-DDT: day precision
+            start_dt = datetime(year, month, day)
+            end_dt = start_dt + timedelta(days=1)
+            precision = "day"
+            normalized = f"{year:04d}-{month:02d}-{day:02d}"
+        elif month is not None:
+            # @YYYY-MMT: month precision
+            start_dt = datetime(year, month, 1)
+            if month == 12:
+                end_dt = datetime(year + 1, 1, 1)
+            else:
+                end_dt = datetime(year, month + 1, 1)
+            precision = "month"
+            normalized = f"{year:04d}-{month:02d}"
+        else:
+            # @YYYYT: year precision
+            start_dt = datetime(year, 1, 1)
+            end_dt = datetime(year + 1, 1, 1)
+            precision = "year"
+            normalized = f"{year:04d}"
+
+        return {
+            "kind": "datetime",
+            "precision": precision,
+            "normalized": normalized,
+            "start": self._format_datetime_iso(start_dt),
+            "end": self._format_datetime_iso(end_dt),
+            "is_partial": True,
+            "literal_type": "datetime",
+            "original": original
+        }
+
+    def _format_datetime_iso(self, dt: datetime) -> str:
+        """Format datetime to ISO string for SQL."""
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_time_iso(self, dt: datetime) -> str:
+        """Format time to ISO string for SQL."""
+        return dt.strftime("%H:%M:%S")
 
     def _build_temporal_conditions(
         self,
@@ -6084,6 +6755,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         if target_type == "Quantity":
             # SP-103-003: Implement Quantity type conversion
+            # SP-106-003: Quantity literals (e.g., "10 'mg'") are marked with QuantityLiteralMarker
             # According to FHIRPath spec, the following can convert to Quantity:
             # - Integer literals (e.g., 1, 5, 10)
             # - Decimal literals (e.g., 1.0, 5.5, 10.25)
@@ -6091,6 +6763,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # - String representations of integers (e.g., '1', '5')
             # - String representations of decimals (e.g., '1.0', '5.5')
             # - String representations of quantities (e.g., '1 day', '4 days', '1 \'wk\'')
+
+            # SP-106-003: Check for quantity literal marker first
+            if hasattr(value, 'is_quantity_literal') and value.is_quantity_literal:
+                return True
 
             if isinstance(value, bool):
                 # Booleans can convert to Quantity (true -> 1.0, false -> 0.0)
@@ -6922,13 +7598,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 {"function": "exclude", "is_collection": True}
             )
 
+            # SP-105: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when exclude() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=base_expr, source_table=source_table),
+                exclusion_fragment
+            )
+
             return SQLFragment(
                 expression=final_expr,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata=metadata
+                metadata=metadata,
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7031,13 +7716,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalize_superset=not right_is_cte_ref
             )
 
+            # SP-106: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when subsetOf() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=subset_expr, source_table=source_table),
+                right_fragment
+            )
+
             return SQLFragment(
                 expression=subset_check_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "subsetOf", "result_type": "boolean"}
+                metadata={"function": "subsetOf", "result_type": "boolean"},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7137,13 +7831,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalize_superset=not left_is_cte_ref
             )
 
+            # SP-106: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when supersetOf() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=normalized_left, source_table=source_table),
+                right_fragment
+            )
+
             return SQLFragment(
                 expression=superset_check_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "supersetOf", "result_type": "boolean"}
+                metadata={"function": "supersetOf", "result_type": "boolean"},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7368,13 +8071,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalized_right,
             )
 
+            # SP-105: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when combine() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=base_expr, source_table=source_table),
+                other_fragment
+            )
+
             return SQLFragment(
                 expression=combine_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=dependencies,
-                metadata={"function": "combine", "is_collection": True}
+                metadata={"function": "combine", "is_collection": True},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7512,7 +8224,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             type_check_sql = self._generate_literal_type_check(
                 expr_fragment.expression,
                 canonical_type,
-                original_literal
+                original_literal,
+                node  # Pass node for metadata access
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -7547,7 +8260,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             source_table=expr_fragment.source_table,
             requires_unnest=False,  # Type check returns boolean, not collection
             is_aggregate=False,  # Type check is scalar operation
-            dependencies=expr_fragment.dependencies
+            dependencies=expr_fragment.dependencies,
+            metadata={"function": "is", "result_type": "boolean"}
         )
 
     def _translate_as_operation(self, node: TypeOperationNode) -> SQLFragment:
@@ -7574,13 +8288,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             Output: SQL that casts Procedure.performed to datetime type
         """
         # Type operation should have exactly one child (the expression to cast)
-        if not node.children:
+        # SP-104-002: Check for value_expression attribute (from parent InvocationExpression)
+        # This handles cases like "@2015.as(Date)" where the literal is a sibling in the parent
+        if hasattr(node, 'value_expression') and node.value_expression is not None:
+            # Use the value expression from the parent
+            child_node = node.value_expression
+        elif node.children:
+            # Fall back to the first child
+            child_node = node.children[0]
+        else:
             raise ValueError("as() operation requires an expression to cast")
 
         # Snapshot context so polymorphic path traversal does not leak state
         snapshot = self._snapshot_context()
         try:
-            child_node = node.children[0]
             expr_fragment = self.visit(child_node)
         finally:
             # Always restore - downstream operations assume original context
@@ -7696,9 +8417,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Check if this is a direct property access
             # Direct access: parent_path contains only the property name (e.g., ['value'])
             # Nested access: parent_path contains multiple elements (e.g., ['component', 'value'])
+            # SP-105-004: Also treat empty parent_path as direct access when property_name matches
+            # This handles cases where the identifier hasn't been visited yet in the current context
             is_direct_access = (
-                len(parent_path_before_child) == 1 and
-                parent_path_before_child[0] == property_name
+                (len(parent_path_before_child) == 0 or len(parent_path_before_child) == 1) and
+                (len(parent_path_before_child) == 0 or parent_path_before_child[0] == property_name)
             )
 
             if is_direct_access:
@@ -7707,45 +8430,80 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     logger.debug(f"Resolved polymorphic field: {property_name} + {canonical_type} → {polymorphic_field}")
                     logger.debug(f"Parent path before: {self.context.parent_path}")
 
-                    # Build JSON path for the polymorphic field
-                    # Need to extract the source table from the expression
-                    source_table = expr_fragment.source_table or self.context.current_table
-                    json_path = f"$.{polymorphic_field}"
+                    # SP-105-004: Check if there's subsequent navigation after ofType()
+                    # We need to look at the parent's parent to see if there are MemberInvocations
+                    has_subsequent_navigation = False
+                    if hasattr(node, 'enhanced_node') and node.enhanced_node:
+                        enhanced_node = node.enhanced_node
+                        if hasattr(enhanced_node, 'parent') and enhanced_node.parent:
+                            grandparent = enhanced_node.parent
+                            # Check if grandparent has more children after the current parent
+                            # This indicates there's more navigation (e.g., .low.value)
+                            if hasattr(grandparent, 'children') and len(grandparent.children) > 1:
+                                has_subsequent_navigation = True
+                                logger.debug(f"SP-105-004: Detected subsequent navigation after ofType(), will continue chain")
 
-                    # Extract the polymorphic field directly - no type filtering needed
-                    # because the field name already guarantees the type!
-                    poly_field_sql = self.dialect.extract_json_object(
-                        column=source_table,
-                        path=json_path
-                    )
+                    if has_subsequent_navigation:
+                        # SP-105-004: When there's subsequent navigation, update parent_path to use
+                        # the resolved polymorphic field, but DON'T return early. Let the navigation
+                        # continue from the resolved field.
+                        if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                            # Replace the last element
+                            self.context.parent_path[-1] = polymorphic_field
+                        else:
+                            # Append if the structure is different than expected
+                            self.context.parent_path.append(polymorphic_field)
+                        logger.debug(f"SP-105-004: Updated parent_path for subsequent navigation: {self.context.parent_path}")
 
-                    logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+                        # Store the polymorphic field mapping for subsequent identifier visits
+                        if not hasattr(self.context, 'polymorphic_field_mappings'):
+                            self.context.polymorphic_field_mappings = {}
+                        self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                        logger.debug(f"SP-105-004: Stored polymorphic mapping for chain: {property_name} -> {polymorphic_field}")
 
-                    # SP-103-005: Update parent_path to reflect the resolved type
-                    # The current path ends with the base property name (e.g., 'value'),
-                    # and we need to replace it with the polymorphic field (e.g., 'valueRange')
-                    if self.context.parent_path and self.context.parent_path[-1] == property_name:
-                        # Replace the last element
-                        self.context.parent_path[-1] = polymorphic_field
+                        # Fall through to continue with navigation after updating context
+                        # Don't return early - let subsequent identifiers build the full path
                     else:
-                        # Append if the structure is different than expected
-                        self.context.parent_path.append(polymorphic_field)
-                    logger.debug(f"Parent path after: {self.context.parent_path}")
+                        # No subsequent navigation - return the polymorphic field extraction
+                        # Build JSON path for the polymorphic field
+                        # Need to extract the source table from the expression
+                        source_table = expr_fragment.source_table or self.context.current_table
+                        json_path = f"$.{polymorphic_field}"
 
-                    # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
-                    # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
-                    if not hasattr(self.context, 'polymorphic_field_mappings'):
-                        self.context.polymorphic_field_mappings = {}
-                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
-                    logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
+                        # Extract the polymorphic field directly - no type filtering needed
+                        # because the field name already guarantees the type!
+                        poly_field_sql = self.dialect.extract_json_object(
+                            column=source_table,
+                            path=json_path
+                        )
 
-                    return SQLFragment(
-                        expression=poly_field_sql,
-                        source_table=source_table,
-                        requires_unnest=False,
-                        is_aggregate=False,
-                        dependencies=expr_fragment.dependencies
-                    )
+                        logger.debug(f"Generated polymorphic field extraction SQL for {polymorphic_field}")
+
+                        # SP-103-005: Update parent_path to reflect the resolved type
+                        # The current path ends with the base property name (e.g., 'value'),
+                        # and we need to replace it with the polymorphic field (e.g., 'valueRange')
+                        if self.context.parent_path and self.context.parent_path[-1] == property_name:
+                            # Replace the last element
+                            self.context.parent_path[-1] = polymorphic_field
+                        else:
+                            # Append if the structure is different than expected
+                            self.context.parent_path.append(polymorphic_field)
+                        logger.debug(f"Parent path after: {self.context.parent_path}")
+
+                        # SP-103-005: Store the polymorphic field mapping in context for subsequent identifier visits
+                        # This allows identifiers like 'low' to know that 'value' was resolved to 'valueRange'
+                        if not hasattr(self.context, 'polymorphic_field_mappings'):
+                            self.context.polymorphic_field_mappings = {}
+                        self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+                        logger.debug(f"SP-103-005: Stored polymorphic mapping: {property_name} -> {polymorphic_field}")
+
+                        return SQLFragment(
+                            expression=poly_field_sql,
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=expr_fragment.dependencies
+                        )
 
         type_metadata: Dict[str, Any] = {}
         if canonical_type:
@@ -8546,20 +9304,35 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         f"Generated polymorphic .as() SQL with path_after: {sql_expr}"
                     )
 
-                    # Create and return the fragment
-                    fragment = SQLFragment(
+                    # Build a proper expression fragment for type casting
+                    # This ensures we get the full complex type metadata
+                    expr_fragment = SQLFragment(
                         expression=sql_expr,
                         source_table=self.context.current_table,
                         requires_unnest=False,
                         is_aggregate=False,
                         dependencies=[],
-                        metadata={
-                            'type_operation': 'as',
-                            'target_type': canonical_type,
-                            'polymorphic_resolution': polymorphic_field,
-                            'json_path': json_path,
-                            'path_after_as': path_after
-                        }
+                        metadata={}
+                    )
+
+                    # Use _build_type_cast_fragment to get proper metadata including mode='complex'
+                    # Create an identifier node representing the polymorphic field
+                    identifier_node = IdentifierNode(
+                        node_type="identifier",
+                        text=path_expr,
+                        identifier=last_component
+                    )
+
+                    # Get type metadata
+                    type_metadata = self.type_registry.get_type_metadata(canonical_type) or {}
+
+                    # Build complex type cast fragment with proper metadata
+                    fragment = self._build_complex_type_cast_fragment(
+                        identifier_node=identifier_node,
+                        expr_fragment=expr_fragment,
+                        canonical_type=canonical_type,
+                        type_metadata=type_metadata,
+                        original_expression=node.text,
                     )
 
                     return fragment
@@ -9003,10 +9776,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         old_pending = self.context.pending_fragment_result
         self.context.pending_fragment_result = None
 
+        # SP-106-002: Store the old current_table and current_element_column to restore later
+        # This ensures that nested expressions like $this.length() use the correct context
+        old_current_table = self.context.current_table
+        old_current_element_column = self.context.current_element_column
+
+        # Set current_table to result_col so that $this references are resolved correctly
+        self.context.current_table = result_col
+        self.context.current_element_column = None
+
         with self._variable_scope({
             "$this": VariableBinding(
                 expression=this_expression,
-                source_table=source_table
+                source_table=result_col,  # Use result_col as source_table for correct scoping
+                requires_unnest=False,
+                is_aggregate=False
             )
         }):
             # Translate the filter condition argument
@@ -9014,6 +9798,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # SP-102-001: Restore pending_fragment_result after lambda scope exits
         self.context.pending_fragment_result = old_pending
+
+        # SP-106-002: Restore the old current_table and current_element_column
+        self.context.current_table = old_current_table
+        self.context.current_element_column = old_current_element_column
 
         # SP-022-012: Remove any intermediate fragments that were added during
         # condition translation. The condition expression is self-contained.
@@ -11250,15 +12038,20 @@ END"""
                 if hasattr(length_fragment, "dependencies"):
                     dependencies.extend(length_fragment.dependencies)
 
-            start_condition = f"({start_expr})"
+            # SP-106-003: Cast start expression to BIGINT for substring compatibility
+            # length() returns DOUBLE, but substring expects BIGINT
+            start_cast = f"TRY_CAST({start_expr} AS BIGINT)"
+            start_condition = f"({start_cast})"
             start_plus_one = f"({start_condition} + 1)"
 
             if length_expr is not None:
+                # SP-106-003: Cast length expression to BIGINT
+                length_cast = f"TRY_CAST({length_expr} AS BIGINT)"
                 substring_sql = self.dialect.generate_string_function(
                     'substring',
                     string_expr,
                     start_plus_one,
-                    length_expr
+                    length_cast
                 )
             else:
                 substring_sql = self.dialect.generate_string_function(

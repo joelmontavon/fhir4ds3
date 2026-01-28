@@ -31,7 +31,6 @@ class TestTranslatorVariableHandling:
         ast = parsed.get_ast()
         return translator.translate(ast)
 
-    @pytest.mark.skip(reason="FHIRPath spec: where() only requires $this")
     def test_where_uses_this_variable(self, duckdb_dialect):
         """Ensure $this resolves to the array item alias within where()."""
         translator = ASTToSQLTranslator(duckdb_dialect, "Patient")
@@ -45,8 +44,19 @@ class TestTranslatorVariableHandling:
         sql_text = "\n".join(fragment.expression for fragment in fragments)
 
         assert "$this" not in sql_text
-        assert "cte_1_item" in sql_text  # Alias assigned to array element
-        assert "substring" in sql_text.lower()
+        # The result column should be given_item (from unnesting the given array)
+        assert "given_item" in sql_text  # Alias assigned to array element
+
+        # Check that the where filter metadata contains the substring expression
+        where_fragment = None
+        for fragment in fragments:
+            if fragment.metadata and fragment.metadata.get("function") == "where":
+                where_fragment = fragment
+                break
+
+        assert where_fragment is not None, "Expected to find where() fragment"
+        where_filter = where_fragment.metadata.get("where_filter", "")
+        assert "substring" in where_filter.lower(), f"Expected substring in where filter, got: {where_filter}"
 
     @pytest.mark.skip(reason="FHIRPath spec: where() only requires $this, not $total")
     def test_where_uses_total_variable(self, duckdb_dialect):

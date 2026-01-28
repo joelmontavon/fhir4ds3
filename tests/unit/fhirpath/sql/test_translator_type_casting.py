@@ -52,6 +52,25 @@ class _CastingDialect:
     def safe_cast_to_boolean(self, expression: str) -> str:
         return f"TRY_CAST({expression} AS BOOLEAN)"
 
+    def extract_json_string(self, column: str, path: str) -> str:
+        """Extract JSON field as string for string comparisons."""
+        return f"json_extract_string({column}, '{path}')"
+
+    def generate_type_cast(self, expression: str, target_type: str) -> str:
+        """Generate type casting for arithmetic operations."""
+        type_map = {
+            "string": "VARCHAR",
+            "integer": "INTEGER",
+            "decimal": "DECIMAL",
+            "boolean": "BOOLEAN",
+            "datetime": "TIMESTAMP",
+            "date": "DATE",
+            "time": "TIME",
+        }
+        normalized_type = target_type.lower() if target_type else ""
+        sql_type = type_map.get(normalized_type, "VARCHAR")
+        return f"TRY_CAST({expression} AS {sql_type})"
+
 
 @pytest.fixture
 def translator():
