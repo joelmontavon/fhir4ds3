@@ -4951,7 +4951,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return format(amount, "f").rstrip("0").rstrip(".")
 
     def _translate_temporal_literal_comparison_if_applicable(self, node: OperatorNode) -> Optional[SQLFragment]:
-        """Translate temporal literal comparisons that require precision-aware semantics."""
+        """Translate temporal literal comparisons that require precision-aware semantics.
+
+        This handles comparisons involving:
+        1. Temporal literals with reduced precision (e.g., @2018-03, @T10:30)
+        2. Field references to temporal types (e.g., Patient.birthDate which is a date)
+
+        For field references, we visit the node to get the SQL expression and use it
+        directly in comparisons, rather than trying to convert to a literal.
+        """
         if len(node.children) != 2:
             return None
 
@@ -4962,20 +4970,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return None
 
         # Only apply range-based semantics when at least one operand has reduced precision
+        # Field references always have implicit precision (e.g., birthDate has day precision)
         if not (left_info.get("is_partial") or right_info.get("is_partial")):
             return None
 
         operator = (node.operator or "").strip()
-        conditions = self._build_temporal_conditions(left_info, right_info, operator)
+        conditions = self._build_temporal_conditions(
+            left_info, right_info, operator,
+            node.children[0], node.children[1]
+        )
         if conditions is None:
             return None
 
         true_condition, false_condition = conditions
 
+        # Use existential semantics for ALL comparison operators:
+        # - When the comparison is true, return TRUE
+        # - When the comparison is false, return NULL (empty result)
+        # This filters out non-matching rows from the result set
         sql_expr = (
             "CASE "
             f"WHEN {true_condition} THEN TRUE "
-            f"WHEN {false_condition} THEN FALSE "
             "ELSE NULL "
             "END"
         )
@@ -4990,11 +5005,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
     def _extract_temporal_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
         """Extract temporal metadata from AST node if available.
 
-        This method handles both:
+        This method handles:
         1. Nodes that have already been visited and have temporal_info attribute
-        2. Raw AST nodes that need temporal info parsed from their text
+        2. Raw AST nodes that need temporal info parsed from their text (literals)
+        3. Field references that resolve to temporal types (date, dateTime, time)
 
-        For raw nodes, we traverse to find the actual literal and parse its temporal info.
+        For field references, we resolve the element type to determine if it's a temporal field.
         """
         # First, check if temporal_info is already set (visited node)
         temporal_info = getattr(node, "temporal_info", None)
@@ -5015,6 +5031,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             text = literal_node.text
             if text and text.startswith('@'):
                 return self._parse_temporal_literal_from_text(text)
+
+        # Check if this is a field reference that resolves to a temporal type
+        # This handles cases like Patient.birthDate where birthDate is a date field
+        temporal_field_info = self._extract_temporal_field_info(node)
+        if temporal_field_info:
+            return temporal_field_info
 
         return None
 
@@ -5037,6 +5059,76 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # Multiple children - not a simple literal wrapper
         return None
+
+    def _extract_temporal_field_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
+        """Extract temporal metadata from a field reference node.
+
+        This handles cases where the node is a field reference (not a literal) that
+        resolves to a temporal type like date, dateTime, or time.
+
+        For example: Patient.birthDate resolves to a 'date' type, which has day precision.
+
+        Args:
+            node: AST node representing a field reference
+
+        Returns:
+            Dict with temporal info including kind, precision, start, end, is_partial
+            or None if not a temporal field reference
+        """
+        from ..types.element_type_resolver import resolve_element_type
+
+        # Check if this is an InvocationExpression (field reference)
+        node_type = getattr(node, 'node_type', '')
+        if node_type != 'InvocationExpression':
+            return None
+
+        # Get the field name from the invocation
+        # For Patient.birthDate, we need to extract "birthDate"
+        text = getattr(node, 'text', '')
+        if not text or '.' not in text:
+            return None
+
+        # Split the path to get the field name
+        parts = text.split('.')
+        if len(parts) < 2:
+            return None
+
+        field_name = parts[-1]  # Last part is the field name
+        resource_type = self.resource_type  # Current resource type being queried
+
+        # Resolve the element type
+        element_type = resolve_element_type(resource_type, field_name)
+        if not element_type:
+            return None
+
+        # Map FHIR types to temporal kinds and precisions
+        temporal_type_map = {
+            'date': ('date', 'day'),
+            'dateTime': ('datetime', 'second'),
+            'time': ('time', 'second'),
+            'instant': ('datetime', 'subsecond'),
+        }
+
+        type_info = temporal_type_map.get(element_type)
+        if not type_info:
+            return None
+
+        kind, precision = type_info
+
+        # For field references, we don't have a specific value, so we can't create
+        # start/end boundaries. Instead, we indicate the field's temporal type
+        # so the comparison logic knows how to handle it.
+        # The is_partial flag is True because field references have implicit precision
+        # (e.g., birthDate has day precision, not full timestamp precision)
+        return {
+            "kind": kind,
+            "precision": precision,
+            "is_partial": True,  # Field references have implicit precision
+            "is_field_reference": True,  # Flag to distinguish from literals
+            "field_type": element_type,
+            "field_name": field_name,
+            "original": text
+        }
 
     def _parse_temporal_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse FHIR temporal literal from text, returning metadata for range comparisons.
@@ -5274,11 +5366,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         self,
         left_info: Dict[str, Any],
         right_info: Dict[str, Any],
-        operator: str
+        operator: str,
+        left_node: Optional[FHIRPathASTNode] = None,
+        right_node: Optional[FHIRPathASTNode] = None
     ) -> Optional[tuple[str, str]]:
-        """Build true/false SQL conditions for temporal comparisons."""
-        left_range = self._temporal_range_to_sql(left_info)
-        right_range = self._temporal_range_to_sql(right_info)
+        """Build true/false SQL conditions for temporal comparisons.
+
+        Args:
+            left_info: Temporal metadata for left operand
+            right_info: Temporal metadata for right operand
+            operator: Comparison operator (<, <=, >, >=, =, !=)
+            left_node: Optional AST node for left operand (for field references)
+            right_node: Optional AST node for right operand (for field references)
+
+        Returns:
+            Tuple of (true_condition, false_condition) or None if not applicable
+
+        For field references, we visit the node to get the SQL expression.
+        For literals, we use the pre-computed start/end boundaries.
+        """
+        left_range = self._temporal_range_to_sql(left_info, left_node)
+        right_range = self._temporal_range_to_sql(right_info, right_node)
 
         if left_range is None or right_range is None:
             return None
@@ -5288,33 +5396,99 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         op = operator.strip()
         if op == "<":
+            # True if left is entirely before right (no overlap)
             conditions = (
                 f"({left_end} <= {right_start})",
                 f"({left_start} >= {right_end})"
             )
         elif op == "<=":
+            # True if left is before right OR overlaps with right
+            # In interval terms: left_end <= right_end (left ends before or at right's end)
             conditions = (
-                f"({left_end} <= {right_start})",
+                f"({left_end} <= {right_end})",
                 f"({left_start} > {right_end})"
             )
         elif op == ">":
+            # True if left is entirely after right (no overlap)
             conditions = (
                 f"({left_start} >= {right_end})",
                 f"({left_end} <= {right_start})"
             )
         elif op == ">=":
+            # True if left is after right OR overlaps with right
+            # In interval terms: left_start >= right_start (left starts after or at right's start)
             conditions = (
-                f"({left_start} >= {right_end})",
+                f"({left_start} >= {right_start})",
                 f"({left_end} < {right_start})"
             )
+        elif op == "=" or op == "!=":
+            # For equality/inequality, check if intervals overlap
+            # Intervals overlap if: left_start < right_end AND left_end > right_start
+            overlap_condition = f"({left_start} < {right_end} AND {left_end} > {right_start})"
+
+            if op == "=":
+                # Equal if intervals overlap (existential comparison)
+                conditions = (overlap_condition, f"NOT ({overlap_condition})")
+            else:  # !=
+                # Not equal if intervals do NOT overlap
+                conditions = (f"NOT ({overlap_condition})", overlap_condition)
         else:
             return None
 
         return conditions
 
-    def _temporal_range_to_sql(self, temporal_info: Dict[str, Any]) -> Optional[tuple[str, str]]:
-        """Convert temporal range start/end into SQL literal expressions."""
+    def _temporal_range_to_sql(
+        self,
+        temporal_info: Dict[str, Any],
+        node: Optional[FHIRPathASTNode] = None
+    ) -> Optional[tuple[str, str]]:
+        """Convert temporal range start/end into SQL literal expressions.
+
+        Args:
+            temporal_info: Temporal metadata with kind, precision, start, end, is_field_reference
+            node: Optional AST node (for field references that need to be visited)
+
+        Returns:
+            Tuple of (start_expr, end_expr) or None if not applicable
+
+        For field references (is_field_reference=True), we visit the node to get the SQL
+        expression and cast it appropriately. For literals, we use the pre-computed
+        start/end values directly.
+        """
         kind = temporal_info.get("kind")
+
+        # Check if this is a field reference
+        is_field_ref = temporal_info.get("is_field_reference", False)
+        if is_field_ref and node:
+            # Visit the node to get its SQL expression
+            # This handles cases like Patient.birthDate where we need the actual SQL
+            fragment = self.visit(node)
+
+            # For date fields, we need to handle the comparison carefully
+            # A date field like birthDate has day precision, so:
+            # - start: The date itself (at midnight)
+            # - end: The next day (exclusive)
+            if kind == "date":
+                # Cast to TIMESTAMP and use date truncation for proper comparison
+                # DATE '1974-12-25' should compare as TIMESTAMP '1974-12-25 00:00:00'
+                # to TIMESTAMP '1974-12-26 00:00:00'
+                start_expr = f"CAST({fragment.expression} AS TIMESTAMP)"
+                end_expr = f"CAST({fragment.expression} AS TIMESTAMP) + INTERVAL '1 day'"
+            elif kind == "datetime":
+                # For datetime fields, use the expression directly
+                # The field already has second precision
+                start_expr = fragment.expression
+                end_expr = f"({fragment.expression} + INTERVAL '1 second')"
+            elif kind == "time":
+                # For time fields, use the expression directly
+                start_expr = fragment.expression
+                end_expr = f"({fragment.expression} + INTERVAL '1 second')"
+            else:
+                return None
+
+            return start_expr, end_expr
+
+        # For literals, use the pre-computed start/end values
         start_value = temporal_info.get("start")
         end_value = temporal_info.get("end")
 
@@ -9286,9 +9460,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             SQLFragment containing type casting SQL
         """
         # SP-107-001: Debug logging
-        print(f"DEBUG SP-107: _translate_as_from_function_call called")
-        print(f"  node.text: {node.text}")
-        print(f"  node.function_name: {node.function_name}")
+        logger.debug(f"SP-107: _translate_as_from_function_call called: node.text={node.text}, node.function_name={node.function_name}")
 
         # Validate argument count
         if not node.arguments or len(node.arguments) == 0:

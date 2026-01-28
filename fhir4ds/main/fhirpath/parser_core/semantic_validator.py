@@ -144,6 +144,9 @@ class SemanticValidator:
             # SP-102-004: Validate incomplete expressions
             self._validate_incomplete_expressions(raw_expression, parsed_expression.ast)
 
+            # SP-106-007: Validate temporal comparison type compatibility
+            self._validate_temporal_comparison_compatibility(raw_expression, parsed_expression.ast)
+
             self._validate_function_definitions(
                 raw_expression,
                 parsed_expression,
@@ -763,6 +766,210 @@ class SemanticValidator:
                 f"Time literal '{literal}' is invalid: Time literals cannot have timezone suffixes. "
                 f"Use DateTime literal format (e.g., @2015-02-04T{tz_suffix}) for time with timezone."
             )
+
+    def _validate_temporal_comparison_compatibility(
+        self,
+        raw_expression: str,
+        parsed_ast: EnhancedASTNode
+    ) -> None:
+        """
+        SP-106-007: Validate that temporal comparisons are between compatible types.
+
+        TIME literals cannot be compared with DATE or TIMESTAMP fields because they
+        represent fundamentally different concepts:
+        - TIME: Represents a time of day (HH:MM:SS) without date context
+        - DATE: Represents a calendar date (YYYY-MM-DD) without time context
+        - TIMESTAMP: Represents a specific point in time (date + time)
+
+        Comparing TIME with DATE/TIMESTAMP would require an implicit cast that
+        doesn't make semantic sense (what date should a TIME be cast to?).
+
+        This method detects such incompatible comparisons and rejects them at
+        parse time with a clear error message.
+
+        Args:
+            raw_expression: Original expression text
+            parsed_ast: Parsed AST node
+
+        Raises:
+            FHIRPathParseError: When a TIME literal is compared with DATE/TIMESTAMP
+        """
+        # Check if expression contains a TIME literal pattern
+        # TIME literals start with @T (e.g., @T12:14:15, @T12:14)
+        time_literal_pattern = r'@T\d{2}(?::\d{2})?(?::\d{2}(\.\d+)?)?'
+        has_time_literal = re.search(time_literal_pattern, raw_expression)
+
+        if not has_time_literal:
+            return  # No TIME literal, nothing to validate
+
+        # Check if expression contains comparison operators
+        comparison_operators = ['=', '!=', '<', '>', '<=', '>=', '~', '!~']
+        has_comparison = any(
+            f' {op} ' in raw_expression or
+            raw_expression.endswith(f' {op}') or
+            raw_expression.startswith(f'{op} ')
+            for op in comparison_operators
+        )
+
+        if not has_comparison:
+            return  # No comparison, nothing to validate
+
+        # Walk the AST to find comparison nodes and check their operands
+        for node in self._iterate_nodes(parsed_ast):
+            # Check for various comparison/operation node types
+            if node.node_type not in {"EqualityExpression", "InequalityExpression",
+                                      "ComparisonExpression", "AdditiveExpression"}:
+                continue
+
+            # Check if this is a comparison operator
+            operator = node.text.strip()
+            if operator not in comparison_operators:
+                continue
+
+            # Check operands for incompatible temporal types
+            if len(node.children) < 2:
+                continue
+
+            left_child = node.children[0]
+            right_child = node.children[1]
+
+            # Get temporal info for both operands
+            # This checks both: 1) temporal literals, 2) field types from registry
+            left_temporal = self._get_temporal_type_of_operand(left_child)
+            right_temporal = self._get_temporal_type_of_operand(right_child)
+
+            # Check if one is TIME and the other is DATE or DATETIME
+            if left_temporal and right_temporal:
+                if left_temporal == "time" and right_temporal in {"date", "datetime"}:
+                    raise FHIRPathParseError(
+                        f"Cannot compare TIME literal with {right_temporal.upper()} field/value. "
+                        f"TIME and {right_temporal.upper()} are incompatible types for comparison. "
+                        f"TIME represents time-of-day without date context, while {right_temporal.upper()} "
+                        f"represents a calendar date or timestamp. Use compatible temporal types or "
+                        f"extract components explicitly."
+                    )
+                elif right_temporal == "time" and left_temporal in {"date", "datetime"}:
+                    raise FHIRPathParseError(
+                        f"Cannot compare {left_temporal.upper()} field/value with TIME literal. "
+                        f"{left_temporal.upper()} and TIME are incompatible types for comparison. "
+                        f"{left_temporal.upper()} represents a calendar date or timestamp, while TIME "
+                        f"represents time-of-day without date context. Use compatible temporal types or "
+                        f"extract components explicitly."
+                    )
+
+    def _get_temporal_type_of_operand(self, node: EnhancedASTNode) -> Optional[str]:
+        """
+        Determine the temporal type of an operand (literal or field).
+
+        This method checks:
+        1. If the operand is a temporal literal (time, date, datetime)
+        2. If the operand is a field reference, looks up its type from the type registry
+
+        Args:
+            node: AST node representing the operand
+
+        Returns:
+            "time", "date", "datetime", or None if not a temporal type
+        """
+        # First, check if it's a temporal literal
+        temporal_literal_type = self._find_temporal_literal_in_subtree(node)
+        if temporal_literal_type:
+            return temporal_literal_type
+
+        # Not a literal - check if it's a field reference with temporal type
+        # Extract the path from the node text (e.g., "Patient.birthDate")
+        path_text = node.text.strip() if hasattr(node, "text") and node.text else ""
+
+        # Try to extract field path (remove trailing whitespace)
+        if path_text and "." in path_text:
+            # Split into resource type and field path
+            # e.g., "Patient.birthDate" -> resource="Patient", field="birthDate"
+            parts = path_text.split(".")
+            if len(parts) >= 2:
+                resource_type = parts[0]
+                # Get the last field name (e.g., "birthDate" from "Patient.birthDate")
+                field_name = parts[-1]
+
+                # Look up the field type in the type registry
+                try:
+                    element_type = self._type_registry.get_element_type(resource_type, field_name)
+                    if element_type:
+                        # Map FHIR types to temporal categories
+                        element_type_lower = element_type.lower()
+                        if element_type_lower == "date":
+                            return "date"
+                        elif element_type_lower in {"datetime", "instant"}:
+                            return "datetime"
+                        elif element_type_lower == "time":
+                            return "time"
+                except Exception:
+                    # Type lookup failed - continue with other checks
+                    pass
+
+        return None
+
+    def _find_temporal_literal_in_subtree(self, node: EnhancedASTNode) -> Optional[str]:
+        """
+        Search a subtree for temporal literals and return the type.
+
+        Args:
+            node: Root node of the subtree to search
+
+        Returns:
+            "time", "date", "datetime", or None if no temporal literal found
+        """
+        # Check current node
+        temporal_type = self._get_temporal_literal_type(node)
+        if temporal_type:
+            return temporal_type
+
+        # Recursively check children
+        for child in node.children:
+            result = self._find_temporal_literal_in_subtree(child)
+            if result:
+                return result
+
+        return None
+
+    def _get_temporal_literal_type(self, node: EnhancedASTNode) -> Optional[str]:
+        """
+        Determine if a node represents a temporal literal and its type.
+
+        Args:
+            node: AST node to check
+
+        Returns:
+            "time", "date", "datetime", or None if not a temporal literal
+        """
+        # Get node text - check both direct text and child text for nested structures
+        text = node.text.strip() if hasattr(node, "text") and node.text else ""
+
+        if not text:
+            return None
+
+        # Check for temporal_info attribute (set by parser for temporal literals)
+        temporal_info = getattr(node, "temporal_info", None)
+        if temporal_info and "kind" in temporal_info:
+            kind = temporal_info["kind"]
+            if kind == "time":
+                return "time"
+            elif kind == "date":
+                return "date"
+            elif kind == "datetime":
+                return "datetime"
+
+        # Fallback: check text for temporal patterns
+        # TIME literals: @THH:MM:SS or @THH:MM
+        if text.startswith("@T"):
+            return "time"
+        # DATETIME literals: @YYYY-MM-DDTHH:MM:SS or contains T after @
+        elif text.startswith("@") and "T" in text and not text.startswith("@T"):
+            return "datetime"
+        # DATE literals: @YYYY-MM-DD or @YYYY-MM or @YYYY
+        elif text.startswith("@") and re.match(r'@\d{4}(-\d{2})?(-\d{2})?$', text):
+            return "date"
+
+        return None
 
     def _validate_unary_operators_on_literals(
         self,
