@@ -8286,6 +8286,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             Input: Procedure.performed as DateTime
             Output: SQL that casts Procedure.performed to datetime type
+
+        SP-107-001: Handles path navigation after .as() operation
         """
         # Type operation should have exactly one child (the expression to cast)
         # SP-104-002: Check for value_expression attribute (from parent InvocationExpression)
@@ -8326,6 +8328,62 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             child_node=child_node,
             fragment=fragment,
         )
+
+        # SP-107-001: Handle path navigation after .as() operation
+        # For expressions like "Observation.value.as(Quantity).unit", we need to:
+        # 1. Detect that there's a ".unit" after the .as() operation
+        # 2. Set up the polymorphic field mapping so subsequent field access uses the resolved field
+        if hasattr(node, 'enhanced_node') and node.enhanced_node.parent:
+            parent = node.enhanced_node.parent
+            # Check if parent's parent has more children (indicating additional navigation after .as())
+            if hasattr(parent, 'parent') and parent.parent:
+                grandparent = parent.parent
+                if hasattr(grandparent, 'children') and len(grandparent.children) >= 2:
+                    # The grandparent is the root invocation with the full expression
+                    # child[0] is the .as() invocation (or its parent), child[1]+ are subsequent navigations
+                    # Check if the first child is our parent (the .as() part)
+                    if grandparent.children[0] == parent and len(grandparent.children) > 1:
+                        next_child = grandparent.children[1]
+                        if hasattr(next_child, 'text') and next_child.text:
+                            # Extract the path from the next child
+                            path_after = next_child.text.lstrip('.')
+                            logger.debug(f"SP-107-001: Detected path after .as(): {path_after}")
+
+                            # Get the property name from the child node
+                            property_name = None
+                            if isinstance(child_node, IdentifierNode):
+                                identifier_value = child_node.identifier or child_node.text or ""
+                                if identifier_value:
+                                    property_name = identifier_value.split(".")[-1].strip("`")
+                            elif hasattr(child_node, 'text') and child_node.text:
+                                property_name = child_node.text.split(".")[-1].strip("`")
+
+                            # Check if it's a polymorphic property
+                            if property_name and is_polymorphic_property(property_name):
+                                # Resolve to type-specific field
+                                polymorphic_field = resolve_polymorphic_field_for_type(property_name, canonical_type)
+
+                                if polymorphic_field:
+                                    logger.debug(
+                                        f"SP-107-001: Setting up polymorphic mapping for .as(): {property_name} -> {polymorphic_field}"
+                                    )
+
+                                    # Set up the mapping for subsequent navigation
+                                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                                        self.context.polymorphic_field_mappings = {}
+                                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+
+                                    # Update parent_path to include the resolved field and subsequent path
+                                    self.context.push_path(polymorphic_field)
+                                    if path_after:
+                                        # Split by dots in case there are multiple levels
+                                        after_components = path_after.split('.')
+                                        for component in after_components:
+                                            self.context.push_path(component)
+
+                                    logger.debug(
+                                        f"SP-107-001: Updated parent_path after .as(): {self.context.parent_path}"
+                                    )
 
         logger.debug(
             "Generated as() SQL for type '%s': %s",
@@ -9225,6 +9283,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Returns:
             SQLFragment containing type casting SQL
         """
+        # SP-107-001: Debug logging
+        print(f"DEBUG SP-107: _translate_as_from_function_call called")
+        print(f"  node.text: {node.text}")
+        print(f"  node.function_name: {node.function_name}")
+
         # Validate argument count
         if not node.arguments or len(node.arguments) == 0:
             raise ValueError(f"as() requires exactly 1 argument, got {len(node.arguments) if node.arguments else 0}")
@@ -9236,25 +9299,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         path_expr = self._extract_path_before_function(node.text, node.function_name)
 
         # ALSO extract any path AFTER .as() - e.g., ".unit" in "value.as(Quantity).unit"
-        # Find the closing paren of .as(...) and get everything after it
+        # SP-107-001: Check parent and grandparent nodes for additional path navigation
+        # The AST structure for "Observation.value.as(Quantity).unit" is:
+        #   - Root: InvocationExpression with text="Observation.value.as(Quantity).unit"
+        #     - child[0]: InvocationExpression with text="Observation.value.as(Quantity)"
+        #       - child[0]: "Observation.value"
+        #       - child[1]: as() function call (current node)
+        #     - child[1]: ".unit" (this is what we need to find)
         path_after = None
-        if node.text and '.as(' in node.text:
-            # Find the .as( and then find the matching closing paren
-            as_start = node.text.find('.as(')
-            if as_start >= 0:
-                # Find closing paren
-                paren_count = 1
-                i = as_start + 4  # Start after '.as('
-                while i < len(node.text) and paren_count > 0:
-                    if node.text[i] == '(':
-                        paren_count += 1
-                    elif node.text[i] == ')':
-                        paren_count -= 1
-                    i += 1
-                # i now points after the closing paren
-                if i < len(node.text) and node.text[i] == '.':
-                    path_after = node.text[i+1:]  # Get everything after the dot
-                    logger.debug(f"Extracted path after .as(): {path_after}")
+        if hasattr(node, 'parent') and node.parent:
+            # Check if parent's parent has more children (indicating additional navigation)
+            grandparent = node.parent.parent if hasattr(node.parent, 'parent') else None
+            if grandparent and hasattr(grandparent, 'children') and len(grandparent.children) >= 2:
+                # The second child of grandparent should be the path after .as()
+                # child[0] is the .as() invocation, child[1]+ are subsequent navigations
+                parent_invocation = node.parent  # This is "Observation.value.as(Quantity)"
+                if grandparent.children[0] == parent_invocation and len(grandparent.children) > 1:
+                    # There's a child after the .as() invocation
+                    next_child = grandparent.children[1]
+                    # Extract the path from the next child's text
+                    if hasattr(next_child, 'text') and next_child.text:
+                        # Remove leading dot if present
+                        path_after = next_child.text.lstrip('.')
+                        logger.debug(f"SP-107-001: Extracted path after .as() from parent: {path_after}")
 
         # POLYMORPHIC PROPERTY HANDLING FOR .as():
         # Check if path ends with a polymorphic property (e.g., "Observation.value")
@@ -9333,6 +9400,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         canonical_type=canonical_type,
                         type_metadata=type_metadata,
                         original_expression=node.text,
+                    )
+
+                    # SP-107-001: Set up polymorphic field mapping for subsequent navigation
+                    # When .as() resolves a polymorphic property (e.g., "value" -> "valueQuantity"),
+                    # subsequent field accesses need to use the resolved field.
+                    # For example: "Observation.value.as(Quantity).unit" should access "valueQuantity.unit"
+                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                        self.context.polymorphic_field_mappings = {}
+                    self.context.polymorphic_field_mappings[last_component] = polymorphic_field
+
+                    # Update parent_path to include the resolved polymorphic field
+                    # This ensures subsequent field navigation (e.g., .unit) uses the correct path
+                    if path_after:
+                        # Split by dots in case there are multiple levels like ".unit.value"
+                        after_components = path_after.split('.')
+                        # Push the resolved polymorphic field first, then the components after .as()
+                        self.context.push_path(polymorphic_field)
+                        for component in after_components:
+                            self.context.push_path(component)
+                    else:
+                        # Just push the resolved polymorphic field
+                        self.context.push_path(polymorphic_field)
+
+                    logger.debug(
+                        f"SP-107-001: Set up polymorphic mapping for .as(): {last_component} -> {polymorphic_field}, parent_path={self.context.parent_path}"
                     )
 
                     return fragment
