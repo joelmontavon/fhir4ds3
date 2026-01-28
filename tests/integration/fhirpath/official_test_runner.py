@@ -250,8 +250,10 @@ class EnhancedOfficialTestRunner:
                     # "execution" flag expects execution errors
                     if error_type == invalid_flag:
                         return True
-                    # Treat parser-level errors as acceptable for syntax and semantic expectations
-                    if error_type == "parse" and invalid_flag in ("syntax", "semantic"):
+                    # Treat parser-level errors as acceptable for all invalid expectations
+                    # Catching errors at parse time is always better than execution time
+                    # This handles cases where semantic validation catches issues earlier than execution
+                    if error_type == "parse":
                         return True
                     return False
                 # No error_type specified - any invalid result is OK

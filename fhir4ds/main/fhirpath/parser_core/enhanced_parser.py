@@ -346,8 +346,42 @@ class EnhancedFHIRPathParser:
     def _parse_with_fhirpathpy(self, expression: str) -> Optional[EnhancedASTNode]:
         """Parse using fhirpath-py library"""
         try:
+            import re
+
+            # SP-106-001: Fix DateTime literal T suffix parsing issue
+            # The ANTLR DATETIME lexer tokenizes @YYYYT as @YYYY + T (IDENTIFIER)
+            # We pre-process to replace @YYYYT with @YYYY, then restore the T in metadata
+            datetime_t_mapping = {}
+
+            def preprocess_datetime_t_suffix(expr: str) -> str:
+                """
+                Pre-process DateTime literals with T suffix
+
+                Replaces @YYYYT with @YYYY to avoid lexer tokenization issues
+                Stores the mapping to restore the T suffix later in metadata
+
+                Examples:
+                    @2015T.is(DateTime) -> @2015.is(DateTime)
+                    @2015-02T.is(DateTime) -> @2015-02.is(DateTime)
+                """
+                nonlocal datetime_t_mapping
+
+                # Pattern matches datetime literal with T suffix followed by . or (
+                pattern = r'(@\d{4}(?:-\d{2}(?:-\d{2})?)?)T(?=[.\(])'
+
+                def replace_func(match):
+                    original = match.group(0)  # Full match including T
+                    placeholder = match.group(1)  # Just the datetime without T
+                    datetime_t_mapping[placeholder] = original
+                    return placeholder
+
+                return re.sub(pattern, replace_func, expr)
+
+            # Pre-process the expression
+            processed_expression = preprocess_datetime_t_suffix(expression)
+
             # Parse with fhirpath-py
-            fhirpath_ast = fhirpath_parse(expression)
+            fhirpath_ast = fhirpath_parse(processed_expression)
 
             # Convert to enhanced AST
             if fhirpath_ast:
@@ -363,6 +397,12 @@ class EnhancedFHIRPathParser:
                         "Parser recovered from syntax error - expression is incomplete or invalid",
                         expression
                     )
+
+                # SP-106-001: Restore T suffix in metadata
+                # Store the mapping in the root metadata so the translator can access it
+                if datetime_t_mapping and hasattr(enhanced_ast, 'metadata') and enhanced_ast.metadata:
+                    if hasattr(enhanced_ast.metadata, 'custom_attributes'):
+                        enhanced_ast.metadata.custom_attributes['datetime_t_mapping'] = datetime_t_mapping
 
                 return enhanced_ast
             else:

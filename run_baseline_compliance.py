@@ -93,7 +93,7 @@ def main():
             cat = 'Comparison Operators'
         elif any(op in str(expr) for op in ['+', '-', '*', '/', 'mod', 'div']):
             cat = 'Arithmetic Operators'
-        elif any(fn in str(expr) for fn in ['substring', 'contains', 'matches', 'length']):
+        elif any(fn in str(expr) for fn in ['substring', 'contains', 'startsWith', 'endsWith', 'matches', 'length']):
             cat = 'String Functions'
         else:
             cat = 'Other'

@@ -45,6 +45,7 @@ from ..types import (
 from ..types.fhir_types import resolve_polymorphic_property, is_polymorphic_property, resolve_polymorphic_field_for_type
 from ..types.type_discriminators import get_type_discriminator
 from ..types.structure_loader import StructureDefinitionLoader
+from ..types.quantity_builder import build_quantity_json_string
 from pathlib import Path
 from .fragments import SQLFragment
 from .context import TranslationContext, VariableBinding
@@ -405,7 +406,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return False
 
-    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None) -> str:
+    def _generate_literal_type_check(self, expression: str, target_type: str, original_literal: Optional[str] = None, node: Optional[TypeOperationNode] = None) -> str:
         """Generate SQL type check for literal values.
 
         SP-022-003: This method generates simplified type checks for SQL literals
@@ -477,52 +478,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             duckdb_type, pg_type = temporal_types[normalized_type]
             if dialect_name == 'DUCKDB':
                 # SP-104-002: Check typeof() first for native types, then fallback to regex
-                # For temporal literals, we also need to handle the original_literal pattern
-                # because temporal literals like @2015 are stored as DATE '2015-01-01'
-                # The original_literal preserves the "@2015" pattern for partial date detection
+                # SP-106-001: Check T-suffix mapping for partial DateTimes
+                # The ANTLR lexer strips 'T' from @YYYYT, making it look like @YYYY (a Date).
+                # We use metadata to track the original form and restore correct type checking.
+                # Key rules:
+                # - @YYYY is Date (NOT DateTime)
+                # - @YYYYT is DateTime (NOT Date)
+                # - The .is() operator checks EXACT type, not type compatibility
                 if original_literal and original_literal.startswith('@'):
-                    # SP-104-006: Workaround for ANTLR lexer stripping 'T' suffix from partial DateTimes
-                    # If original_literal is @YYYY (Date pattern) but we're checking for DateTime,
-                    # it might have been @YYYYT originally. Check if expression is a TIMESTAMP type.
-                    # This handles cases like @2015T.is(DateTime) where lexer strips the T.
-                    if normalized_type == 'datetime':
-                        # Check if the SQL expression is a TIMESTAMP (would be generated from @YYYYT)
-                        # If so, the original was likely a partial DateTime, not a Date
-                        if f"TIMESTAMP '" in expression or "TIMESTAMP '" in str(expression):
-                            # This is a TIMESTAMP literal, so it's a DateTime type
-                            return "true"
-
-                    # Parse the temporal literal to determine its type
-                    parsed = self.temporal_parser.parse(original_literal)
-                    if parsed:
-                        # Check if the parsed type matches the target type
-                        parsed_type = parsed.temporal_type.lower()  # 'date', 'datetime', 'time'
-                        if parsed_type == normalized_type or (
-                            normalized_type == 'datetime' and parsed_type == 'instant'
-                        ):
-                            # Exact type match - return true
-                            return "true"
-                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
-                            # DateTime can match Date or Time in some contexts
-                            # This is per FHIRPath specification
-                            return "true"
+                    type_check = self._check_temporal_literal_type(original_literal, normalized_type, node)
+                    if type_check is not None:
+                        return type_check
 
                 # Default: Check typeof() for native SQL types
                 return (
                     f"typeof({expression}) = '{duckdb_type}'"
                 )
             else:  # PostgreSQL
-                # SP-104-002: Check pg_typeof() first for native types, also handle original_literal
+                # SP-106-001: Check T-suffix mapping for partial DateTimes
+                # Same logic as DuckDB - use shared helper method
                 if original_literal and original_literal.startswith('@'):
-                    parsed = self.temporal_parser.parse(original_literal)
-                    if parsed:
-                        parsed_type = parsed.temporal_type.lower()
-                        if parsed_type == normalized_type or (
-                            normalized_type == 'datetime' and parsed_type == 'instant'
-                        ):
-                            return "true"
-                        elif normalized_type == 'datetime' and parsed_type in ['date', 'time']:
-                            return "true"
+                    type_check = self._check_temporal_literal_type(original_literal, normalized_type, node)
+                    if type_check is not None:
+                        return type_check
+
                 return (
                     f"pg_typeof({expression})::text LIKE '{pg_type}%'"
                 )
@@ -563,6 +542,74 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """Check whether the canonical type represents a FHIR resource."""
         metadata = self._get_type_metadata(canonical_type)
         return bool(metadata.get("is_resource", False))
+
+    def _check_temporal_literal_type(self, original_literal: str, normalized_type: str, node: Optional[TypeOperationNode] = None) -> Optional[str]:
+        """Check if a temporal literal matches the target type.
+
+        This implements SP-106-001: Correct type checking for Date vs DateTime.
+        The ANTLR lexer strips 'T' from @YYYYT, making both @YYYY and @YYYYT
+        appear as @YYYY in original_literal. We use metadata tracking to restore
+        the original form and determine the correct type.
+
+        Type Rules:
+        - @YYYY (or @YYYY-MM-DD) is Date, NOT DateTime
+        - @YYYYT (or @YYYY-MM-DDT...) is DateTime, NOT Date
+        - The .is() operator checks EXACT type, not type compatibility
+
+        Args:
+            original_literal: The literal with @ prefix (e.g., '@2015', '@2015-02-03T')
+            normalized_type: The target type to check against ('date', 'datetime', 'time')
+
+        Returns:
+            "CASE WHEN TRUE THEN TRUE ELSE FALSE END" if type matches
+            "CASE WHEN FALSE THEN TRUE ELSE FALSE END" if type doesn't match
+            None if cannot determine from literal (should fall back to typeof check)
+        """
+        # Step 1: Check datetime_t_mapping for T-suffix restoration
+        # This tracks literals that were originally @YYYYT but lexer made them @YYYY
+        datetime_t_mapping = None
+        if node:
+            try:
+                # The node might be an adapter with an enhanced_node attribute
+                root_node = None
+                if hasattr(node, 'get_root'):
+                    root_node = node.get_root()
+                elif hasattr(node, 'enhanced_node') and hasattr(node.enhanced_node, 'get_root'):
+                    root_node = node.enhanced_node.get_root()
+
+                if root_node and hasattr(root_node, 'metadata') and root_node.metadata:
+                    if hasattr(root_node.metadata, 'custom_attributes'):
+                        datetime_t_mapping = root_node.metadata.custom_attributes.get('datetime_t_mapping')
+            except Exception:
+                pass  # If we can't get root, fall back to literal parsing
+
+        # Step 2: If checking for DateTime and literal was originally @YYYYT, it's a match
+        if normalized_type == 'datetime' and datetime_t_mapping and original_literal in datetime_t_mapping:
+            return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+        # Step 3: Parse the temporal literal to determine its actual type
+        parsed = self.temporal_parser.parse(original_literal)
+        if parsed:
+            parsed_type = parsed.temporal_type.lower()  # 'date', 'datetime', 'time', 'instant'
+
+            # Exact type match (including instant -> datetime mapping)
+            if parsed_type == normalized_type:
+                return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+            # FHIRPath treats 'instant' as a subtype of 'datetime' for .is() checks
+            if normalized_type == 'datetime' and parsed_type == 'instant':
+                return "CASE WHEN TRUE THEN TRUE ELSE FALSE END"
+
+            # Explicitly NOT treating Date as DateTime - they are distinct types
+            # This is the key fix for SP-106-001
+            if normalized_type == 'datetime' and parsed_type == 'date':
+                return "CASE WHEN FALSE THEN TRUE ELSE FALSE END"
+
+            if normalized_type == 'date' and parsed_type == 'datetime':
+                return "CASE WHEN FALSE THEN TRUE ELSE FALSE END"
+
+        # Step 4: Cannot determine from literal - let caller fall back to typeof check
+        return None
 
     def _should_accumulate_as_separate_fragment(self, node: FHIRPathASTNode) -> bool:
         """Determine if a node should generate a separate fragment in the chain.
@@ -781,40 +828,43 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         target_ast = self._parse_function_target_ast(node)
 
-        if target_ast is None:
-            # SP-022-015: Check for pending fragment result FIRST from invocation chain
-            # This handles expressions like (1|2|3).aggregate() where the union result
-            # is a complete expression that should take priority over pending_literal_value.
-            # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
-            if self.context.pending_fragment_result is not None:
-                target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
-                # If the pending fragment is from a multi-item collection, this is an error for iif()
-                # We need to pass this information to the caller
-                # Store this in a temporary attribute for _translate_iif to check
-                self._pending_target_is_multi_item = is_multi_item_collection
-                # Clear both pending values after consuming (fragment result takes priority)
-                self.context.pending_fragment_result = None
-                self.context.pending_literal_value = None
-            # SP-022-009: Check for pending literal value from invocation chain
-            # This handles expressions like 1.convertsToInteger() where the literal
-            # was visited in visit_generic before this function call
-            elif self.context.pending_literal_value is not None:
-                literal_value, target_expression = self.context.pending_literal_value
-                # Clear the pending value after consuming it
-                self.context.pending_literal_value = None
+        # SP-106-003: Check for pending literal value FIRST, before checking target_ast
+        # This handles expressions like "10 'mg'.convertsToQuantity()" where the literal
+        # is visited as part of the target_ast, and we need to capture the pending_literal_value
+        # that was set during the visit.
+        # SP-022-015: Check for pending fragment result FIRST from invocation chain
+        # This handles expressions like (1|2|3).aggregate() where the union result
+        # is a complete expression that should take priority over pending_literal_value.
+        # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
+        if self.context.pending_fragment_result is not None:
+            target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
+            # If the pending fragment is from a multi-item collection, this is an error for iif()
+            # We need to pass this information to the caller
+            # Store this in a temporary attribute for _translate_iif to check
+            self._pending_target_is_multi_item = is_multi_item_collection
+            # Clear both pending values after consuming (fragment result takes priority)
+            self.context.pending_fragment_result = None
+            self.context.pending_literal_value = None
+        # SP-022-009: Check for pending literal value from invocation chain
+        # This handles expressions like 1.convertsToInteger() where the literal
+        # was visited in visit_generic before this function call
+        elif self.context.pending_literal_value is not None:
+            literal_value, target_expression = self.context.pending_literal_value
+            # Clear the pending value after consuming it
+            self.context.pending_literal_value = None
+        elif target_ast is None:
+            # No explicit path provided; rely on current context
+            json_path = self.context.get_json_path()
+            if json_path and json_path != "$":
+                target_expression = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=json_path
+                )
+                # SP-101-002: Set target_path from current context when using context path
+                # This allows first(), last(), etc. to work on the current path
+                target_path = self.context.parent_path.copy()
             else:
-                # No explicit path provided; rely on current context
-                json_path = self.context.get_json_path()
-                if json_path and json_path != "$":
-                    target_expression = self.dialect.extract_json_field(
-                        column=self.context.current_table,
-                        path=json_path
-                    )
-                    # SP-101-002: Set target_path from current context when using context path
-                    # This allows first(), last(), etc. to work on the current path
-                    target_path = self.context.parent_path.copy()
-                else:
-                    target_expression = self.context.current_table
+                target_expression = self.context.current_table
         elif isinstance(target_ast, LiteralNode):
             # Literal expressions can be evaluated directly
             literal_value = target_ast.value
@@ -1129,6 +1179,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             True
         """
         logger.debug(f"Translating literal: type={node.literal_type}, value={node.value}, text={node.text}")
+
+        # SP-106-003: Check for quantity literals that weren't properly identified by parser
+        # The parser may treat quantity literals (e.g., "10 'mg'") as string literals
+        # We detect them here and handle them appropriately
+        if node.literal_type == "string" and node.text:
+            quantity_info = self._extract_quantity_from_text(node.text)
+            if quantity_info:
+                # This is actually a quantity literal - handle it as such
+                return self._handle_quantity_literal(node, quantity_info)
 
         # SP-100-003: Check for empty collection literal before type-based handling
         if self._is_empty_collection_literal(node):
@@ -2071,7 +2130,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # of toInteger() needs to flow to the subsequent empty() function call
                     # SP-100-002: Only set pending values for non-function-call children
                     # Function calls should consume pending values, not overwrite them
-                    if not hasattr(child, 'node_type') or child.node_type not in ('function_call', 'functionCall'):
+                    # SP-106-003: Don't set pending_fragment_result for quantity literals - they use pending_literal_value instead
+                    if (not hasattr(child, 'node_type') or child.node_type not in ('function_call', 'functionCall')) and \
+                       fragment.metadata.get('literal_type') != 'quantity':
                         # SP-100-002: Check if this child is a multi-item collection (e.g., union operator)
                         is_multi_item = self._is_multi_item_collection(child)
                         # Store as tuple (expression, parent_path, is_multi_item) for cardinality validation
@@ -2684,6 +2745,109 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """Match quantity literal pattern."""
         pattern = r"\s*(-?\d+(?:\.\d+)?)\s*'([^']+)'\s*"
         return re.fullmatch(pattern, value or "")
+
+    def _extract_quantity_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract quantity information from text that may represent a quantity literal.
+
+        SP-106-003: Detect quantity literals that were not properly identified by the parser.
+        The parser treats expressions like "10 'mg'" as string literals, but we can
+        detect the pattern and extract the quantity value and unit.
+
+        Args:
+            text: The text representation of the literal (e.g., "10'mg'", "10.5 'kg'")
+
+        Returns:
+            Dictionary with 'value' (Decimal) and 'unit' (str) if text matches quantity pattern,
+            None otherwise
+
+        Example:
+            >>> self._extract_quantity_from_text("10'mg'")
+            {'value': Decimal('10'), 'unit': 'mg'}
+            >>> self._extract_quantity_from_text("10.5 'kg'")
+            {'value': Decimal('10.5'), 'unit': 'kg'}
+        """
+        if not text:
+            return None
+
+        # Try to match the quantity pattern: NUMBER 'UNIT'
+        # The parser may remove spaces, so we handle both "10'mg'" and "10 'mg'"
+        match = self._match_quantity_literal(text)
+        if match:
+            try:
+                value_str = match.group(1)
+                unit = match.group(2)
+                return {
+                    'value': Decimal(value_str),
+                    'unit': unit
+                }
+            except (ValueError, InvalidOperation):
+                return None
+
+        return None
+
+    def _handle_quantity_literal(self, node: LiteralNode, quantity_info: Dict[str, Any]) -> SQLFragment:
+        """Handle a quantity literal by generating proper FHIR Quantity JSON structure.
+
+        SP-106-003: Generate SQL that creates a FHIR Quantity JSON object for literals
+        like "10 'mg'". This enables proper type checking and comparison operations.
+
+        Delegates to FHIR-specific business logic layer (quantity_builder) to maintain
+        thin dialect principle - the translator contains only syntax translation logic.
+
+        Args:
+            node: The literal node (still has literal_type="string" from parser)
+            quantity_info: Dict with 'value' (Decimal) and 'unit' (str)
+
+        Returns:
+            SQLFragment with the quantity represented as JSON
+
+        Example:
+            >>> # For "10 'mg'"
+            >>> fragment = self._handle_quantity_literal(node, {'value': Decimal('10'), 'unit': 'mg'})
+            >>> fragment.expression
+            '{"value": 10, "unit": "mg", "system": "http://unitsofmeasure.org", "code": "mg"}'
+        """
+        value = quantity_info['value']
+        unit = quantity_info['unit']
+
+        # Generate FHIR Quantity JSON structure using FHIR-specific business logic
+        # This ensures the translator remains "thin" - only syntax translation, no FHIR rules
+        quantity_json_str = build_quantity_json_string(value, unit)
+
+        # Convert to SQL expression
+        sql_expr = f"'{quantity_json_str}'"
+
+        # Store quantity info in context for function calls like convertsToQuantity()
+        # SP-106-003: Store a special marker to indicate this is a quantity literal
+        # This allows convertsToQuantity() to recognize it and return TRUE
+        class QuantityLiteralMarker:
+            def __init__(self, value, unit):
+                self.value = value
+                self.unit = unit
+                self.is_quantity_literal = True
+
+        self.context.pending_literal_value = (QuantityLiteralMarker(value, unit), sql_expr)
+
+        # Create metadata with quantity information
+        fragment_metadata = {
+            'literal_type': 'quantity',
+            'is_literal': True,
+            'quantity_value': str(value),
+            'quantity_unit': unit
+        }
+        if node.text:
+            fragment_metadata['source_text'] = node.text
+            fragment_metadata['text'] = node.text
+
+        logger.debug(f"Generated quantity literal SQL: {sql_expr}")
+
+        return SQLFragment(
+            expression=sql_expr,
+            source_table=self.context.current_table,
+            requires_unnest=False,
+            is_aggregate=False,
+            metadata=fragment_metadata
+        )
 
     def _build_implies_sql(
         self,
@@ -6591,6 +6755,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         if target_type == "Quantity":
             # SP-103-003: Implement Quantity type conversion
+            # SP-106-003: Quantity literals (e.g., "10 'mg'") are marked with QuantityLiteralMarker
             # According to FHIRPath spec, the following can convert to Quantity:
             # - Integer literals (e.g., 1, 5, 10)
             # - Decimal literals (e.g., 1.0, 5.5, 10.25)
@@ -6598,6 +6763,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # - String representations of integers (e.g., '1', '5')
             # - String representations of decimals (e.g., '1.0', '5.5')
             # - String representations of quantities (e.g., '1 day', '4 days', '1 \'wk\'')
+
+            # SP-106-003: Check for quantity literal marker first
+            if hasattr(value, 'is_quantity_literal') and value.is_quantity_literal:
+                return True
 
             if isinstance(value, bool):
                 # Booleans can convert to Quantity (true -> 1.0, false -> 0.0)
@@ -7547,13 +7716,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalize_superset=not right_is_cte_ref
             )
 
+            # SP-106: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when subsetOf() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=subset_expr, source_table=source_table),
+                right_fragment
+            )
+
             return SQLFragment(
                 expression=subset_check_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "subsetOf", "result_type": "boolean"}
+                metadata={"function": "subsetOf", "result_type": "boolean"},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -7653,13 +7831,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 normalize_superset=not left_is_cte_ref
             )
 
+            # SP-106: Extract columns that need to be preserved through CTEs
+            # This fixes "column not found" errors when supersetOf() references columns
+            # from previous CTEs (e.g., name_item, given_item)
+            preserved_columns = self._extract_preserved_columns(
+                SQLFragment(expression=normalized_left, source_table=source_table),
+                right_fragment
+            )
+
             return SQLFragment(
                 expression=superset_check_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "supersetOf", "result_type": "boolean"}
+                metadata={"function": "supersetOf", "result_type": "boolean"},
+                preserved_columns=preserved_columns
             )
         finally:
             self._restore_context(snapshot)
@@ -8037,7 +8224,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             type_check_sql = self._generate_literal_type_check(
                 expr_fragment.expression,
                 canonical_type,
-                original_literal
+                original_literal,
+                node  # Pass node for metadata access
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -8072,7 +8260,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             source_table=expr_fragment.source_table,
             requires_unnest=False,  # Type check returns boolean, not collection
             is_aggregate=False,  # Type check is scalar operation
-            dependencies=expr_fragment.dependencies
+            dependencies=expr_fragment.dependencies,
+            metadata={"function": "is", "result_type": "boolean"}
         )
 
     def _translate_as_operation(self, node: TypeOperationNode) -> SQLFragment:
@@ -9587,10 +9776,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         old_pending = self.context.pending_fragment_result
         self.context.pending_fragment_result = None
 
+        # SP-106-002: Store the old current_table and current_element_column to restore later
+        # This ensures that nested expressions like $this.length() use the correct context
+        old_current_table = self.context.current_table
+        old_current_element_column = self.context.current_element_column
+
+        # Set current_table to result_col so that $this references are resolved correctly
+        self.context.current_table = result_col
+        self.context.current_element_column = None
+
         with self._variable_scope({
             "$this": VariableBinding(
                 expression=this_expression,
-                source_table=source_table
+                source_table=result_col,  # Use result_col as source_table for correct scoping
+                requires_unnest=False,
+                is_aggregate=False
             )
         }):
             # Translate the filter condition argument
@@ -9598,6 +9798,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # SP-102-001: Restore pending_fragment_result after lambda scope exits
         self.context.pending_fragment_result = old_pending
+
+        # SP-106-002: Restore the old current_table and current_element_column
+        self.context.current_table = old_current_table
+        self.context.current_element_column = old_current_element_column
 
         # SP-022-012: Remove any intermediate fragments that were added during
         # condition translation. The condition expression is self-contained.

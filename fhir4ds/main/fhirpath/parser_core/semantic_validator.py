@@ -134,6 +134,7 @@ class SemanticValidator:
         self._validate_choice_aliases(collapsed)
         self._validate_identifier_suffixes(raw_expression)
         self._validate_period_property_access(collapsed)
+        self._validate_time_literal_timezones(raw_expression)
 
         masked_expression = self._mask_expression(raw_expression or "")
         masked_with_backticks = self._mask_expression(raw_expression or "", preserve_backticks=True)
@@ -190,9 +191,17 @@ class SemanticValidator:
             )
 
     def _validate_choice_aliases(self, collapsed_expression: str) -> None:
-        """Disallow direct access to [x] choice aliases such as valueQuantity."""
+        """Disallow direct access to [x] choice aliases such as valueQuantity.
+
+        SP-106-001: Allow generic '.value' access (choice field) while blocking
+        specific aliases like '.valueQuantity'. The FHIRPath specification supports
+        accessing choice fields directly (e.g., Observation.value), but requires
+        type functions for specific type access (e.g., value.as(Quantity)).
+        """
         for suffix in self._choice_type_suffixes:
             alias = self._alias_pattern_template.format(suffix=suffix)
+            # Only block if the specific alias appears (e.g., .valueQuantity)
+            # Allow generic .value (choice field without type suffix)
             if alias in collapsed_expression:
                 raise FHIRPathParseError(
                     f"Direct access to choice-type alias '{alias.lstrip('.')}' is not "
@@ -578,6 +587,11 @@ class SemanticValidator:
                 path = match.group(1)
                 # Avoid re-validating absolute paths that start with uppercase identifiers
                 if path and path[0].isupper():
+                    continue
+                # SP-106: Skip validation for variable references ($this, $variable)
+                # Variables are not part of the resource type schema
+                # Check original expression at match position for $ prefix (regex \b excludes it)
+                if masked_expression[match.start()-1:match.start()] == '$':
                     continue
                 self._validate_path_segments(
                     expression,
