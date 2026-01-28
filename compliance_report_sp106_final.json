@@ -1,0 +1,208 @@
+{
+  "total_tests": 934,
+  "passed_tests": 547,
+  "failed_tests": 387,
+  "compliance_percentage": 58.565310492505354,
+  "execution_time_total_ms": 319054.1317462921,
+  "execution_time_average_ms": 341.5664753515664,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-27T16:39:24.286556",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 30,
+      "failed": 42
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 53,
+      "failed": 63
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 64,
+      "failed": 77
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 62,
+      "failed": 51
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 238,
+      "failed": 100
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 19,
+      "failed": 9
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.017642974853515625,
+    "max_execution_time_ms": 638.22340965271,
+    "median_execution_time_ms": 396.95489406585693,
+    "std_dev_execution_time_ms": 158.7486740302858
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testPolymorphismAsA",
+      "expression": "Observation.value.as(Quantity).unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 375.0722408294678,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testPolarityPrecedence",
+      "expression": "-Patient.name.given.count() = -5",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 357.7075004577637,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "testLiteralIntegerGreaterThan",
+      "expression": "Patient.name.given.count() > -3",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 444.83137130737305,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          5
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqual",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 363.6434078216553,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqualTimezoneOffsetBefore",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00-10:00",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 379.32324409484863,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqualTimezoneOffsetAfter",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00+10:00",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 354.8779487609863,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqualUTC",
+      "expression": "Patient.birthDate != @1974-12-25T12:34:00Z",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 347.14818000793457,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testDateNotEqualTimeSecond",
+      "expression": "Patient.birthDate != @T12:14:15",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 338.9401435852051,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testDateNotEqualTimeMinute",
+      "expression": "Patient.birthDate != @T12:14",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 401.6132354736328,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Conversion Error: Unimplemented type for cast (TIME -> TIMESTAMP)",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testDateTimeGreaterThanDate2",
+      "expression": "now() > today()",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 346.99368476867676,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    }
+  ]
+}

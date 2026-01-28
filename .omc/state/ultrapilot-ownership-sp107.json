@@ -1,0 +1,90 @@
+{
+  "sessionId": "ultrapilot-sp107-20260127",
+  "sprint": "SP-107",
+  "workers": {
+    "worker-phase1": {
+      "description": "Phase 1: P0 Quick Wins",
+      "ownedCategories": [
+        "path_navigation",
+        "datetime_functions",
+        "boolean_logic"
+      ],
+      "ownedTestPatterns": [
+        "*path*",
+        "*navigation*",
+        "*datetime*",
+        "*time*",
+        "*boolean*",
+        "*logic*",
+        "*and*",
+        "*or*",
+        "*not*"
+      ],
+      "boundaryImports": [
+        "semantic_validator",
+        "translator",
+        "executor"
+      ]
+    },
+    "worker-phase2": {
+      "description": "Phase 2: Math Functions",
+      "ownedCategories": [
+        "math_functions"
+      ],
+      "ownedTestPatterns": [
+        "*math*",
+        "*abs*",
+        "*ceil*",
+        "*floor*",
+        "*exp*",
+        "*log*",
+        "*ln*",
+        "*pow*",
+        "*sqrt*",
+        "*truncate*"
+      ],
+      "boundaryImports": [
+        "semantic_validator",
+        "translator",
+        "executor"
+      ]
+    },
+    "worker-phase3": {
+      "description": "Phase 3: String and Comparison Quick Wins",
+      "ownedCategories": [
+        "string_functions",
+        "comparison_operators"
+      ],
+      "ownedTestPatterns": [
+        "*string*",
+        "*substring*",
+        "*indexOf*",
+        "*length*",
+        "*lower*",
+        "*upper*",
+        "*replace*",
+        "*matches*",
+        "*comparison*",
+        "*equal*",
+        "*inequal*",
+        "*less*",
+        "*greater*",
+        "*contains*"
+      ],
+      "boundaryImports": [
+        "semantic_validator",
+        "translator",
+        "executor"
+      ]
+    }
+  },
+  "sharedFiles": [
+    "fhir4ds/main/fhirpath/parser_core/semantic_validator.py",
+    "fhir4ds/main/fhirpath/sql/translator.py",
+    "fhir4ds/main/fhirpath/executor/executor.py",
+    "fhir4ds/main/dialects/base.py",
+    "fhir4ds/main/dialects/duckdb.py",
+    "fhir4ds/main/dialects/postgresql.py"
+  ],
+  "conflictPolicy": "coordinator-handles"
+}

@@ -1,0 +1,208 @@
+{
+  "total_tests": 934,
+  "passed_tests": 536,
+  "failed_tests": 398,
+  "compliance_percentage": 57.38758029978587,
+  "execution_time_total_ms": 335789.0133857727,
+  "execution_time_average_ms": 359.48275524237425,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-27T15:47:31.667042",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 30,
+      "failed": 42
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 48,
+      "failed": 68
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 64,
+      "failed": 77
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 60,
+      "failed": 53
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 234,
+      "failed": 104
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 19,
+      "failed": 9
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.014543533325195312,
+    "max_execution_time_ms": 727.3831367492676,
+    "median_execution_time_ms": 417.02187061309814,
+    "std_dev_execution_time_ms": 166.31799857566935
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testPolymorphismAsA",
+      "expression": "Observation.value.as(Quantity).unit",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 380.0532817840576,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testLiteralDateTimeYear",
+      "expression": "@2015T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 429.9159049987793,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-01-01T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeMonth",
+      "expression": "@2015-02T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 435.4875087738037,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-02-01T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeDay",
+      "expression": "@2015-02-04T.is(DateTime)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 413.13838958740234,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          "2015-02-04T00:00:00"
+        ]
+      }
+    },
+    {
+      "name": "testLiteralTimeUTC",
+      "expression": "@T14:34:28Z.is(Time)",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 401.5471935272217,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralTimeTimezoneOffset",
+      "expression": "@T14:34:28+10:00.is(Time)",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 383.32462310791016,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralQuantityDecimal",
+      "expression": "10.1 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 394.84500885009766,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralQuantityInteger",
+      "expression": "10 'mg'.convertsToQuantity()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 392.1036720275879,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testPolarityPrecedence",
+      "expression": "-Patient.name.given.count() = -5",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 399.9364376068115,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "testLiteralIntegerGreaterThan",
+      "expression": "Patient.name.given.count() > -3",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 407.6113700866699,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          5
+        ]
+      }
+    }
+  ]
+}

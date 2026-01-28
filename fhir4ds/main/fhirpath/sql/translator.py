@@ -2900,9 +2900,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # {} implies false -> {} (propagate empty)
                 return "NULL"
             else:
-                # {} implies true -> true (empty antecedent is true)
-                # Also handles {} implies (non-false expression) -> (NOT NULL) OR expr -> expr
-                return right_sql
+                # {} implies true -> (NOT left) OR right
+                # Empty antecedent is treated as true, but we generate the full expression
+                # to properly demonstrate empty collection handling in SQL
+                not_left = self.dialect.generate_boolean_not(left_sql)
+                return f"({not_left}) OR ({right_sql})"
         elif left_is_true_literal and right_is_empty:
             # true implies {} -> {} (propagate empty)
             return "NULL"
@@ -4949,7 +4951,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return format(amount, "f").rstrip("0").rstrip(".")
 
     def _translate_temporal_literal_comparison_if_applicable(self, node: OperatorNode) -> Optional[SQLFragment]:
-        """Translate temporal literal comparisons that require precision-aware semantics."""
+        """Translate temporal literal comparisons that require precision-aware semantics.
+
+        This handles comparisons involving:
+        1. Temporal literals with reduced precision (e.g., @2018-03, @T10:30)
+        2. Field references to temporal types (e.g., Patient.birthDate which is a date)
+
+        For field references, we visit the node to get the SQL expression and use it
+        directly in comparisons, rather than trying to convert to a literal.
+        """
         if len(node.children) != 2:
             return None
 
@@ -4960,20 +4970,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return None
 
         # Only apply range-based semantics when at least one operand has reduced precision
+        # Field references always have implicit precision (e.g., birthDate has day precision)
         if not (left_info.get("is_partial") or right_info.get("is_partial")):
             return None
 
         operator = (node.operator or "").strip()
-        conditions = self._build_temporal_conditions(left_info, right_info, operator)
+        conditions = self._build_temporal_conditions(
+            left_info, right_info, operator,
+            node.children[0], node.children[1]
+        )
         if conditions is None:
             return None
 
         true_condition, false_condition = conditions
 
+        # Use existential semantics for ALL comparison operators:
+        # - When the comparison is true, return TRUE
+        # - When the comparison is false, return NULL (empty result)
+        # This filters out non-matching rows from the result set
         sql_expr = (
             "CASE "
             f"WHEN {true_condition} THEN TRUE "
-            f"WHEN {false_condition} THEN FALSE "
             "ELSE NULL "
             "END"
         )
@@ -4988,11 +5005,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
     def _extract_temporal_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
         """Extract temporal metadata from AST node if available.
 
-        This method handles both:
+        This method handles:
         1. Nodes that have already been visited and have temporal_info attribute
-        2. Raw AST nodes that need temporal info parsed from their text
+        2. Raw AST nodes that need temporal info parsed from their text (literals)
+        3. Field references that resolve to temporal types (date, dateTime, time)
 
-        For raw nodes, we traverse to find the actual literal and parse its temporal info.
+        For field references, we resolve the element type to determine if it's a temporal field.
         """
         # First, check if temporal_info is already set (visited node)
         temporal_info = getattr(node, "temporal_info", None)
@@ -5013,6 +5031,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             text = literal_node.text
             if text and text.startswith('@'):
                 return self._parse_temporal_literal_from_text(text)
+
+        # Check if this is a field reference that resolves to a temporal type
+        # This handles cases like Patient.birthDate where birthDate is a date field
+        temporal_field_info = self._extract_temporal_field_info(node)
+        if temporal_field_info:
+            return temporal_field_info
 
         return None
 
@@ -5035,6 +5059,76 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # Multiple children - not a simple literal wrapper
         return None
+
+    def _extract_temporal_field_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
+        """Extract temporal metadata from a field reference node.
+
+        This handles cases where the node is a field reference (not a literal) that
+        resolves to a temporal type like date, dateTime, or time.
+
+        For example: Patient.birthDate resolves to a 'date' type, which has day precision.
+
+        Args:
+            node: AST node representing a field reference
+
+        Returns:
+            Dict with temporal info including kind, precision, start, end, is_partial
+            or None if not a temporal field reference
+        """
+        from ..types.element_type_resolver import resolve_element_type
+
+        # Check if this is an InvocationExpression (field reference)
+        node_type = getattr(node, 'node_type', '')
+        if node_type != 'InvocationExpression':
+            return None
+
+        # Get the field name from the invocation
+        # For Patient.birthDate, we need to extract "birthDate"
+        text = getattr(node, 'text', '')
+        if not text or '.' not in text:
+            return None
+
+        # Split the path to get the field name
+        parts = text.split('.')
+        if len(parts) < 2:
+            return None
+
+        field_name = parts[-1]  # Last part is the field name
+        resource_type = self.resource_type  # Current resource type being queried
+
+        # Resolve the element type
+        element_type = resolve_element_type(resource_type, field_name)
+        if not element_type:
+            return None
+
+        # Map FHIR types to temporal kinds and precisions
+        temporal_type_map = {
+            'date': ('date', 'day'),
+            'dateTime': ('datetime', 'second'),
+            'time': ('time', 'second'),
+            'instant': ('datetime', 'subsecond'),
+        }
+
+        type_info = temporal_type_map.get(element_type)
+        if not type_info:
+            return None
+
+        kind, precision = type_info
+
+        # For field references, we don't have a specific value, so we can't create
+        # start/end boundaries. Instead, we indicate the field's temporal type
+        # so the comparison logic knows how to handle it.
+        # The is_partial flag is True because field references have implicit precision
+        # (e.g., birthDate has day precision, not full timestamp precision)
+        return {
+            "kind": kind,
+            "precision": precision,
+            "is_partial": True,  # Field references have implicit precision
+            "is_field_reference": True,  # Flag to distinguish from literals
+            "field_type": element_type,
+            "field_name": field_name,
+            "original": text
+        }
 
     def _parse_temporal_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse FHIR temporal literal from text, returning metadata for range comparisons.
@@ -5262,7 +5356,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
     def _format_datetime_iso(self, dt: datetime) -> str:
         """Format datetime to ISO string for SQL."""
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return dt.isoformat()
 
     def _format_time_iso(self, dt: datetime) -> str:
         """Format time to ISO string for SQL."""
@@ -5272,11 +5366,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         self,
         left_info: Dict[str, Any],
         right_info: Dict[str, Any],
-        operator: str
+        operator: str,
+        left_node: Optional[FHIRPathASTNode] = None,
+        right_node: Optional[FHIRPathASTNode] = None
     ) -> Optional[tuple[str, str]]:
-        """Build true/false SQL conditions for temporal comparisons."""
-        left_range = self._temporal_range_to_sql(left_info)
-        right_range = self._temporal_range_to_sql(right_info)
+        """Build true/false SQL conditions for temporal comparisons.
+
+        Args:
+            left_info: Temporal metadata for left operand
+            right_info: Temporal metadata for right operand
+            operator: Comparison operator (<, <=, >, >=, =, !=)
+            left_node: Optional AST node for left operand (for field references)
+            right_node: Optional AST node for right operand (for field references)
+
+        Returns:
+            Tuple of (true_condition, false_condition) or None if not applicable
+
+        For field references, we visit the node to get the SQL expression.
+        For literals, we use the pre-computed start/end boundaries.
+        """
+        left_range = self._temporal_range_to_sql(left_info, left_node)
+        right_range = self._temporal_range_to_sql(right_info, right_node)
 
         if left_range is None or right_range is None:
             return None
@@ -5286,33 +5396,99 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         op = operator.strip()
         if op == "<":
+            # True if left is entirely before right (no overlap)
             conditions = (
                 f"({left_end} <= {right_start})",
                 f"({left_start} >= {right_end})"
             )
         elif op == "<=":
+            # True if left is before right OR overlaps with right
+            # In interval terms: left_end <= right_end (left ends before or at right's end)
             conditions = (
-                f"({left_end} <= {right_start})",
+                f"({left_end} <= {right_end})",
                 f"({left_start} > {right_end})"
             )
         elif op == ">":
+            # True if left is entirely after right (no overlap)
             conditions = (
                 f"({left_start} >= {right_end})",
                 f"({left_end} <= {right_start})"
             )
         elif op == ">=":
+            # True if left is after right OR overlaps with right
+            # In interval terms: left_start >= right_start (left starts after or at right's start)
             conditions = (
-                f"({left_start} >= {right_end})",
+                f"({left_start} >= {right_start})",
                 f"({left_end} < {right_start})"
             )
+        elif op == "=" or op == "!=":
+            # For equality/inequality, check if intervals overlap
+            # Intervals overlap if: left_start < right_end AND left_end > right_start
+            overlap_condition = f"({left_start} < {right_end} AND {left_end} > {right_start})"
+
+            if op == "=":
+                # Equal if intervals overlap (existential comparison)
+                conditions = (overlap_condition, f"NOT ({overlap_condition})")
+            else:  # !=
+                # Not equal if intervals do NOT overlap
+                conditions = (f"NOT ({overlap_condition})", overlap_condition)
         else:
             return None
 
         return conditions
 
-    def _temporal_range_to_sql(self, temporal_info: Dict[str, Any]) -> Optional[tuple[str, str]]:
-        """Convert temporal range start/end into SQL literal expressions."""
+    def _temporal_range_to_sql(
+        self,
+        temporal_info: Dict[str, Any],
+        node: Optional[FHIRPathASTNode] = None
+    ) -> Optional[tuple[str, str]]:
+        """Convert temporal range start/end into SQL literal expressions.
+
+        Args:
+            temporal_info: Temporal metadata with kind, precision, start, end, is_field_reference
+            node: Optional AST node (for field references that need to be visited)
+
+        Returns:
+            Tuple of (start_expr, end_expr) or None if not applicable
+
+        For field references (is_field_reference=True), we visit the node to get the SQL
+        expression and cast it appropriately. For literals, we use the pre-computed
+        start/end values directly.
+        """
         kind = temporal_info.get("kind")
+
+        # Check if this is a field reference
+        is_field_ref = temporal_info.get("is_field_reference", False)
+        if is_field_ref and node:
+            # Visit the node to get its SQL expression
+            # This handles cases like Patient.birthDate where we need the actual SQL
+            fragment = self.visit(node)
+
+            # For date fields, we need to handle the comparison carefully
+            # A date field like birthDate has day precision, so:
+            # - start: The date itself (at midnight)
+            # - end: The next day (exclusive)
+            if kind == "date":
+                # Cast to TIMESTAMP and use date truncation for proper comparison
+                # DATE '1974-12-25' should compare as TIMESTAMP '1974-12-25 00:00:00'
+                # to TIMESTAMP '1974-12-26 00:00:00'
+                start_expr = f"CAST({fragment.expression} AS TIMESTAMP)"
+                end_expr = f"CAST({fragment.expression} AS TIMESTAMP) + INTERVAL '1 day'"
+            elif kind == "datetime":
+                # For datetime fields, use the expression directly
+                # The field already has second precision
+                start_expr = fragment.expression
+                end_expr = f"({fragment.expression} + INTERVAL '1 second')"
+            elif kind == "time":
+                # For time fields, use the expression directly
+                start_expr = fragment.expression
+                end_expr = f"({fragment.expression} + INTERVAL '1 second')"
+            else:
+                return None
+
+            return start_expr, end_expr
+
+        # For literals, use the pre-computed start/end values
         start_value = temporal_info.get("start")
         end_value = temporal_info.get("end")
 
@@ -8286,6 +8462,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             Input: Procedure.performed as DateTime
             Output: SQL that casts Procedure.performed to datetime type
+
+        SP-107-001: Handles path navigation after .as() operation
         """
         # Type operation should have exactly one child (the expression to cast)
         # SP-104-002: Check for value_expression attribute (from parent InvocationExpression)
@@ -8326,6 +8504,62 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             child_node=child_node,
             fragment=fragment,
         )
+
+        # SP-107-001: Handle path navigation after .as() operation
+        # For expressions like "Observation.value.as(Quantity).unit", we need to:
+        # 1. Detect that there's a ".unit" after the .as() operation
+        # 2. Set up the polymorphic field mapping so subsequent field access uses the resolved field
+        if hasattr(node, 'enhanced_node') and node.enhanced_node.parent:
+            parent = node.enhanced_node.parent
+            # Check if parent's parent has more children (indicating additional navigation after .as())
+            if hasattr(parent, 'parent') and parent.parent:
+                grandparent = parent.parent
+                if hasattr(grandparent, 'children') and len(grandparent.children) >= 2:
+                    # The grandparent is the root invocation with the full expression
+                    # child[0] is the .as() invocation (or its parent), child[1]+ are subsequent navigations
+                    # Check if the first child is our parent (the .as() part)
+                    if grandparent.children[0] == parent and len(grandparent.children) > 1:
+                        next_child = grandparent.children[1]
+                        if hasattr(next_child, 'text') and next_child.text:
+                            # Extract the path from the next child
+                            path_after = next_child.text.lstrip('.')
+                            logger.debug(f"SP-107-001: Detected path after .as(): {path_after}")
+
+                            # Get the property name from the child node
+                            property_name = None
+                            if isinstance(child_node, IdentifierNode):
+                                identifier_value = child_node.identifier or child_node.text or ""
+                                if identifier_value:
+                                    property_name = identifier_value.split(".")[-1].strip("`")
+                            elif hasattr(child_node, 'text') and child_node.text:
+                                property_name = child_node.text.split(".")[-1].strip("`")
+
+                            # Check if it's a polymorphic property
+                            if property_name and is_polymorphic_property(property_name):
+                                # Resolve to type-specific field
+                                polymorphic_field = resolve_polymorphic_field_for_type(property_name, canonical_type)
+
+                                if polymorphic_field:
+                                    logger.debug(
+                                        f"SP-107-001: Setting up polymorphic mapping for .as(): {property_name} -> {polymorphic_field}"
+                                    )
+
+                                    # Set up the mapping for subsequent navigation
+                                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                                        self.context.polymorphic_field_mappings = {}
+                                    self.context.polymorphic_field_mappings[property_name] = polymorphic_field
+
+                                    # Update parent_path to include the resolved field and subsequent path
+                                    self.context.push_path(polymorphic_field)
+                                    if path_after:
+                                        # Split by dots in case there are multiple levels
+                                        after_components = path_after.split('.')
+                                        for component in after_components:
+                                            self.context.push_path(component)
+
+                                    logger.debug(
+                                        f"SP-107-001: Updated parent_path after .as(): {self.context.parent_path}"
+                                    )
 
         logger.debug(
             "Generated as() SQL for type '%s': %s",
@@ -9225,6 +9459,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Returns:
             SQLFragment containing type casting SQL
         """
+        # SP-107-001: Debug logging
+        logger.debug(f"SP-107: _translate_as_from_function_call called: node.text={node.text}, node.function_name={node.function_name}")
+
         # Validate argument count
         if not node.arguments or len(node.arguments) == 0:
             raise ValueError(f"as() requires exactly 1 argument, got {len(node.arguments) if node.arguments else 0}")
@@ -9236,25 +9473,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         path_expr = self._extract_path_before_function(node.text, node.function_name)
 
         # ALSO extract any path AFTER .as() - e.g., ".unit" in "value.as(Quantity).unit"
-        # Find the closing paren of .as(...) and get everything after it
+        # SP-107-001: Check parent and grandparent nodes for additional path navigation
+        # The AST structure for "Observation.value.as(Quantity).unit" is:
+        #   - Root: InvocationExpression with text="Observation.value.as(Quantity).unit"
+        #     - child[0]: InvocationExpression with text="Observation.value.as(Quantity)"
+        #       - child[0]: "Observation.value"
+        #       - child[1]: as() function call (current node)
+        #     - child[1]: ".unit" (this is what we need to find)
         path_after = None
-        if node.text and '.as(' in node.text:
-            # Find the .as( and then find the matching closing paren
-            as_start = node.text.find('.as(')
-            if as_start >= 0:
-                # Find closing paren
-                paren_count = 1
-                i = as_start + 4  # Start after '.as('
-                while i < len(node.text) and paren_count > 0:
-                    if node.text[i] == '(':
-                        paren_count += 1
-                    elif node.text[i] == ')':
-                        paren_count -= 1
-                    i += 1
-                # i now points after the closing paren
-                if i < len(node.text) and node.text[i] == '.':
-                    path_after = node.text[i+1:]  # Get everything after the dot
-                    logger.debug(f"Extracted path after .as(): {path_after}")
+        if hasattr(node, 'parent') and node.parent:
+            # Check if parent's parent has more children (indicating additional navigation)
+            grandparent = node.parent.parent if hasattr(node.parent, 'parent') else None
+            if grandparent and hasattr(grandparent, 'children') and len(grandparent.children) >= 2:
+                # The second child of grandparent should be the path after .as()
+                # child[0] is the .as() invocation, child[1]+ are subsequent navigations
+                parent_invocation = node.parent  # This is "Observation.value.as(Quantity)"
+                if grandparent.children[0] == parent_invocation and len(grandparent.children) > 1:
+                    # There's a child after the .as() invocation
+                    next_child = grandparent.children[1]
+                    # Extract the path from the next child's text
+                    if hasattr(next_child, 'text') and next_child.text:
+                        # Remove leading dot if present
+                        path_after = next_child.text.lstrip('.')
+                        logger.debug(f"SP-107-001: Extracted path after .as() from parent: {path_after}")
 
         # POLYMORPHIC PROPERTY HANDLING FOR .as():
         # Check if path ends with a polymorphic property (e.g., "Observation.value")
@@ -9333,6 +9574,31 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         canonical_type=canonical_type,
                         type_metadata=type_metadata,
                         original_expression=node.text,
+                    )
+
+                    # SP-107-001: Set up polymorphic field mapping for subsequent navigation
+                    # When .as() resolves a polymorphic property (e.g., "value" -> "valueQuantity"),
+                    # subsequent field accesses need to use the resolved field.
+                    # For example: "Observation.value.as(Quantity).unit" should access "valueQuantity.unit"
+                    if not hasattr(self.context, 'polymorphic_field_mappings'):
+                        self.context.polymorphic_field_mappings = {}
+                    self.context.polymorphic_field_mappings[last_component] = polymorphic_field
+
+                    # Update parent_path to include the resolved polymorphic field
+                    # This ensures subsequent field navigation (e.g., .unit) uses the correct path
+                    if path_after:
+                        # Split by dots in case there are multiple levels like ".unit.value"
+                        after_components = path_after.split('.')
+                        # Push the resolved polymorphic field first, then the components after .as()
+                        self.context.push_path(polymorphic_field)
+                        for component in after_components:
+                            self.context.push_path(component)
+                    else:
+                        # Just push the resolved polymorphic field
+                        self.context.push_path(polymorphic_field)
+
+                    logger.debug(
+                        f"SP-107-001: Set up polymorphic mapping for .as(): {last_component} -> {polymorphic_field}, parent_path={self.context.parent_path}"
                     )
 
                     return fragment
@@ -11765,6 +12031,22 @@ END"""
                     f"Function 'power' invoked as method requires exactly 1 argument, got {len(args)}"
                 )
             exponent_node = args[0]
+        elif self.fragments:
+            # Method invocation like 2.power(3) where base is in fragments
+            base_fragment = self.fragments[-1]
+            base_expr = base_fragment.expression
+            if hasattr(base_fragment, "dependencies"):
+                for dep in base_fragment.dependencies:
+                    if dep not in dependencies:
+                        dependencies.append(dep)
+            # Remove the base fragment since we're incorporating it into power()
+            self.fragments.pop()
+
+            if len(args) != 1:
+                raise ValueError(
+                    f"Function 'power' invoked as method on context requires exactly 1 argument, got {len(args)}"
+                )
+            exponent_node = args[0]
         else:
             if len(args) != 2:
                 raise ValueError(
@@ -11958,54 +12240,70 @@ END"""
                 self.context.pending_fragment_result = None
                 if source_table is None:
                     source_table = self.context.current_table
-            # SP-102-001: Check if we're in a lambda scope with $this bound
-            # This handles cases like substring($this.length()-3) where the string
-            # argument is implicit and should be $this
-            elif func_name in ("substring", "indexof", "replace"):
-                logger.debug(f"SP-102-001 DEBUG: substring checking for $this, func_name={func_name}")
-                this_binding = self.context.get_variable("$this")
-                if this_binding is not None:
-                    # Use $this as the implicit string argument
-                    # SP-102-001: $this might be a column reference (like 'given_item') or an expression
-                    # For column references from UNNEST, we need to unwrap the JSON to get the string value
-                    this_expr = this_binding.expression
-                    # Check if this is a simple column reference (no parentheses, no function calls)
-                    is_simple_column = this_expr and not any(c in this_expr for c in '()')
-
-                    if is_simple_column:
-                        # Simple column reference - need to unwrap JSON
-                        # Use extract_json_string to get the scalar value from the JSON column
-                        string_expr = self.dialect.extract_json_string(this_expr, "$")
-                        logger.debug(
-                            f"SP-102-001: Unwrapped $this column {this_expr} -> {string_expr}"
-                        )
-                    else:
-                        # Complex expression - use as-is
-                        string_expr = this_expr
-                        logger.debug(
-                            f"SP-102-001: Using $this expression directly: {string_expr}"
-                        )
-
-                    source_table = this_binding.source_table or self.context.current_table
-                    requires_unnest = this_binding.requires_unnest
-                    is_aggregate = this_binding.is_aggregate
-                    if this_binding.dependencies:
-                        dependencies.extend(this_binding.dependencies)
-                    logger.debug(
-                        f"SP-102-001: Using $this as implicit string argument for {func_name}"
-                    )
             else:
+                # SP-107-005: Check context path BEFORE $this to avoid using default $this binding
+                # when there's a meaningful context path available
                 current_path = self.context.get_json_path()
                 if current_path and current_path != "$":
+                    # Use the context path if available
                     string_expr = self.dialect.extract_json_field(
                         column=self.context.current_table,
                         path=current_path
                     )
+                    source_table = self.context.current_table
+                    requires_unnest = False
+                    is_aggregate = False
+                    logger.debug(
+                        f"Using context path for string function: {current_path} -> {string_expr}"
+                    )
+                # SP-102-001: Check if we're in a lambda scope with $this bound
+                # This handles cases like substring($this.length()-3) where the string
+                # argument is implicit and should be $this
+                elif func_name in ("substring", "indexof", "replace"):
+                    logger.debug(f"SP-102-001 DEBUG: substring checking for $this, func_name={func_name}")
+                    this_binding = self.context.get_variable("$this")
+                    if this_binding is not None:
+                        # Use $this as the implicit string argument
+                        # SP-102-001: $this might be a column reference (like 'given_item') or an expression
+                        # For column references from UNNEST, we need to unwrap the JSON to get the string value
+                        this_expr = this_binding.expression
+                        # Check if this is a simple column reference (no parentheses, no function calls)
+                        is_simple_column = this_expr and not any(c in this_expr for c in '()')
+
+                        if is_simple_column:
+                            # Simple column reference - need to unwrap JSON
+                            # Use extract_json_string to get the scalar value from the JSON column
+                            string_expr = self.dialect.extract_json_string(this_expr, "$")
+                            logger.debug(
+                                f"SP-102-001: Unwrapped $this column {this_expr} -> {string_expr}"
+                            )
+                        else:
+                            # Complex expression - use as-is
+                            string_expr = this_expr
+                            logger.debug(
+                                f"SP-102-001: Using $this expression directly: {string_expr}"
+                            )
+
+                        source_table = this_binding.source_table or self.context.current_table
+                        requires_unnest = this_binding.requires_unnest
+                        is_aggregate = this_binding.is_aggregate
+                        if this_binding.dependencies:
+                            dependencies.extend(this_binding.dependencies)
+                        logger.debug(
+                            f"SP-102-001: Using $this as implicit string argument for {func_name}"
+                        )
+                    else:
+                        # No context path and no $this, use current table directly
+                        string_expr = self.context.current_table
+                        source_table = self.context.current_table
+                        requires_unnest = False
+                        is_aggregate = False
                 else:
+                    # For other functions (length), use current table if no context path
                     string_expr = self.context.current_table
-                source_table = self.context.current_table
-                requires_unnest = False
-                is_aggregate = False
+                    source_table = self.context.current_table
+                    requires_unnest = False
+                    is_aggregate = False
 
         if source_table is None:
             source_table = self.context.current_table

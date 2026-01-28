@@ -948,7 +948,13 @@ class EnhancedASTNode:
                             target_type = self._extract_type_from_children(node)
                             return 'ofType', target_type or 'Unknown'
 
-                        # Parse from text for other operations
+                        # SP-107-001: Check for as() operation (function call syntax)
+                        # The text for as() is 'as()' so we check for that pattern first
+                        if text == 'as()' or 'as(' in text:
+                            target_type = self._extract_type_from_children(node)
+                            return 'as', target_type or 'Unknown'
+
+                        # Parse from text for other operations (with spaces - infix syntax)
                         if ' is ' in text:
                             return 'is', text.split(' is ')[-1].strip()
                         elif ' as ' in text:

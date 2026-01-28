@@ -1,0 +1,67 @@
+{
+  "active": true,
+  "mode": "ultrapilot",
+  "sprint": "SP-105",
+  "title": "Parallel High-Impact Compliance Fixes",
+  "baseline": {
+    "passed": 545,
+    "total": 934,
+    "percentage": 58.4
+  },
+  "target": {
+    "passed": 600,
+    "total": 934,
+    "percentage": 64.0
+  },
+  "workers": [
+    {
+      "id": "w1",
+      "name": "String Literal exclude()",
+      "status": "running",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "functions": ["_normalize_collection_expression", "_build_exclusion_array"],
+      "target_tests": 6,
+      "agent_id": "a0dce41"
+    },
+    {
+      "id": "w2",
+      "name": "Type Operations",
+      "status": "running",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py", "fhir4ds/main/fhirpath/types/type_registry.py"],
+      "functions": ["visit_type_operation"],
+      "target_tests": 81,
+      "agent_id": "ade6a98"
+    },
+    {
+      "id": "w3",
+      "name": "Comparison Operators",
+      "status": "running",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "functions": ["_translate_comparison_operator"],
+      "target_tests": 93,
+      "agent_id": "abf38db"
+    },
+    {
+      "id": "w4",
+      "name": "Arithmetic Operators",
+      "status": "running",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+      "functions": ["_translate_arithmetic_operator"],
+      "target_tests": 46,
+      "agent_id": "a7e8e94"
+    },
+    {
+      "id": "w5",
+      "name": "Date/Time Arithmetic",
+      "status": "running",
+      "files": ["fhir4ds/main/fhirpath/sql/translator.py", "fhir4ds/main/fhirpath/types/temporal_parser.py"],
+      "functions": ["date/time arithmetic methods"],
+      "target_tests": 26,
+      "agent_id": "af7bb99",
+      "runs_final_test": true
+    }
+  ],
+  "shared_files": ["fhir4ds/main/fhirpath/sql/translator.py"],
+  "phase": "parallel_execution",
+  "start_time": "2026-01-26T16:35:00Z"
+}
