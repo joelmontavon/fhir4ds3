@@ -776,6 +776,43 @@ class EnhancedASTNode:
                 return FunctionCallNodeAdapter(self).accept(visitor)
 
             elif category == NodeCategory.PATH_EXPRESSION:
+                # SP-108-003: Handle MembershipExpression (in, contains) before other PATH_EXPRESSION handling
+                # MembershipExpression needs to be converted to a function call for proper translation
+                if self.node_type == "MembershipExpression":
+                    class MembershipExpressionAdapter:
+                        def __init__(self, enhanced_node):
+                            self.text = enhanced_node.text
+                            self.node_type = "function_call"
+                            self.enhanced_node = enhanced_node
+                            self.metadata = enhanced_node.metadata
+                            self.children = enhanced_node.children
+                            self.function_name = "contains"
+                            self.target = None
+
+                            # Determine arguments based on operator
+                            self.arguments = self._extract_arguments(enhanced_node)
+
+                        def _extract_arguments(self, node):
+                            """Extract arguments, converting 'in' to contains() form."""
+                            if len(node.children) < 2:
+                                return node.children
+
+                            left = node.children[0]
+                            right = node.children[1]
+
+                            # Infer operator from text
+                            text = node.text or ""
+                            if ' in ' in text:
+                                # "x in collection" → contains(collection, x)
+                                return [right, left]
+                            else:
+                                # "collection contains x" → contains(collection, x)
+                                return [left, right]
+
+                        def accept(self, v):
+                            return v.visit_function_call(self)
+                    return MembershipExpressionAdapter(self).accept(visitor)
+
                 # SP-022-009: Handle PolarityExpression (unary minus) before other PATH_EXPRESSION handling
                 # PolarityExpression needs special handling for negation
                 if self.node_type == "PolarityExpression" and self.children:

@@ -719,13 +719,19 @@ class CTEManager:
             # which is fine - it means translator generated incorrect SQL
             columns.append(f"{source_table}.resource")
 
-        columns.extend(ordering_columns)
+        # SP-108-003: Check if order columns should be excluded from SELECT
+        # Functions like all() aggregate across all elements, so order columns
+        # should not be included in SELECT or GROUP BY
+        exclude_order = fragment.metadata.get("exclude_order_from_group_by", False)
+        if not exclude_order:
+            columns.extend(ordering_columns)
 
         # SP-105 Phase 2: Propagate _item columns from source CTEs throughout the chain
         # This fixes "column not found" errors when combine/exclude reference columns
         # that were available in earlier CTEs but not propagated forward
+        # SP-108-003: Skip item column propagation if exclude_order is True
         propagated_item_columns = set()
-        if source_table.startswith("cte_"):
+        if source_table.startswith("cte_") and not exclude_order:
             # Check if any previous CTEs had _item columns that should be propagated
             # We need to look at what columns are available in the source CTE
             # For now, we conservatively preserve columns that are referenced in the expression
@@ -799,8 +805,10 @@ class CTEManager:
         # SP-025-003: Add GROUP BY clause for aggregate functions
         # When fragment.is_aggregate=True (e.g., COUNT(*), SUM(), etc.),
         # all non-aggregated columns must be in GROUP BY clause
+        # SP-108-003: Check if order columns should be excluded from GROUP BY
+        exclude_order = fragment.metadata.get("exclude_order_from_group_by", False)
         if fragment.is_aggregate and (ordering_columns or source_table.startswith("cte_")):
-            # Build GROUP BY with id, resource, and all ordering columns
+            # Build GROUP BY with id, resource, and optionally ordering columns
             group_by_columns = [id_column]
 
             # Include resource in GROUP BY
@@ -811,8 +819,10 @@ class CTEManager:
             else:
                 group_by_columns.append(f"{source_table}.resource")
 
-            # Include all ordering columns in GROUP BY
-            group_by_columns.extend(ordering_columns)
+            # SP-108-003: Include ordering columns in GROUP BY only if not excluded
+            # Functions like all() aggregate across all elements per patient, not per row
+            if not exclude_order:
+                group_by_columns.extend(ordering_columns)
 
             query += f"\nGROUP BY {', '.join(group_by_columns)}"
 
@@ -1131,6 +1141,10 @@ class CTEManager:
             # it breaks the ordering chain since those columns won't be propagated.
             if cte.source_fragment and cte.source_fragment.expression.strip().upper().startswith("SELECT"):
                 ordering_columns.clear()
+            # SP-108-003: If a CTE has exclude_order_from_group_by metadata (like all()),
+            # it breaks the ordering chain since order columns are not in the output.
+            if cte.source_fragment and cte.source_fragment.metadata.get("exclude_order_from_group_by", False):
+                ordering_columns.clear()
 
         # SP-022-001: Check if we need collection aggregation
         # When we have UNNEST operations followed by aggregate functions,
@@ -1165,6 +1179,8 @@ class CTEManager:
         Collection aggregation is needed when:
         1. There are UNNEST operations in the chain (has_unnest=True)
         2. The final CTE is an aggregate function (count, empty, exists)
+        3. SP-108-001: The final CTE is a comparison involving an aggregate function
+        4. SP-108-003: The final CTE is a unary operator (not()) on an aggregate function
 
         This ensures FHIRPath expressions like `Patient.name.given.count()`
         return a single scalar value (5) instead of per-row values (0,0,0,0,0).
@@ -1185,7 +1201,17 @@ class CTEManager:
         function_name = final_cte.metadata.get("function", "")
         aggregate_functions = {"count", "empty", "exists"}
 
-        return function_name in aggregate_functions
+        # SP-108-001: Check if final CTE is a comparison involving an aggregate function
+        # For example, count() > 5 should trigger aggregation
+        is_comparison = final_cte.metadata.get("is_comparison", False)
+        aggregate_function = final_cte.metadata.get("aggregate_function", "")
+
+        # SP-108-003: Check if final CTE is a unary operator (like not()) on an aggregate function
+        # For example, empty().not() should trigger aggregation
+        is_unary_operator = function_name in {"not", "minus"}
+        has_aggregate_operand = aggregate_function in aggregate_functions
+
+        return function_name in aggregate_functions or (is_comparison and aggregate_function in aggregate_functions) or (is_unary_operator and has_aggregate_operand)
 
     def _add_aggregation_cte(
         self,
@@ -1213,16 +1239,41 @@ class CTEManager:
         Returns:
             Tuple of (updated CTE list, updated ordering columns)
         """
-        function_name = final_cte.metadata.get("function", "count")
+        # SP-108-001: Get the function name - check both direct function metadata
+        # and aggregate_function metadata (for comparisons involving aggregates)
+        # SP-108-003: Check aggregate_function first for unary operators like not()
+        aggregate_function = final_cte.metadata.get("aggregate_function", "")
+        function_name = aggregate_function or final_cte.metadata.get("function", "")
+        if not function_name:
+            function_name = "count"
 
-        # Check if the source expression contains a comparison
+        # Check if the source expression contains a comparison or unary operator
         # Look for patterns like "= 5", "!= 10", "> 3", "= false", etc.
         source_expr = final_cte.source_expression or ""
         comparison_op, comparison_val = self._extract_comparison_parts(source_expr)
 
+        # SP-108-001: Detect unary operators in source expression
+        # Handles expressions like "-count()", "+count()", "-COALESCE(...)"
+        unary_operator = self._extract_unary_operator(source_expr)
+
+        # SP-108-003: For not(), we need to negate the aggregate expression
+        if final_cte.metadata.get("function") == "not":
+            unary_operator = "NOT"
+
+        # SP-108-001: Check if the final CTE itself is a comparison (not the source expression)
+        # For example, when we have count() > 5, the final CTE contains the comparison expression
+        is_final_cte_comparison = final_cte.metadata.get("is_comparison", False)
+        if is_final_cte_comparison and not comparison_op:
+            # The final CTE is the comparison, extract from its expression instead
+            final_cte_expr = final_cte.query or source_expr
+            comparison_op, comparison_val = self._extract_comparison_parts(final_cte_expr)
+
         # Generate aggregation expression based on function type
         if function_name == "count":
             base_agg = "COUNT(*)"
+            # SP-108-001: Apply unary operator if present
+            if unary_operator:
+                base_agg = f"({unary_operator} {base_agg})"
             if comparison_op:
                 agg_expr = f"({base_agg} {comparison_op} {comparison_val})"
             else:
@@ -1230,6 +1281,9 @@ class CTEManager:
         elif function_name == "empty":
             # empty() returns true if collection is empty
             base_result = "(COUNT(*) = 0)"
+            # SP-108-003: Apply NOT operator if present (for not() on empty())
+            if unary_operator == "NOT":
+                base_result = f"(NOT {base_result})"
             if comparison_op:
                 # Handle empty() = true/false comparisons
                 agg_expr = f"({base_result} {comparison_op} {comparison_val})"
@@ -1238,6 +1292,9 @@ class CTEManager:
         elif function_name == "exists":
             # exists() returns true if collection is not empty
             base_result = "(COUNT(*) > 0)"
+            # SP-108-003: Apply NOT operator if present (for not() on exists())
+            if unary_operator == "NOT":
+                base_result = f"(NOT {base_result})"
             if comparison_op:
                 # Handle exists() = true/false comparisons
                 agg_expr = f"({base_result} {comparison_op} {comparison_val})"
@@ -1333,10 +1390,19 @@ class CTEManager:
             if value_clean.lower() in ("true", "false"):
                 is_valid = True
             else:
-                # Check for number (including negative and decimal)
+                # SP-108-001: Check for number (including negative and decimal)
+                # Also handle unary minus expressions like (- 3)
                 try:
                     # Remove any trailing parentheses
                     num_str = value_clean.rstrip(")")
+                    # Handle unary minus expressions like (- 3)
+                    num_str = num_str.strip()
+                    if num_str.startswith("(-"):
+                        num_str = "-" + num_str[2:].strip()
+                    elif num_str.startswith("(+"):
+                        num_str = "+" + num_str[2:].strip()
+                    # Remove any remaining parentheses
+                    num_str = num_str.rstrip(")")
                     float(num_str)
                     is_valid = True
                     value_clean = num_str
@@ -1347,6 +1413,40 @@ class CTEManager:
                 return op, value_clean
 
         return None, None
+
+    def _extract_unary_operator(self, source_expr: str) -> Optional[str]:
+        """Extract unary operator from a source expression.
+
+        SP-108-001: Detects unary operators (+, -) at the start of expressions.
+        Handles expressions like:
+        - "-COUNT(*)" -> "-"
+        - "+COALESCE(...)" -> "+"
+        - "- (5)" -> "-" (operator before parentheses, not inside)
+
+        Args:
+            source_expr: The source SQL expression
+
+        Returns:
+            The unary operator ("+", "-") or None if no unary operator found
+        """
+        if not source_expr:
+            return None
+
+        # Strip whitespace
+        expr = source_expr.strip()
+
+        # Extract the operator by looking at the first non-parenthesis character
+        # This handles cases like "- (5)" where operator is outside parens
+        operator = None
+        for char in expr:
+            if char in '+-':
+                operator = char
+                break
+            elif char not in ' \t\n\r(':
+                # Not a unary operator, not whitespace, not opening paren
+                break
+
+        return operator
 
     def _order_ctes_by_dependencies(
         self,

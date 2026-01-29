@@ -868,6 +868,32 @@ class PostgreSQLDialect(DatabaseDialect):
         """
         return f"({string_expr} LIKE '%' || {substring} || '%')"
 
+    def generate_membership_test(self, collection_expr: str, value_expr: str) -> str:
+        """Generate membership test SQL for PostgreSQL (contains operator).
+
+        Uses jsonb_array_elements and EXISTS to check if value is in collection.
+
+        Args:
+            collection_expr: SQL expression evaluating to collection (JSONB array)
+            value_expr: SQL expression for value to find
+
+        Returns:
+            SQL expression using EXISTS with jsonb_array_elements
+
+        Example:
+            generate_membership_test("resource->'tags'", "'active'")
+            → "EXISTS (SELECT 1 FROM jsonb_array_elements(resource->'tags') WHERE value = 'active')"
+        """
+        # For string literals, wrap in to_jsonb() for proper comparison with JSONB values
+        # Detect if value_expr is a string literal (starts and ends with single quote)
+        value_stripped = value_expr.strip()
+        if value_stripped.startswith("'") and value_stripped.endswith("'"):
+            # String literal - wrap in to_jsonb() for proper JSON comparison
+            value_expr = f"to_jsonb({value_expr})"
+
+        # Cast to jsonb for array elements function
+        return f"EXISTS (SELECT 1 FROM jsonb_array_elements(CAST({collection_expr} AS jsonb)) WHERE value = {value_expr})"
+
     def generate_prefix_check(self, string_expr: str, prefix: str) -> str:
         """Generate prefix check SQL for PostgreSQL (startsWith).
 

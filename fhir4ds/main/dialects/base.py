@@ -460,6 +460,31 @@ class DatabaseDialect(ABC):
         pass
 
     @abstractmethod
+    def generate_membership_test(self, collection_expr: str, value_expr: str) -> str:
+        """Generate membership test SQL (contains operator).
+
+        Returns boolean expression indicating if value is in collection.
+        This is a thin dialect method - contains ONLY syntax differences.
+
+        Args:
+            collection_expr: SQL expression evaluating to collection (JSON array)
+            value_expr: SQL expression for value to find
+
+        Returns:
+            SQL expression returning boolean (true if value found in collection)
+
+        Example:
+            DuckDB: EXISTS (SELECT 1 FROM json_each(collection_expr) WHERE value = value_expr)
+            PostgreSQL: EXISTS (SELECT 1 FROM jsonb_array_elements(collection_expr) WHERE value = value_expr)
+
+        Note:
+            - Uses equality comparison
+            - Empty collection returns false
+            - NULL handling: NULL collection → NULL output
+        """
+        pass
+
+    @abstractmethod
     def generate_prefix_check(self, string_expr: str, prefix: str) -> str:
         """Generate prefix check SQL (startsWith).
 

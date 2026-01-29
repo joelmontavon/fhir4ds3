@@ -657,6 +657,32 @@ class DuckDBDialect(DatabaseDialect):
         """
         return f"({string_expr} LIKE '%' || {substring} || '%')"
 
+    def generate_membership_test(self, collection_expr: str, value_expr: str) -> str:
+        """Generate membership test SQL for DuckDB (contains operator).
+
+        Uses json_each and EXISTS to check if value is in collection.
+
+        Args:
+            collection_expr: SQL expression evaluating to collection (JSON array)
+            value_expr: SQL expression for value to find
+
+        Returns:
+            SQL expression using EXISTS with json_each
+
+        Example:
+            generate_membership_test("json_extract(resource, '$.tags')", "'active'")
+            → "EXISTS (SELECT 1 FROM json_each(json_extract(resource, '$.tags')) WHERE value = 'active')"
+        """
+        # For string literals, wrap in to_json() for proper comparison with JSON values
+        # Detect if value_expr is a string literal (starts and ends with single quote)
+        value_stripped = value_expr.strip()
+        if value_stripped.startswith("'") and value_stripped.endswith("'"):
+            # String literal - wrap in to_json() for proper JSON comparison
+            value_expr = f"to_json({value_expr})"
+
+        # Handle JSON arrays - use json_each to iterate and check for matching value
+        return f"EXISTS (SELECT 1 FROM json_each({collection_expr}) WHERE value = {value_expr})"
+
     def generate_prefix_check(self, string_expr: str, prefix: str) -> str:
         """Generate prefix check SQL for DuckDB (startsWith).
 
@@ -848,8 +874,14 @@ class DuckDBDialect(DatabaseDialect):
         )
 
     def wrap_json_array(self, expression: str) -> str:
-        """Wrap scalar expression as single-element JSON array using DuckDB syntax."""
-        return f"json_array({expression})"
+        """Wrap scalar expression as single-element JSON array using DuckDB syntax.
+
+        SP-108-003: Fixed to handle all expression types. Using to_json() to convert
+        scalar values to JSON format before wrapping in array, which handles VARCHAR
+        values from json_extract_string correctly.
+        """
+        # Always use to_json() to ensure the value is in JSON format before wrapping
+        return f"json_array(to_json({expression}))"
 
     def serialize_json_value(self, expression: str) -> str:
         """Serialize JSON value to canonical text preserving type semantics."""
@@ -860,8 +892,14 @@ class DuckDBDialect(DatabaseDialect):
         return "json_array()"
 
     def is_json_array(self, expression: str) -> str:
-        """Check if expression evaluates to a DuckDB JSON array."""
-        return f"(json_type(CAST({expression} AS JSON)) = 'ARRAY')"
+        """Check if expression evaluates to a DuckDB JSON array.
+
+        SP-108-003: Fixed to handle all expression types. Using to_json() instead of
+        CAST(... AS JSON) because to_json() properly handles string values by converting
+        them to JSON format (e.g., "value" -> "\"value\"").
+        """
+        # Use to_json() which handles all types correctly including VARCHAR from json_extract_string
+        return f"(json_type(to_json({expression})) = 'ARRAY')"
 
     def enumerate_json_array(self, array_expr: str, value_alias: str, index_alias: str) -> str:
         """Enumerate JSON array into rows of (index, value) using DuckDB json_each().
@@ -1312,7 +1350,11 @@ class DuckDBDialect(DatabaseDialect):
             "date": ["VARCHAR"],
             "time": ["VARCHAR"],
         }
+        # SP-108-002: Add boolean regex pattern to match FHIR boolean strings
+        # FHIR boolean values are stored as JSON strings 'true' or 'false'
+        # This pattern matches both lowercase and variants
         regex_patterns = {
+            "boolean": r'^(true|false)$',
             "datetime": r'^\d{4}(-\d{2}(-\d{2})?)?T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$',
             "date": r'^\d{4}(-\d{2}(-\d{2})?)?$',
             "time": r'^\d{2}:\d{2}:\d{2}(\.\d+)?$',
@@ -1406,10 +1448,12 @@ class DuckDBDialect(DatabaseDialect):
         # Map FHIRPath types to DuckDB type names (uppercase)
         # This mapping is part of syntax adaptation, not business logic
         # SP-106-004: Use DECIMAL for FHIRPath decimal type to maintain precision
+        # SP-108-001: Use DECIMAL(38,10) to support large decimal values with fractional parts
+        # 38 total digits with 10 after decimal point preserves precision for most FHIRPath decimals
         type_map = {
             "string": "VARCHAR",
             "integer": "INTEGER",
-            "decimal": "DECIMAL",
+            "decimal": "DECIMAL(38,10)",  # Support large decimals with fractional parts
             "boolean": "BOOLEAN",
             "datetime": "TIMESTAMP",
             "date": "DATE",

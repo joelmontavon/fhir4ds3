@@ -1227,8 +1227,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             sql_expr = str(node.value)
 
         elif node.literal_type == "decimal":
-            # Direct string conversion for decimals (preserves precision)
-            sql_expr = str(node.value)
+            # SP-108-001: Use node.text instead of node.value to preserve precision
+            # node.value is a Python float which loses precision for large decimals
+            # node.text is the original string representation which preserves precision
+            if node.text:
+                # Validate that text is a valid decimal literal before using
+                # This provides safety without breaking legitimate decimal values
+                try:
+                    # Basic validation - check if it can be parsed as a number
+                    float(node.text)
+                    sql_expr = node.text
+                except (ValueError, TypeError):
+                    # If text is invalid, fall back to value conversion
+                    sql_expr = str(node.value)
+            else:
+                sql_expr = str(node.value)
 
         elif node.literal_type == "boolean":
             # SQL standard boolean literals
@@ -2210,7 +2223,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         elif function_name == "trim":
             return self._translate_trim(node)
         elif function_name == "contains":
-            return self._translate_contains(node)
+            # SP-108-003: Check if this is membership contains (collection contains value)
+            # vs string contains (string.contains(substring))
+            # Membership contains has 2 explicit arguments, string contains has 1
+            if len(node.arguments) == 2 and node.target is None:
+                return self._translate_contains_membership(node)
+            else:
+                return self._translate_contains(node)
         elif function_name == "startswith":
             return self._translate_startswith(node)
         elif function_name == "endswith":
@@ -3013,11 +3032,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         logger.debug(f"Generated unary operator SQL: {sql_expr}")
 
+        # SP-108-001: Preserve metadata from operand for unary operators
+        # This ensures CTE builder can recognize when unary operator is applied to
+        # aggregate functions (e.g., -count() should be treated as aggregate)
+        # Initialize metadata as empty dict to ensure consistent handling
+        metadata = {}
+        if isinstance(operand_fragment.metadata, dict):
+            metadata = dict(operand_fragment.metadata)
+
         return SQLFragment(
             expression=sql_expr,
             source_table=operand_fragment.source_table,
             requires_unnest=operand_fragment.requires_unnest,
-            is_aggregate=operand_fragment.is_aggregate
+            is_aggregate=operand_fragment.is_aggregate,
+            metadata=metadata
         )
 
     def _translate_binary_operator(self, node: OperatorNode) -> SQLFragment:
@@ -3424,18 +3452,39 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # don't copy array-related metadata since the result is a scalar boolean
         if node.operator_type in ("comparison", "logical"):
             # For comparison/logical, only copy non-array metadata
+            # SP-108-001: Keep 'function' metadata if present in either operand to allow
+            # CTE builder to recognize aggregation is needed for expressions like count() > 5
             metadata = {}
             left_meta = left_fragment.metadata if isinstance(left_fragment.metadata, dict) else {}
             right_meta = right_fragment.metadata if isinstance(right_fragment.metadata, dict) else {}
             # Copy relevant metadata but exclude array-specific keys
+            # Note: We keep 'function' metadata to signal CTE builder about aggregate functions
             array_keys = {"array_column", "result_alias", "source_path", "projection_expression",
                           "from_element_column", "unnest_level"}
+            # Check if either operand is an aggregate function
+            has_function = False
+            function_name = None
+            for meta in [left_meta, right_meta]:
+                if "function" in meta:
+                    has_function = True
+                    function_name = meta["function"]
+                    break
+
             for key, value in left_meta.items():
                 if key not in array_keys:
                     metadata[key] = value
             for key, value in right_meta.items():
                 if key not in array_keys and key not in metadata:
                     metadata[key] = value
+
+            # SP-108-001: Mark comparison operators with result_type boolean
+            metadata["result_type"] = "boolean"
+
+            # SP-108-001: Mark as comparison if it involves an aggregate function
+            # This signals the CTE builder to extract comparison parts from source_expression
+            if has_function:
+                metadata["is_comparison"] = True
+                metadata["aggregate_function"] = function_name
         else:
             # For other operators (arithmetic), use existing metadata merge logic
             metadata = dict(left_fragment.metadata) if isinstance(left_fragment.metadata, dict) else {}
@@ -3706,7 +3755,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _normalize_collection_expression(self, expression: str) -> str:
-        """Normalize expression to JSON array, preserving NULL semantics."""
+        """Normalize expression to JSON array, preserving NULL semantics.
+
+        SP-108-003: Now uses dialect methods that properly handle scalar values.
+        The dialect's is_json_array() and wrap_json_array() use to_json() which
+        converts all types (including VARCHAR from json_extract_string) to JSON format.
+        """
         is_array_predicate = self.dialect.is_json_array(expression)
         wrapped_scalar = self.dialect.wrap_json_array(expression)
 
@@ -6980,16 +7034,25 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if isinstance(value, str):
                 stripped = value.strip()
                 # SP-101-003: Support partial DateTime formats
+                # SP-108-002: Support milliseconds and timezone
                 # Accepts: YYYY, YYYY-MM, YYYY-MM-DD, YYYYT, YYYY-MMT, YYYY-MM-DDT, YYYY-MM-DDTHH:MM:SS...
+                #          YYYY-MM-DDTHH:MM:SS.sss, YYYY-MM-DDTHH:MM:SSZ, YYYY-MM-DDTHH:MM:SS+10:00
                 # Pattern: Year required, month/day optional, 'T' suffix optional (with or without time)
-                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)?T?.*$', stripped))
+                #          Time can include milliseconds and timezone
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)?(T(\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:\d{2})?)?)?$', stripped))
             return False
 
         if target_type == "Time":
             if isinstance(value, str):
                 stripped = value.strip()
                 # SP-101-003: Support hour-only format and standard time formats
+                # SP-108-002: Support timezone suffix (Z or +/-HH:MM)
                 # Accepts: HH, HH:MM, HH:MM:SS, HH:MM:SS.sss
+                #          Note: FHIRPath Time literals cannot have timezones (returns false)
+                #          But for string conversion checking, we accept the format
+                if bool(re.search(r'[Z]|[+-]\d{2}:\d{2}$', stripped)):
+                    # Time with timezone is not a valid FHIRPath Time
+                    return False
                 return bool(re.match(r'^\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?$', stripped))
             return False
 
@@ -7175,15 +7238,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         SP-101-003: Use regex pattern matching instead of casting to support
         partial DateTime formats like '2015', '2015-02', '2015-02-04'.
 
+        SP-108-002: Support milliseconds and timezone in DateTime format.
+        Pattern now includes:
+        - Milliseconds: (\.[0-9]+)?
+        - Timezone: (Z|[+-][0-9]{2}:[0-9]{2})?
+
         FHIRPath spec allows convertsToDateTime() to return true for strings that
         match the DateTime format, even if they're partial dates.
         """
         # First, try to cast as string
         string_cast = self.dialect.generate_type_cast(value_expr, "String")
         # Use regex to check if it matches a DateTime pattern
-        # Pattern: YYYY(-MM(-DD(T(HH(:MM(:SS)?)?)?)?)?
+        # Pattern: YYYY(-MM(-DD(T(HH(:MM(:SS(\.SSS)?)?)?)?(Z|[+-]HH:MM)?)?)?
         # Matches: 2015, 2015-02, 2015-02-04, 2015T, 2015-02T, 2015-02-04T, 2015-02-04T10:00:00
-        datetime_pattern = r"'^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?(T([0-9]{2}(:[0-9]{2})?(:[0-9]{2})?)?)?$'"
+        #          2015-02-04T14:34:28.123, 2015-02-04T14:34:28Z, 2015-02-04T14:34:28+10:00
+        datetime_pattern = r"'^[0-9]{4}(-[0-9]{2})?(-[0-9]{2})?(T([0-9]{2}(:[0-9]{2})?(:[0-9]{2}(\.[0-9]+)?)?)?(Z|[+-][0-9]{2}:[0-9]{2})?)?$'"
         return (
             f"CASE "
             f"WHEN {string_cast} IS NULL THEN FALSE "
@@ -8402,6 +8471,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 canonical_type,
                 original_literal,
                 node  # Pass node for metadata access
+            )
+        # SP-108-002: Check for SQL literal expressions (numeric, string, boolean)
+        # This avoids calling json_type() on non-JSON values which causes SQL errors
+        elif self._is_sql_literal_expression(expr_fragment.expression):
+            type_check_sql = self._generate_literal_type_check(
+                expr_fragment.expression,
+                canonical_type,
+                original_literal,
+                node
             )
         elif self._is_primitive_type(canonical_type) or normalized in primitive_families:
             type_check_sql = self.dialect.generate_type_check(
@@ -10255,7 +10333,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # Generate database-specific JSON array aggregation
         # Need to order by index to preserve array order
-        aggregate_expr = self.dialect.aggregate_to_json_array(f"{projection_fragment.expression} ORDER BY {index_alias}")
+        # SP-108-003: Wrap projection in to_json() to handle scalar values correctly
+        # When projection extracts strings (via json_extract_string), they're VARCHAR type
+        # to_json() converts them to JSON format (e.g., "Chalmers" -> "\"Chalmers\"")
+        aggregate_expr = self.dialect.aggregate_to_json_array(f"to_json({projection_fragment.expression}) ORDER BY {index_alias}")
 
         # Construct complete SQL fragment with SELECT, FROM, LATERAL enumeration, GROUP BY
         # This is population-friendly: processes entire array without row-by-row iteration
@@ -10584,13 +10665,23 @@ END"""
 
             logger.debug(f"Generated exists() SQL (no criteria): {sql_expr}")
 
+            # SP-108-003: When operating on an unnested collection, exists() should aggregate
+            # back to patient level (one boolean per patient, not per row)
+            source_table = self.context.current_table
+            is_aggregate = source_table.startswith("cte_")
+            metadata = {"function": "exists", "result_type": "boolean"}
+            if is_aggregate:
+                # Exclude ordering columns from GROUP BY - we aggregate to patient level
+                metadata["exclude_order_from_group_by"] = True
+                logger.debug(f"exists() on unnested collection {source_table} - setting is_aggregate=True")
+
             return SQLFragment(
                 expression=sql_expr,
-                source_table=self.context.current_table,
+                source_table=source_table,
                 requires_unnest=False,
-                is_aggregate=False,
+                is_aggregate=is_aggregate,
                 dependencies=[],
-                metadata={"function": "exists", "result_type": "boolean"}
+                metadata=metadata
             )
 
         # Case 2: exists(criteria) - check if any element satisfies condition
@@ -10828,13 +10919,23 @@ END"""
 
             logger.debug(f"Generated empty() SQL: {empty_check_sql}")
 
+            # SP-108-003: When operating on an unnested collection (source_table is a CTE),
+            # empty() should aggregate back to patient level (one boolean per patient, not per row)
+            # This handles cases like Patient.name.given.empty() where given has been unnested
+            is_aggregate = source_table.startswith("cte_")
+            metadata = {"function": "empty", "result_type": "boolean"}
+            if is_aggregate:
+                # Exclude ordering columns from GROUP BY - we aggregate to patient level
+                metadata["exclude_order_from_group_by"] = True
+                logger.debug(f"empty() on unnested collection {source_table} - setting is_aggregate=True")
+
             return SQLFragment(
                 expression=empty_check_sql,
                 source_table=source_table,
                 requires_unnest=False,
-                is_aggregate=False,
+                is_aggregate=is_aggregate,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "empty", "result_type": "boolean"}
+                metadata=metadata
             )
         finally:
             self._restore_context(snapshot)
@@ -10906,13 +11007,23 @@ END"""
 
             logger.debug(f"Generated not() SQL (from previous fragment): {not_sql}")
 
+            # SP-108-003: Propagate aggregate_function metadata from the previous fragment
+            # This ensures that expressions like empty().not() or exists().not() still trigger
+            # aggregation when operating on unnested collections
+            prev_metadata = self.fragments[-1].metadata or {}
+            aggregate_function = prev_metadata.get("function", "")
+            metadata = {"function": "not", "result_type": "boolean"}
+            if aggregate_function in {"empty", "exists", "count"}:
+                metadata["aggregate_function"] = aggregate_function
+                logger.debug(f"not() propagating aggregate_function={aggregate_function}")
+
             return SQLFragment(
                 expression=not_sql,
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "not", "result_type": "boolean"}
+                metadata=metadata
             )
 
         # Standard path - use _resolve_function_target
@@ -10971,14 +11082,9 @@ END"""
             elements satisfy the condition. This maintains population-scale capability
             by processing entire collections without row-by-row iteration.
 
-        Implementation Strategy:
-            The all() function can be implemented using several SQL approaches:
-            1. BOOL_AND aggregate (PostgreSQL, DuckDB): BOOL_AND(condition) = true
-            2. NOT EXISTS negation: NOT EXISTS (SELECT ... WHERE NOT condition)
-            3. COUNT comparison: COUNT(*) = COUNT(*) FILTER (WHERE condition)
-
-            We use approach #1 (BOOL_AND) as it's most direct and supported by both
-            DuckDB and PostgreSQL dialects.
+        SP-108-003: Handle two cases:
+        1. Direct path: Patient.name.all(...) - Creates subquery with UNNEST
+        2. After path navigation: Patient.name.all(...) where path already created UNNEST
 
         Args:
             node: FunctionCallNode representing all() function call
@@ -10988,27 +11094,6 @@ END"""
 
         Raises:
             ValueError: If all() doesn't have exactly 1 argument (criteria expression)
-
-        Example:
-            Input: Patient.name.all(use = 'official')
-
-            Output SQL (DuckDB):
-                COALESCE(
-                    (SELECT bool_and(json_extract_string(elem, '$.use') = 'official')
-                     FROM (SELECT unnest(json_extract(resource, '$.name')) as elem)),
-                    true
-                )
-
-            Input: Patient.telecom.all(system = 'phone')
-
-            Output SQL (PostgreSQL):
-                COALESCE(
-                    (SELECT bool_and(jsonb_extract_path_text(elem, 'system') = 'phone')
-                     FROM jsonb_array_elements(jsonb_extract_path(resource, 'telecom')) as elem),
-                    true
-                )
-
-            Note: COALESCE handles empty arrays (NULL result from bool_and) → returns true
         """
         logger.debug(f"Translating all() function with {len(node.arguments)} arguments")
 
@@ -11019,6 +11104,75 @@ END"""
                 f"got {len(node.arguments)}"
             )
 
+        # SP-108-003: Check if there's already a UNNEST fragment from path navigation
+        unnest_fragments = [f for f in self.fragments if f.requires_unnest]
+        has_unnest = len(unnest_fragments) > 0
+
+        if has_unnest:
+            # Case 2: Work on already-unnested collection
+            logger.debug("all() operating on unnested collection")
+
+            # Get the last UNNEST fragment
+            last_unnest = unnest_fragments[-1]
+
+            # Get the result column from the last UNNEST fragment
+            result_col = last_unnest.metadata.get("result_alias", "result")
+            source_table = last_unnest.source_table or self.context.current_table
+
+            # Determine if this is a primitive type array
+            is_primitive_array = self._is_primitive_collection(last_unnest)
+
+            if is_primitive_array:
+                # For primitive types, unwrap JSON to get scalar value
+                this_expression = self.dialect.extract_json_string(result_col, "$")
+            else:
+                # For complex types, keep JSON for field access
+                this_expression = result_col
+
+            # Save context and fragments
+            old_table = source_table
+            old_path = self.context.parent_path.copy()
+            saved_fragments = self.fragments.copy()
+            self.fragments.clear()
+
+            # Translate criteria expression with context pointing to the unnested element
+            self.context.current_table = this_expression
+            self.context.parent_path.clear()
+
+            with self._variable_scope({
+                "$this": VariableBinding(
+                    expression=this_expression,
+                    source_table=this_expression
+                )
+            }):
+                criteria_fragment = self.visit(node.arguments[0])
+
+            # Restore fragments
+            self.fragments.clear()
+            self.fragments.extend(saved_fragments)
+
+            # Restore context but update current_table to source for the aggregation
+            self.context.current_table = old_table
+            self.context.parent_path = old_path
+
+            # Generate SQL using BOOL_AND on the unnested rows
+            # Return just the expression - CTE builder will handle wrapping
+            all_check_sql = f"COALESCE(bool_and({criteria_fragment.expression}), true)"
+
+            return SQLFragment(
+                expression=all_check_sql,
+                source_table=old_table,
+                requires_unnest=False,
+                is_aggregate=True,
+                dependencies=[old_table],
+                metadata={
+                    "function": "all",
+                    "result_type": "boolean",
+                    "exclude_order_from_group_by": True  # SP-108-003: Don't group by order columns
+                }
+            )
+
+        # Case 1: Direct path - create subquery with UNNEST
         # Ensure context path reflects the function target
         self._prefill_path_from_function(node)
 
@@ -11039,6 +11193,11 @@ END"""
         self.context.current_table = element_alias
         self.context.parent_path.clear()  # Reset path since we're now at array element level
 
+        # SP-108-003: Save fragments list to prevent criteria expression from creating CTEs
+        # The criteria should be an inline expression within the subquery, not separate CTEs
+        saved_fragments = self.fragments.copy()
+        self.fragments.clear()
+
         # Translate the criteria expression argument
         # This recursively visits the criteria AST and generates SQL
         total_expr = self.dialect.get_json_array_length(
@@ -11058,6 +11217,10 @@ END"""
             )
         }):
             criteria_fragment = self.visit(node.arguments[0])
+
+        # SP-108-003: Restore fragments list - criteria translation should not create CTEs
+        self.fragments.clear()
+        self.fragments.extend(saved_fragments)
 
         logger.debug(f"Criteria expression SQL: {criteria_fragment.expression}")
 
@@ -12695,6 +12858,71 @@ END"""
         finally:
             if restore_snapshot is not None:
                 self._restore_context(restore_snapshot)
+
+    def _translate_contains_membership(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate membership contains operator to SQL.
+
+        FHIRPath: collection contains value
+        SQL: EXISTS (SELECT 1 FROM json_each(collection) WHERE value = target)
+
+        The membership contains operator tests if a value is a member of a collection.
+        This is a binary operator where both the collection and value are explicit arguments.
+
+        Args:
+            node: FunctionCallNode representing contains() function call with 2 arguments
+
+        Returns:
+            SQLFragment containing the membership test SQL
+
+        Raises:
+            ValueError: If function doesn't have exactly 2 arguments
+
+        Example:
+            (1 | 2 | 3) contains 1:
+            >>> node = FunctionCallNode(function_name="contains", arguments=[collection_node, value_node])
+            >>> fragment = translator._translate_contains_membership(node)
+            >>> fragment.expression
+            "EXISTS (SELECT 1 FROM json_each(...) WHERE value = 1)"
+        """
+        logger.debug(f"Translating membership contains() operator")
+
+        if len(node.arguments) != 2:
+            raise ValueError(
+                f"Membership contains() operator requires exactly 2 arguments (collection, value), "
+                f"got {len(node.arguments)}"
+            )
+
+        # Translate collection (left operand)
+        collection_fragment = self.visit(node.arguments[0])
+        collection_expr = collection_fragment.expression
+
+        # Translate value (right operand)
+        value_fragment = self.visit(node.arguments[1])
+        value_expr = value_fragment.expression
+
+        # Combine dependencies
+        dependencies = list(collection_fragment.dependencies or [])
+        if value_fragment.dependencies:
+            dependencies.extend(value_fragment.dependencies)
+
+        # Use dialect to generate membership test
+        # For simple cases, we can use: value_expr IN (collection_expr)
+        # For JSON arrays, we need: EXISTS (SELECT 1 FROM json_each(collection) WHERE value = value_expr)
+        contains_sql = self.dialect.generate_membership_test(
+            collection_expr,
+            value_expr
+        )
+
+        logger.debug(f"Generated membership contains() SQL: {contains_sql}")
+
+        return SQLFragment(
+            expression=contains_sql,
+            source_table=collection_fragment.source_table,
+            requires_unnest=False,
+            is_aggregate=False,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "contains", "result_type": "boolean"}
+        )
 
     def _translate_startswith(self, node: FunctionCallNode) -> SQLFragment:
         """Translate startsWith() function to SQL for prefix matching.
