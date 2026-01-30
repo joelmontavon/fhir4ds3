@@ -1,0 +1,78 @@
+{
+  "total_tests": 934,
+  "passed_tests": 593,
+  "failed_tests": 341,
+  "compliance_percentage": 63.49036402569593,
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 33,
+      "failed": 39
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 63,
+      "failed": 53
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 69,
+      "failed": 72
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 63,
+      "failed": 50
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 253,
+      "failed": 85
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 49,
+      "failed": 16
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 27,
+      "failed": 1
+    }
+  },
+  "timestamp": "2026-01-29T21:39:26.132561",
+  "execution_time_total_ms": 300051.0456562042,
+  "execution_time_average_ms": 321.2233802235867,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb"
+}

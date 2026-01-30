@@ -633,7 +633,6 @@ class EnhancedASTNode:
                         self.children = enhanced_node.children
                         # Add required operator attributes
                         self.operator = enhanced_node.text
-                        self.operator_type = self._infer_operator_type(enhanced_node.text, enhanced_node.children)
                         # Map to left_operand/right_operand for binary operators
                         if len(enhanced_node.children) >= 2:
                             self.left_operand = enhanced_node.children[0]
@@ -644,6 +643,8 @@ class EnhancedASTNode:
                         else:
                             self.left_operand = None
                             self.right_operand = None
+
+                        self.operator_type = self._infer_operator_type(self.operator, self.children)
 
                     def _infer_operator_type(self, operator, children):
                         """Infer operator type from operator symbol and children count"""
@@ -756,17 +757,24 @@ class EnhancedASTNode:
                         return text.strip()
 
                     def _extract_arguments(self, node):
-                        """Extract actual arguments from ParamList"""
-                        # Look for Functn -> ParamList pattern
+                        """Extract actual arguments from ParamList or FuncParamList"""
+                        # SP-109-003: FuncParamList can be a direct child of functionCall
+                        # Check direct children first for ParamList/FuncParamList
+                        for child in node.children:
+                            if child.node_type in ('ParamList', 'FuncParamList'):
+                                return child.children
+
+                        # Look for Functn -> ParamList/FuncParamList pattern (legacy structure)
                         for child in node.children:
                             # Check if child is Functn (by type or structure)
                             if child.node_type == 'Functn' or (child.text.startswith('(') and child.text.endswith(')')):
                                 for grandchild in child.children:
-                                    if grandchild.node_type == 'ParamList':
+                                    # SP-109-003: Handle both ParamList and FuncParamList node types
+                                    if grandchild.node_type in ('ParamList', 'FuncParamList'):
                                         return grandchild.children
-                                # If Functn found but no ParamList, it means empty arguments
+                                # If Functn found but no ParamList/FuncParamList, it means empty arguments
                                 return []
-                        
+
                         # If no Functn found, fallback to filtering children
                         # This handles cases where arguments might be direct children (unlikely in this parser)
                         return [c for c in node.children if c.node_type != 'Identifier' and c.text != self.function_name]
@@ -813,67 +821,10 @@ class EnhancedASTNode:
                             return v.visit_function_call(self)
                     return MembershipExpressionAdapter(self).accept(visitor)
 
-                # SP-022-009: Handle PolarityExpression (unary minus) before other PATH_EXPRESSION handling
-                # PolarityExpression needs special handling for negation
-                if self.node_type == "PolarityExpression" and self.children:
-                    child = self.children[0]
-                    # Recursively unwrap to find the actual literal
-                    actual_child = child
-                    while (actual_child.children and len(actual_child.children) == 1 and
-                           actual_child.node_type in ['TermExpression', 'InvocationExpression', 'InvocationTerm']):
-                        actual_child = actual_child.children[0]
-
-                    # Check if the actual child is a literal
-                    if (actual_child.metadata and
-                        actual_child.metadata.node_category == NodeCategory.LITERAL):
-                        # Create negated literal
-                        class NegatedLiteralAdapter:
-                            def __init__(self, enhanced_node, original_child):
-                                child_text = original_child.text or ""
-                                self.text = f"-{child_text}"
-                                self.node_type = "literal"
-                                self.enhanced_node = enhanced_node
-                                self.metadata = original_child.metadata
-
-                                # Parse and negate the value
-                                try:
-                                    if '.' in child_text:
-                                        self.value = -float(child_text)
-                                        self.literal_type = "decimal"
-                                    else:
-                                        self.value = -int(child_text)
-                                        self.literal_type = "integer"
-                                except ValueError:
-                                    self.value = child_text
-                                    self.literal_type = "string"
-
-                                self.temporal_info = None
-
-                            def accept(self, v):
-                                return v.visit_literal(self)
-                        return NegatedLiteralAdapter(self, actual_child).accept(visitor)
-                    else:
-                        # General case: create unary operator
-                        class UnaryMinusAdapter:
-                            def __init__(self, enhanced_node):
-                                self.text = enhanced_node.text
-                                self.node_type = "operator"
-                                self.enhanced_node = enhanced_node
-                                self.metadata = enhanced_node.metadata
-                                self.children = enhanced_node.children
-                                self.operator = "unary_minus"
-                                self.operator_type = "unary"
-                                self.left_operand = enhanced_node.children[0] if enhanced_node.children else None
-                                self.right_operand = None
-
-                            def accept(self, v):
-                                return v.visit_operator(self)
-                        return UnaryMinusAdapter(self).accept(visitor)
-
                 # Special case: If this is a wrapper node (like TermExpression) with a single
                 # child, unwrap it and visit the child directly. This prevents wrapper nodes
                 # from being treated as identifiers when they contain other logic.
-                if (self.node_type in ['TermExpression', 'InvocationExpression', 'InvocationTerm'] and
+                if (self.node_type in ['TermExpression', 'InvocationExpression'] and
                     len(self.children) == 1):
                     # Unwrap and visit the child directly
                     return self.children[0].accept(visitor)
@@ -1164,57 +1115,6 @@ class EnhancedASTNode:
                     return v.visit_function_call(self)
             return MembershipExpressionAdapter(self).accept(visitor)
 
-        # SP-023-006: Handle PolarityExpression (unary minus)
-        if self.node_type == "PolarityExpression":
-            if self.children and len(self.children) == 1:
-                # Check if we can fold negation into a literal
-                child = self.children[0]
-                if (child.metadata and
-                    child.metadata.node_category == NodeCategory.LITERAL):
-                    # Create negated literal
-                    class NegatedLiteralAdapter:
-                        def __init__(self, enhanced_node, original_child):
-                            child_text = original_child.text or ""
-                            self.text = f"-{child_text}"
-                            self.node_type = "literal"
-                            self.enhanced_node = enhanced_node
-                            self.metadata = original_child.metadata
-
-                            # Parse and negate the value
-                            try:
-                                if '.' in child_text:
-                                    self.value = -float(child_text)
-                                    self.literal_type = "decimal"
-                                else:
-                                    self.value = -int(child_text)
-                                    self.literal_type = "integer"
-                            except ValueError:
-                                self.value = child_text
-                                self.literal_type = "string"
-
-                            self.temporal_info = None
-
-                        def accept(self, v):
-                            return v.visit_literal(self)
-                    return NegatedLiteralAdapter(self, child).accept(visitor)
-                else:
-                    # General case: create unary operator
-                    class UnaryMinusAdapter:
-                        def __init__(self, enhanced_node):
-                            self.text = enhanced_node.text
-                            self.node_type = "operator"
-                            self.enhanced_node = enhanced_node
-                            self.metadata = enhanced_node.metadata
-                            self.children = enhanced_node.children
-                            self.operator = "unary_minus"
-                            self.operator_type = "unary"
-                            self.left_operand = enhanced_node.children[0] if enhanced_node.children else None
-                            self.right_operand = None
-
-                        def accept(self, v):
-                            return v.visit_operator(self)
-                    return UnaryMinusAdapter(self).accept(visitor)
-
         # Fallback: call generic visit
         return visitor.visit_generic(self)
 
@@ -1464,15 +1364,24 @@ class ASTNodeFactory:
         else:
             children = getattr(fhirpath_node, 'children', [])
 
-        # Look for Functn -> Identifier pattern
+        # SP-109-001: Handle both old and new grammar structures
+        # Old grammar: FunctionInvocation -> Functn -> Identifier
+        # New grammar: FunctionInvocation -> Identifier (direct)
         for child in children:
             if isinstance(child, dict):
                 child_type = child.get('type', '')
                 child_children = child.get('children', [])
+                child_text = child.get('text', '')
             else:
                 child_type = getattr(child, 'type', '')
                 child_children = getattr(child, 'children', [])
+                child_text = getattr(child, 'text', '')
 
+            # Direct Identifier child (new grammar)
+            if child_type == 'Identifier' and child_text:
+                return child_text
+
+            # Functn -> Identifier pattern (old grammar)
             if child_type == 'Functn':
                 # Look for Identifier in Functn children
                 for grandchild in child_children:

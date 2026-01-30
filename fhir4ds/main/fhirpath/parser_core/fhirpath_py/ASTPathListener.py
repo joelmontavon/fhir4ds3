@@ -22,6 +22,9 @@ def has_node_type_text(node_type):
         "TypeSpecifier",
         "InvocationExpression",
         "TermExpression",
+        "UnaryExpressionWrapper",  # SP-109-001: Added for unary operator support
+        "UnaryPolarityTerm",        # SP-109-001: Added for unary operator support
+        "MemberInvocationTerm",     # SP-109-001: Added for member invocation
     ]
 
 
@@ -78,7 +81,7 @@ class ASTPathListener(FHIRPathListener):
     OPERATOR_EXPRESSION_TYPES = {
         "AdditiveExpression",
         "MultiplicativeExpression",
-        "PolarityExpression",
+        "UnaryPolarityTerm",  # SP-109-001: Fixed unary operator precedence
         "InequalityExpression",
         "EqualityExpression",
         "AndExpression",

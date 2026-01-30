@@ -1,0 +1,138 @@
+{
+  "total_tests": 12,
+  "passed_tests": 4,
+  "failed_tests": 8,
+  "compliance_percentage": 33.33333333333333,
+  "execution_time_total_ms": 5113.53063583374,
+  "execution_time_average_ms": 426.10442638397217,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-28T17:02:02.390503",
+  "test_categories": {
+    "collection_functions": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1
+    },
+    "comparison_operators": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "function_calls": {
+      "total": 4,
+      "passed": 3,
+      "failed": 1
+    },
+    "arithmetic_operators": {
+      "total": 2,
+      "passed": 0,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 4,
+      "passed": 0,
+      "failed": 4
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 356.07266426086426,
+    "max_execution_time_ms": 922.9860305786133,
+    "median_execution_time_ms": 385.58971881866455,
+    "std_dev_execution_time_ms": 157.43798419766821
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testCollectionNotEmpty",
+      "expression": "Patient.name.given.empty().not()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 922.9860305786133,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "testCollectionBoolean1",
+      "expression": "iif(1 | 2 | 3, true, false)",
+      "error": "Expected semantic failure but expression was accepted.",
+      "execution_time_ms": 356.07266426086426,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testCollectionBoolean5",
+      "expression": "iif(true, true, 1/0)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 409.7936153411865,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Cannot mix values of type DOUBLE and BOOLEAN in CASE expression - an explicit cast is required\n\nLINE 3:     SELECT resource.id, resource, CASE WHEN TRUE IS NULL THEN NULL WHEN TRUE THEN TRUE ELSE...\n                                          ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testCollectionBoolean6",
+      "expression": "iif(false, 1/0, true)",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 403.64551544189453,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Binder Error: Cannot mix values of type BOOLEAN and DOUBLE in CASE expression - an explicit cast is required\n\nLINE 3:     SELECT resource.id, resource, CASE WHEN FALSE IS NULL THEN NULL WHEN FALSE THEN (CASE...\n                                          ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testContainsCollection1",
+      "expression": "(1 | 2 | 3) contains 1",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 369.9328899383545,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testContainsCollection2",
+      "expression": "(2 | 3) contains 1 ",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 368.69287490844727,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testContainsCollection3",
+      "expression": "('a' | 'c' | 'd') contains 'a'",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 393.0685520172119,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    },
+    {
+      "name": "testContainsCollection4",
+      "expression": "('a' | 'c' | 'd') contains 'b'",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 356.54759407043457,
+      "actual_result": {
+        "is_valid": true,
+        "result": []
+      }
+    }
+  ]
+}

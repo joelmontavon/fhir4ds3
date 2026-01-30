@@ -1,0 +1,106 @@
+{
+  "sessionId": "ultrapilot-20250128-sp108",
+  "taskDescription": "SP-108 FHIRPath Compliance Sprint - Achieve 70%+ compliance through parallel work on arithmetic, type, and collection functions",
+  "phase": "decomposition",
+  "createdAt": "2026-01-28T10:00:00Z",
+  "parallelizable": true,
+  "confidence": 0.95,
+  "subtasks": [
+    {
+      "id": "worker-1",
+      "title": "SP-108-001: Arithmetic Operators",
+      "description": "Fix arithmetic operators to achieve 100% compliance (42 tests, +4.5% overall). Focus on unary polarity, negative literals, and decimal precision.",
+      "impact": "+4.5% overall compliance",
+      "effort": "8-12 hours",
+      "priority": "P0",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/parser_core/semantic_validator.py",
+        "fhir4ds/main/fhirpath/parser_core/parser_core.py",
+        "fhir4ds/main/fhirpath/sql/translator.py"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/operators/arithmetic/**"
+      ],
+      "testCategories": ["arithmetic_operators"],
+      "dependencies": [],
+      "boundaryFiles": [
+        "fhir4ds/main/fhirpath/types/type_registry.py"
+      ]
+    },
+    {
+      "id": "worker-2",
+      "title": "SP-108-002: Type Functions",
+      "description": "Fix type functions to achieve 100% compliance (60 tests, +6.4% overall). Focus on type conversion, is()/as()/ofType(), and decimal precision.",
+      "impact": "+6.4% overall compliance",
+      "effort": "12-16 hours",
+      "priority": "P0",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/types/type_registry.py",
+        "fhir4ds/main/fhirpath/functions/type_functions.py"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/types/**",
+        "fhir4ds/main/fhirpath/functions/type*/**"
+      ],
+      "testCategories": ["type_functions"],
+      "dependencies": [],
+      "boundaryFiles": [
+        "fhir4ds/main/fhirpath/sql/translator.py",
+        "fhir4ds/dialects/duckdb.py",
+        "fhir4ds/dialects/postgresql.py"
+      ]
+    },
+    {
+      "id": "worker-3",
+      "title": "SP-108-003: Collection Functions",
+      "description": "Fix collection functions to achieve 100% compliance (76 tests, +8.1% overall). Focus on where(), select(), quantifiers, and aggregate().",
+      "impact": "+8.1% overall compliance",
+      "effort": "16-20 hours",
+      "priority": "P1",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/functions/collection_functions.py",
+        "fhir4ds/main/fhirpath/sql/cte/**"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/functions/collection*/**"
+      ],
+      "testCategories": ["collection_functions"],
+      "dependencies": [],
+      "boundaryFiles": [
+        "fhir4ds/main/fhirpath/sql/translator.py",
+        "fhir4ds/main/fhirpath/types/type_registry.py"
+      ]
+    }
+  ],
+  "sharedFiles": [
+    "fhir4ds/main/fhirpath/sql/translator.py",
+    "fhir4ds/main/fhirpath/types/type_registry.py",
+    "fhir4ds/dialects/duckdb.py",
+    "fhir4ds/dialects/postgresql.py",
+    "tests/integration/fhirpath/official_test_runner.py",
+    "compliance_report_*.json"
+  ],
+  "conflictPolicy": "coordinator-handles",
+  "integrationStrategy": "sequential",
+  "testingRequirements": {
+    "testCommand": "python3 -m pytest tests/integration/fhirpath/official_test_runner.py -v",
+    "databases": ["duckdb", "postgresql"],
+    "regressionCheck": true,
+    "complianceTarget": 70.0
+  },
+  "successCriteria": {
+    "minimum": "65%+ compliance (P0 tasks complete)",
+    "target": "70%+ compliance",
+    "stretch": "75%+ compliance (P0 + partial P1)",
+    "requirements": [
+      "All code reviewed and approved",
+      "No regressions in passing categories",
+      "Both DuckDB and PostgreSQL passing"
+    ]
+  },
+  "riskAssessment": {
+    "parallelizable": "HIGH - Tasks operate on different components with minimal overlap",
+    "conflictRisk": "LOW - Shared files well-defined, coordinator will handle integration",
+    "fallbackStrategy": "Continue with P0 tasks sequentially if parallel execution fails"
+  }
+}

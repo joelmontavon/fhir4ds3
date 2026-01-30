@@ -1,0 +1,212 @@
+{
+  "total_tests": 934,
+  "passed_tests": 582,
+  "failed_tests": 352,
+  "compliance_percentage": 62.31263383297645,
+  "execution_time_total_ms": 340201.1570930481,
+  "execution_time_average_ms": 364.204759260827,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb",
+  "timestamp": "2026-01-28T15:03:22.914131",
+  "test_categories": {
+    "comments_syntax": {
+      "total": 32,
+      "passed": 11,
+      "failed": 21
+    },
+    "arithmetic_operators": {
+      "total": 72,
+      "passed": 33,
+      "failed": 39
+    },
+    "basic_expressions": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "path_navigation": {
+      "total": 10,
+      "passed": 9,
+      "failed": 1
+    },
+    "error_handling": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    "type_functions": {
+      "total": 116,
+      "passed": 63,
+      "failed": 53
+    },
+    "collection_functions": {
+      "total": 141,
+      "passed": 65,
+      "failed": 76
+    },
+    "function_calls": {
+      "total": 113,
+      "passed": 62,
+      "failed": 51
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 251,
+      "failed": 87
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 65,
+      "passed": 45,
+      "failed": 20
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 27,
+      "failed": 1
+    }
+  },
+  "performance_metrics": {
+    "min_execution_time_ms": 0.014781951904296875,
+    "max_execution_time_ms": 846.2331295013428,
+    "median_execution_time_ms": 422.7532148361206,
+    "std_dev_execution_time_ms": 168.94162342466277
+  },
+  "failed_test_analysis": [
+    {
+      "name": "testDateNotEqualTimeSecond",
+      "expression": "Patient.birthDate != @T12:14:15",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 1.5790462493896484,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Cannot compare DATE field/value with TIME literal. DATE and TIME are incompatible types for comparison. DATE represents a calendar date or timestamp, while TIME represents time-of-day without date context. Use compatible temporal types or extract components explicitly.",
+        "result": null,
+        "error_type": "parse"
+      }
+    },
+    {
+      "name": "testDateNotEqualTimeMinute",
+      "expression": "Patient.birthDate != @T12:14",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 0.5595684051513672,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Cannot compare DATE field/value with TIME literal. DATE and TIME are incompatible types for comparison. DATE represents a calendar date or timestamp, while TIME represents time-of-day without date context. Use compatible temporal types or extract components explicitly.",
+        "result": null,
+        "error_type": "parse"
+      }
+    },
+    {
+      "name": "testDateTimeGreaterThanDate2",
+      "expression": "now() > today()",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 362.3356819152832,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeTZGreater",
+      "expression": "@2017-11-05T01:30:00.0-04:00 > @2017-11-05T01:15:00.0-05:00",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 406.0187339782715,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeTZLess",
+      "expression": "@2017-11-05T01:30:00.0-04:00 < @2017-11-05T01:15:00.0-05:00",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 375.58746337890625,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testLiteralDateTimeTZEqualTrue",
+      "expression": "@2017-11-05T01:30:00.0-04:00 = @2017-11-05T00:30:00.0-05:00",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 386.46531105041504,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
+        ]
+      }
+    },
+    {
+      "name": "testCollectionNotEmpty",
+      "expression": "Patient.name.given.empty().not()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 409.273624420166,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "testExpressions",
+      "expression": "Patient.name.select(given | family).distinct()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 371.6859817504883,
+      "actual_result": {
+        "is_valid": false,
+        "error": "Conversion Error: Malformed JSON at byte 0 of input: unexpected character.  Input: \"Windsor\"\n\nLINE 14: ...(cte_1_item, '$.family') IS NULL THEN NULL WHEN (json_type(CAST(json_extract_string(cte_1_item, '$.family') AS JSON...\n                                                                       ^",
+        "error_type": "execution",
+        "result": null
+      }
+    },
+    {
+      "name": "testExpressionsEqual",
+      "expression": "Patient.name.given.count() = 1 + 4",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 371.94108963012695,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          5
+        ]
+      }
+    },
+    {
+      "name": "testNotEmpty",
+      "expression": "Patient.name.empty().not()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 440.824031829834,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true,
+          true,
+          true
+        ]
+      }
+    }
+  ]
+}

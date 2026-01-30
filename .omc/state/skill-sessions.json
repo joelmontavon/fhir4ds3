@@ -1,0 +1,12 @@
+{
+  "sessions": {
+    "unknown": {
+      "injectedPaths": [
+        "/mnt/d/fhir4ds3/.omc/skills/run-full-test-suite/SKILL.md",
+        "/mnt/d/fhir4ds3/.omc/skills/architecture-deep-dive/SKILL.md",
+        "/mnt/d/fhir4ds3/.omc/skills/code-quality-audit/SKILL.md"
+      ],
+      "timestamp": 1769746538205
+    }
+  }
+}

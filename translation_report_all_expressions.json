@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-01-27T23:45:43.800840",
+  "timestamp": "2026-01-29T00:25:51.052036",
   "total_expressions": 934,
-  "overall_success_rate": 83.61884368308351,
+  "overall_success_rate": 84.36830835117773,
   "category_breakdown": {
     "comments_syntax": {
       "total": 32,
@@ -11,9 +11,9 @@
     },
     "arithmetic_operators": {
       "total": 87,
-      "success": 62,
-      "failed": 25,
-      "success_rate": 71.26436781609196
+      "success": 63,
+      "failed": 24,
+      "success_rate": 72.41379310344827
     },
     "basic_expressions": {
       "total": 28,
@@ -35,15 +35,15 @@
     },
     "collection_functions": {
       "total": 130,
-      "success": 115,
-      "failed": 15,
-      "success_rate": 88.46153846153845
+      "success": 116,
+      "failed": 14,
+      "success_rate": 89.23076923076924
     },
     "comparison_operators": {
       "total": 336,
-      "success": 298,
-      "failed": 38,
-      "success_rate": 88.69047619047619
+      "success": 303,
+      "failed": 33,
+      "success_rate": 90.17857142857143
     },
     "datetime_functions": {
       "total": 8,
@@ -130,6 +130,18 @@
       "expression": "@T14:34:28+10:00.is(Time)",
       "category": "type_functions",
       "error": "Time literal '@T14:34:28+10:00' is invalid: Time literals cannot have timezone suffixes. Use DateTime literal format (e.g., @2015-02-04T+10:00) for time with timezone."
+    },
+    {
+      "name": "testDateNotEqualTimeSecond",
+      "expression": "Patient.birthDate != @T12:14:15",
+      "category": "comparison_operators",
+      "error": "Cannot compare DATE field/value with TIME literal. DATE and TIME are incompatible types for comparison. DATE represents a calendar date or timestamp, while TIME represents time-of-day without date context. Use compatible temporal types or extract components explicitly."
+    },
+    {
+      "name": "testDateNotEqualTimeMinute",
+      "expression": "Patient.birthDate != @T12:14",
+      "category": "comparison_operators",
+      "error": "Cannot compare DATE field/value with TIME literal. DATE and TIME are incompatible types for comparison. DATE represents a calendar date or timestamp, while TIME represents time-of-day without date context. Use compatible temporal types or extract components explicitly."
     },
     {
       "name": "testExists4",
@@ -297,13 +309,13 @@
       "name": "testUnescapeHtml",
       "expression": "'&quot;1&lt;2&quot;'.unescape('html')",
       "category": "path_navigation",
-      "error": "Unknown function 'unescape' at line 1, column 22. Refer to the FHIRPath specification for supported functions."
+      "error": "Unknown function 'unescape' at line 1, column 22. Did you mean 'truncate'?"
     },
     {
       "name": "testUnescapeJson",
       "expression": "'\\\"1<2\\\"'.unescape('json')",
       "category": "comparison_operators",
-      "error": "Unknown function 'unescape' at line 1, column 11. Refer to the FHIRPath specification for supported functions."
+      "error": "Unknown function 'unescape' at line 1, column 11. Did you mean 'truncate'?"
     },
     {
       "name": "testTrim1",
@@ -363,18 +375,6 @@
       "name": "testSort1",
       "expression": "(1 | 2 | 3).sort() = (1 | 2 | 3)",
       "category": "comparison_operators",
-      "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
-    },
-    {
-      "name": "testSort2",
-      "expression": "(3 | 2 | 1).sort() = (1 | 2 | 3)",
-      "category": "comparison_operators",
-      "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
-    },
-    {
-      "name": "testSort3",
-      "expression": "(1 | 2 | 3).sort($this) = (1 | 2 | 3)",
-      "category": "type_functions",
       "error": "Unknown function 'sort' at line 1, column 13. Did you mean 'sqrt'?"
     }
   ]

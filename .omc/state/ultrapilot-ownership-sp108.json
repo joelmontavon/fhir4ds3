@@ -1,0 +1,65 @@
+{
+  "sessionId": "ultrapilot-20250128-sp108",
+  "updatedAt": "2026-01-28T10:00:00Z",
+  "workers": {
+    "worker-1": {
+      "task": "SP-108-001: Arithmetic Operators",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/parser_core/semantic_validator.py",
+        "fhir4ds/main/fhirpath/parser_core/parser_core.py"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/operators/arithmetic/**"
+      ],
+      "boundaryImports": [
+        "fhir4ds.main.fhirpath.types.type_registry",
+        "fhir4ds.main.fhirpath.sql.translator"
+      ],
+      "testCategories": ["arithmetic_operators"]
+    },
+    "worker-2": {
+      "task": "SP-108-002: Type Functions",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/types/type_registry.py",
+        "fhir4ds/main/fhirpath/functions/type_functions.py"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/types/**",
+        "fhir4ds/main/fhirpath/functions/type*/**"
+      ],
+      "boundaryImports": [
+        "fhir4ds.main.fhirpath.sql.translator",
+        "fhir4ds.dialects.duckdb",
+        "fhir4ds.dialects.postgresql"
+      ],
+      "testCategories": ["type_functions"]
+    },
+    "worker-3": {
+      "task": "SP-108-003: Collection Functions",
+      "ownedFiles": [
+        "fhir4ds/main/fhirpath/functions/collection_functions.py"
+      ],
+      "ownedGlobs": [
+        "fhir4ds/main/fhirpath/functions/collection*/**",
+        "fhir4ds/main/fhirpath/sql/cte/**"
+      ],
+      "boundaryImports": [
+        "fhir4ds.main.fhirpath.sql.translator",
+        "fhir4ds.main.fhirpath.types.type_registry"
+      ],
+      "testCategories": ["collection_functions"]
+    }
+  },
+  "sharedFiles": [
+    "fhir4ds/main/fhirpath/sql/translator.py",
+    "fhir4ds/main/fhirpath/types/type_registry.py",
+    "fhir4ds/dialects/duckdb.py",
+    "fhir4ds/dialects/postgresql.py"
+  ],
+  "integrationOrder": [
+    "worker-1",
+    "worker-2",
+    "worker-3"
+  ],
+  "conflictPolicy": "coordinator-handles"
+}

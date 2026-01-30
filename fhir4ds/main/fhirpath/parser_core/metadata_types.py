@@ -228,9 +228,6 @@ class MetadataBuilder:
             else:
                 # Path expression / identifier nodes
                 builder.with_category(NodeCategory.PATH_EXPRESSION)
-        elif node_type == 'PolarityExpression':
-            # SP-024-001: PolarityExpression is a unary operator (+/-) not a path expression
-            builder.with_category(NodeCategory.OPERATOR)
         elif node_type in ['TypeSpecifier', 'TypeExpression']:
             # Type operation nodes
             builder.with_category(NodeCategory.TYPE_OPERATION)

@@ -263,7 +263,7 @@ class PathNavigationComplianceRunner:
         """Evaluate a single test case and construct the result payload."""
         actual_row_count = len(raw_rows)
         actual_unique_ids = len({row[0] for row in raw_rows})
-        normalized_values = [self._normalize_value(row[1]) for row in raw_rows]
+        normalized_values = [self._normalize_value(row[-1]) for row in raw_rows]
 
         expected_samples = {self._canonicalize(value) for value in test_case.expected_sample_values}
         actual_samples = {self._canonicalize(value) for value in normalized_values}

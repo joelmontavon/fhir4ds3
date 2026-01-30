@@ -6653,7 +6653,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         wrapper_types = {
             'TermExpression',
+            'TermExpressionTerm',
             'InvocationTerm',
+            'InvocationExpression',
             'PolarityExpression',
         }
 
@@ -10268,13 +10270,41 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 f"got {len(node.arguments)}"
             )
 
-        # Ensure context path reflects the function target
-        self._prefill_path_from_function(node)
+        # SP-109-004: Use _resolve_function_target to get correct source table from context
+        # This fixes CTE chaining issue where select() was using 'resource' instead of
+        # the previous CTE when called after functions like take()
+        (
+            collection_expr,
+            dependencies,
+            _,
+            snapshot,
+            _,
+            target_path,
+        ) = self._resolve_function_target(node)
+
+        # SP-109-004: Determine the correct source table for select()
+        # The key insight is that we need to check if fragments have already been generated
+        # for the target expression. If so, we should use the last fragment's source_table.
+        # If not, we use the current context's table.
+
+        # Check the current context AFTER _resolve_function_target has processed the target
+        current_table_after_target = self.context.current_table
+
+        # Also check if there are fragments with a non-resource source_table
+        non_resource_fragments = [f for f in self.fragments if f.source_table and f.source_table not in ("resource", "patient_resources")]
+
+        if non_resource_fragments:
+            # Use the most recent fragment's source_table (likely a CTE)
+            source_table = non_resource_fragments[-1].source_table
+        elif current_table_after_target and current_table_after_target not in ("resource", "patient_resources"):
+            # Context has been updated to a CTE
+            source_table = current_table_after_target
+        else:
+            # Fall back to snapshot's current_table
+            source_table = snapshot["current_table"]
 
         # Get the array path from current context
         array_path = self.context.get_json_path()
-
-        logger.debug(f"Array path for select(): {array_path}")
 
         # Generate unique CTE and array element alias names
         cte_name = self.context.next_cte_name()
@@ -10283,7 +10313,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         logger.debug(f"Generated CTE name: {cte_name}, array alias: {array_alias}")
 
         # Save current context state for restoration
-        old_table = self.context.current_table
+        old_table = source_table
         old_path = self.context.parent_path.copy()
 
         # Update context to reference array elements for projection expression translation
@@ -10324,9 +10354,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Clear parent_path so count() won't try to extract from a JSON path.
         self.context.parent_path.clear()
 
-        # Use enumerate_json_array to get both value and index
-        # This generates: SELECT index, value FROM enumerate_json_array(...)
-        array_expr = self.dialect.extract_json_object(old_table, array_path) if array_path and array_path != "$" else old_table
+        # SP-109-004: Determine what to enumerate for select()
+        # If there's a subset_filter (take/first/last/skip/where), the data is in the 'result' column
+        # Otherwise, extract from JSON path or use the table directly
+
+        # Also check if there's a subset_filter in recent fragments (indicating take/first/last/where)
+        has_subset_filter = any(
+            f.metadata.get("subset_filter") or f.metadata.get("function") in ["take", "first", "last", "skip", "where"]
+            for f in self.fragments
+        )
+
+        if has_subset_filter:
+            # After a subset filter, data is in the 'result' column
+            array_expr = "<<SOURCE_TABLE>>.result"
+        elif array_path and array_path != "$":
+            # Original resource table - extract from JSON path
+            array_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
+        else:
+            # Root level table - use table directly
+            array_expr = "<<SOURCE_TABLE>>"
+
         enumerate_sql = self.dialect.enumerate_json_array(array_expr, array_alias, index_alias)
 
         logger.debug(f"Enumerate SQL: {enumerate_sql}")
@@ -10341,15 +10388,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Construct complete SQL fragment with SELECT, FROM, LATERAL enumeration, GROUP BY
         # This is population-friendly: processes entire array without row-by-row iteration
         # SP-022-019: Include resource column for subsequent CTEs to reference
-        sql = f"""SELECT {old_table}.id, {old_table}.resource,
+        # SP-109-004: Use unqualified column references and a placeholder table name.
+        # The CTEManager will substitute the correct source table when wrapping this fragment.
+        sql = f"""SELECT <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource,
        {aggregate_expr} as result
-FROM {old_table}, LATERAL ({enumerate_sql}) AS enum_table
-GROUP BY {old_table}.id, {old_table}.resource"""
+FROM <<SOURCE_TABLE>>, LATERAL ({enumerate_sql}) AS enum_table
+GROUP BY <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource"""
+        # Note: '<<SOURCE_TABLE>>' will be replaced by CTEManager with the actual source table
 
         logger.debug(f"Complete select() SQL fragment generated")
 
         # Update context to reference the new CTE for subsequent operations
         self.context.current_table = cte_name
+
+        # SP-109-004: Restore context from snapshot to maintain proper CTE chaining
+        self._restore_context(snapshot)
 
         # Return SQL fragment with metadata
         # SP-022-019: Set requires_unnest=False since select() generates a complete

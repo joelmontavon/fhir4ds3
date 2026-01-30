@@ -636,7 +636,21 @@ class CTEManager:
             raise ValueError("SQLFragment expression cannot be empty when wrapping CTE")
 
         # If the translator already provided a full SELECT statement, respect it.
+        # SP-109-004: If it contains <<SOURCE_TABLE>>, substitute the actual source_table
         if expression.upper().startswith("SELECT"):
+            if "<<SOURCE_TABLE>>" in expression:
+                # Validate source_table is a safe SQL identifier before substitution
+                # This prevents SQL injection by ensuring only valid table names are used
+                import re
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', source_table):
+                    raise ValueError(f"Invalid table name for substitution: {source_table}")
+                # Substitute <<SOURCE_TABLE>> with the actual source_table
+                # This handles both "<<SOURCE_TABLE>>" and "<<SOURCE_TABLE>>.result"
+                original_expression = expression
+                expression = expression.replace('<<SOURCE_TABLE>>', source_table)
+                # Verify substitution was successful
+                if "<<SOURCE_TABLE>>" in expression:
+                    raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
             return expression
 
         result_alias = fragment.metadata.get("result_alias", "result")

@@ -1,23 +1,23 @@
 {
   "total_tests": 50,
-  "passed_tests": 42,
-  "failed_tests": 8,
-  "compliance_percentage": 84.0,
-  "execution_time_total_ms": 18385.414123535156,
-  "execution_time_average_ms": 367.6780128479004,
+  "passed_tests": 50,
+  "failed_tests": 0,
+  "compliance_percentage": 100.0,
+  "execution_time_total_ms": 18768.409967422485,
+  "execution_time_average_ms": 375.33812046051025,
   "parser_type": "FHIRPathParser",
   "database_type": "duckdb",
-  "timestamp": "2026-01-25T08:15:16.668889",
+  "timestamp": "2026-01-28T13:49:32.553073",
   "test_categories": {
     "comments_syntax": {
       "total": 8,
-      "passed": 7,
-      "failed": 1
+      "passed": 8,
+      "failed": 0
     },
     "arithmetic_operators": {
       "total": 4,
-      "passed": 3,
-      "failed": 1
+      "passed": 4,
+      "failed": 0
     },
     "basic_expressions": {
       "total": 2,
@@ -31,18 +31,18 @@
     },
     "error_handling": {
       "total": 2,
-      "passed": 1,
-      "failed": 1
+      "passed": 2,
+      "failed": 0
     },
     "type_functions": {
       "total": 8,
-      "passed": 7,
-      "failed": 1
+      "passed": 8,
+      "failed": 0
     },
     "collection_functions": {
       "total": 8,
-      "passed": 4,
-      "failed": 4
+      "passed": 8,
+      "failed": 0
     },
     "function_calls": {
       "total": 9,
@@ -51,107 +51,10 @@
     }
   },
   "performance_metrics": {
-    "min_execution_time_ms": 0.040531158447265625,
-    "max_execution_time_ms": 683.8469505310059,
-    "median_execution_time_ms": 396.0932493209839,
-    "std_dev_execution_time_ms": 146.01163270556023
+    "min_execution_time_ms": 0.015020370483398438,
+    "max_execution_time_ms": 701.8630504608154,
+    "median_execution_time_ms": 413.04945945739746,
+    "std_dev_execution_time_ms": 161.89309126485375
   },
-  "failed_test_analysis": [
-    {
-      "name": "testComment7",
-      "expression": "2 + 2 /",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 433.54010581970215,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Unknown unary operator: /",
-        "error_type": "ValueError",
-        "result": null
-      }
-    },
-    {
-      "name": "testComment8",
-      "expression": "2 + 2 /* not finished",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 0.040531158447265625,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Unterminated block comment starting at line 1, column 7.",
-        "result": null,
-        "error_type": "parse"
-      }
-    },
-    {
-      "name": "testPolymorphismIsA3",
-      "expression": "Observation.issued is instant",
-      "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 406.83960914611816,
-      "actual_result": {
-        "is_valid": true,
-        "result": [
-          false
-        ]
-      }
-    },
-    {
-      "name": "testDollarThis1",
-      "expression": "Patient.name.given.where(substring($this.length()-3) = 'out')",
-      "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 417.1416759490967,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_extract(name_item, '$.given[*]')\", ['name', 'given...\n                                ^",
-        "error_type": "BinderException",
-        "result": null
-      }
-    },
-    {
-      "name": "testDollarThis2",
-      "expression": "Patient.name.given.where(substring($this.length()-3) = 'ter')",
-      "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 404.5743942260742,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Binder Error: Referenced column \"json_extract(name_item, '$.given[*]')\" not found in FROM clause!\nCandidate bindings: \"resource\", \"cte_1_order\", \"cte_2_order\"\n\nLINE 13:     WHERE ((CASE WHEN (\"json_extract(name_item, '$.given[*]')\", ['name', 'given...\n                                ^",
-        "error_type": "BinderException",
-        "result": null
-      }
-    },
-    {
-      "name": "testDollarOrderAllowed",
-      "expression": "Patient.name.skip(1).given",
-      "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 397.6912498474121,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Binder Error: Referenced column \"name_item\" not found in FROM clause!\nCandidate bindings: \"cte_1_order\", \"result\"\n\nLINE 13:     FROM cte_2, LATERAL UNNEST(json_extract(name_item, '$.given[*]')) AS given_item\n                                                     ^",
-        "error_type": "BinderException",
-        "result": null
-      }
-    },
-    {
-      "name": "testDollarOrderAllowedA",
-      "expression": "Patient.name.skip(3).given",
-      "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 507.5104236602783,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Binder Error: Referenced column \"name_item\" not found in FROM clause!\nCandidate bindings: \"cte_1_order\", \"result\"\n\nLINE 13:     FROM cte_2, LATERAL UNNEST(json_extract(name_item, '$.given[*]')) AS given_item\n                                                     ^",
-        "error_type": "BinderException",
-        "result": null
-      }
-    },
-    {
-      "name": "testLiteralIntegerNegative1Invalid",
-      "expression": "-1.convertsToInteger()",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 439.8541450500488,
-      "actual_result": {
-        "is_valid": false,
-        "error": "Binder Error: No function matches the given name and argument types '-(BOOLEAN)'. You might need to add explicit type casts.\n\tCandidate functions:\n\t-(TINYINT) -> TINYINT\n\t-(TINYINT, TINYINT) -> TINYINT\n\t-(SMALLINT) -> SMALLINT\n\t-(SMALLINT, SMALLINT) -> SMALLINT\n\t-(INTEGER) -> INTEGER\n\t-(INTEGER, INTEGER) -> INTEGER\n\t-(BIGINT) -> BIGINT\n\t-(BIGINT, BIGINT) -> BIGINT\n\t-(HUGEINT) -> HUGEINT\n\t-(HUGEINT, HUGEINT) -> HUGEINT\n\t-(FLOAT) -> FLOAT\n\t-(FLOAT, FLOAT) -> FLOAT\n\t-(DOUBLE) -> DOUBLE\n\t-(DOUBLE, DOUBLE) -> DOUBLE\n\t-(DECIMAL) -> DECIMAL\n\t-(DECIMAL, DECIMAL) -> DECIMAL\n\t-(UTINYINT) -> UTINYINT\n\t-(UTINYINT, UTINYINT) -> UTINYINT\n\t-(USMALLINT) -> USMALLINT\n\t-(USMALLINT, USMALLINT) -> USMALLINT\n\t-(UINTEGER) -> UINTEGER\n\t-(UINTEGER, UINTEGER) -> UINTEGER\n\t-(UBIGINT) -> UBIGINT\n\t-(UBIGINT, UBIGINT) -> UBIGINT\n\t-(UHUGEINT) -> UHUGEINT\n\t-(UHUGEINT, UHUGEINT) -> UHUGEINT\n\t-(DATE, DATE) -> BIGINT\n\t-(DATE, INTEGER) -> DATE\n\t-(TIMESTAMP, TIMESTAMP) -> INTERVAL\n\t-(INTERVAL, INTERVAL) -> INTERVAL\n\t-(DATE, INTERVAL) -> TIMESTAMP\n\t-(TIME, INTERVAL) -> TIME\n\t-(TIMESTAMP, INTERVAL) -> TIMESTAMP\n\t-(TIME WITH TIME ZONE, INTERVAL) -> TIME WITH TIME ZONE\n\t-(INTERVAL) -> INTERVAL\n\t-(TIMESTAMP WITH TIME ZONE, INTERVAL) -> TIMESTAMP WITH TIME ZONE\n\t-(TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH TIME ZONE) -> INTERVAL\n\n\nLINE 11:     SELECT cte_2.id, cte_2.resource, (- CASE WHEN (TRY_CAST(1 AS INTEGER) IS NOT NULL AND (TRY_CAST...\n                                               ^",
-        "error_type": "BinderException",
-        "result": null
-      }
-    }
-  ]
+  "failed_test_analysis": []
 }

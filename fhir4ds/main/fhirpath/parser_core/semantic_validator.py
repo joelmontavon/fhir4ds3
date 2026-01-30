@@ -130,15 +130,17 @@ class SemanticValidator:
         """
         collapsed = re.sub(r"\s+", "", raw_expression or "")
 
-        self._validate_context_root(raw_expression, context)
-        self._validate_choice_aliases(collapsed)
-        self._validate_identifier_suffixes(raw_expression)
-        self._validate_period_property_access(collapsed)
-        self._validate_time_literal_timezones(raw_expression)
-
+        # SP-109-002: Create masked expression before identifier validation to avoid
+        # false positives from URLs in string literals (e.g., 'http://hl7.org/...')
         masked_expression = self._mask_expression(raw_expression or "")
         masked_with_backticks = self._mask_expression(raw_expression or "", preserve_backticks=True)
         snippet_state: Dict[str, int] = {}
+
+        self._validate_context_root(raw_expression, context)
+        self._validate_choice_aliases(collapsed)
+        self._validate_identifier_suffixes(masked_expression)  # Use masked to avoid string literal matches
+        self._validate_period_property_access(collapsed)
+        self._validate_time_literal_timezones(raw_expression)
 
         if parsed_expression is not None and parsed_expression.ast is not None:
             # SP-102-004: Validate incomplete expressions
@@ -570,6 +572,17 @@ class SemanticValidator:
             # Skip path validation - type changes make it unreliable
             return
 
+        # SP-109-002: Skip path validation for paths containing collection subset functions
+        # Functions like skip(), take(), first(), last() in the middle of paths break
+        # the regex-based path validation because the regex doesn't handle function calls.
+        # We skip validation for these paths since the functions preserve the element type.
+        collection_subset_functions = ('skip(', 'take(', 'first(', 'last(', 'subset(')
+        has_collection_subset = any(func in collapsed for func in collection_subset_functions)
+
+        if has_collection_subset:
+            # Skip path validation - collection subsets preserve element types
+            return
+
         # Absolute paths (Patient.name.given)
         for match in self._absolute_path_rgx.finditer(masked_with_backticks):
             path = match.group(1)
@@ -632,8 +645,15 @@ class SemanticValidator:
 
         for idx in segment_range:
             raw_segment = segments[idx]
-            if self._is_known_function(raw_segment):
-                break
+
+            # SP-109-002: Skip validation for function call segments
+            # Extract function name from segments like "skip(3)" or "take(4)"
+            segment_name = raw_segment.split('(')[0] if '(' in raw_segment else raw_segment
+            if self._is_known_function(segment_name):
+                # Function calls don't change the element type for collection subsets
+                # e.g., name.skip(3) still returns a collection of HumanName
+                # Skip this segment but keep current_type unchanged for next segment
+                continue
 
             segment = raw_segment.strip("`")
             if not segment:
