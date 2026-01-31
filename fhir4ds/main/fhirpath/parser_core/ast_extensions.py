@@ -172,6 +172,15 @@ class EnhancedASTNode:
         if self.node_type == "TermExpression" and self.children and len(self.children) == 1:
             return self.children[0].accept(visitor)
 
+        # SP-110-005: Handle PolarityExpression (unary +, -) by calling specialized visitor
+        # This ensures unary operators are properly translated rather than treated as path navigation
+        if self.node_type == "PolarityExpression":
+            # Check if visitor has the specialized method
+            if hasattr(visitor, 'visit_polarity_expression'):
+                return visitor.visit_polarity_expression(self)
+            # Otherwise fall back to generic visitor
+            return visitor.visit_generic(self)
+
         # Map node types to visitor methods based on metadata category
         if self.metadata:
             category = self.metadata.node_category
@@ -824,8 +833,11 @@ class EnhancedASTNode:
                 # Special case: If this is a wrapper node (like TermExpression) with a single
                 # child, unwrap it and visit the child directly. This prevents wrapper nodes
                 # from being treated as identifiers when they contain other logic.
-                if (self.node_type in ['TermExpression', 'InvocationExpression'] and
-                    len(self.children) == 1):
+                # SP-110-002: Added InvocationTerm and MemberInvocation to unwrapping logic
+                # to handle cases where these wrapper nodes have empty text attributes,
+                # which would otherwise create IdentifierNodeAdapters with empty identifiers.
+                wrapper_types = ['TermExpression', 'InvocationExpression', 'InvocationTerm', 'MemberInvocation']
+                if (self.node_type in wrapper_types and len(self.children) == 1):
                     # Unwrap and visit the child directly
                     return self.children[0].accept(visitor)
 

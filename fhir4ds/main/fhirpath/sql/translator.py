@@ -8338,6 +8338,104 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         finally:
             self._restore_context(snapshot)
 
+    def visit_polarity_expression(self, node: Any) -> SQLFragment:
+        """Translate unary polarity expressions (+, -) to SQL.
+
+        Handles unary plus and minus operators applied to expressions.
+        In FHIRPath, unary operators have high precedence and bind tightly
+        to their operands.
+
+        This method ensures that expressions like (-1) are correctly translated
+        as negative literals, and that attempting to negate a boolean results
+        in a type error (as expected by FHIRPath semantics).
+
+        Grammar:
+            PolarityExpression: ('+' | '-') Expression
+
+        Examples:
+            (-1) -> -1 (SQL negative literal)
+            (-Patient.value.count()) -> -(COUNT(...)) (negated count)
+
+        Args:
+            node: EnhancedASTNode with node_type='PolarityExpression'
+
+        Returns:
+            SQLFragment with the unary operator applied to the operand
+
+        Raises:
+            FHIRPathTranslationError: If trying to negate a boolean value
+
+        Note:
+            The polarity operator is stored in node.text ('+' or '-')
+            The operand is the first child node
+        """
+        logger.debug(f"Translating polarity expression: {node.text}")
+
+        # Get the operator from the node text
+        operator = node.text if hasattr(node, 'text') else None
+
+        if not operator or operator not in ('+', '-'):
+            logger.warning(f"Invalid polarity operator: {operator}")
+            # Fall back to generic visitor
+            return self.visit_generic(node)
+
+        # Visit the child expression to get the operand
+        if not hasattr(node, 'children') or len(node.children) == 0:
+            raise FHIRPathTranslationError(
+                f"PolarityExpression has no child operand"
+            )
+
+        child = node.children[0]
+        child_fragment = self.visit(child)
+
+        if operator == '-':
+            # Check if the child is a literal (simple numeric negation)
+            if (hasattr(child_fragment, 'metadata') and
+                child_fragment.metadata.get('is_literal')):
+                # Direct literal negation: -1, -3.14, etc.
+                negated_expr = f"-({child_fragment.expression})"
+
+                # Create new fragment with negated expression
+                result_metadata = dict(child_fragment.metadata)
+                return SQLFragment(
+                    expression=negated_expr,
+                    source_table=child_fragment.source_table,
+                    requires_unnest=child_fragment.requires_unnest,
+                    is_aggregate=child_fragment.is_aggregate,
+                    metadata=result_metadata
+                )
+            else:
+                # Complex expression negation: -(COUNT(...)), etc.
+                # We need to check if the result type is numeric
+                # If it's a boolean, this should fail (FHIRPath semantic error)
+                metadata = getattr(child_fragment, 'metadata', {})
+                result_type = metadata.get('result_type') or metadata.get('type')
+
+                # Check if this is a boolean expression (e.g., convertsToInteger() result)
+                # If so, negation should fail
+                if result_type == 'boolean' or metadata.get('function') in ('convertsToBoolean', 'convertsToInteger', 'convertsToString', 'convertsToDecimal', 'convertsToDateTime', 'convertsToDate', 'convertsToTime'):
+                    # The child expression returns a boolean or type conversion result
+                    # Negating a boolean is a semantic error in FHIRPath
+                    raise FHIRPathTranslationError(
+                        f"Cannot apply unary minus operator to non-numeric result. "
+                        f"Operator '-' requires numeric operand, but got '{result_type or 'unknown'}'."
+                    )
+
+                # For other expressions, apply the negation
+                negated_expr = f"-({child_fragment.expression})"
+
+                result_metadata = dict(metadata)
+                return SQLFragment(
+                    expression=negated_expr,
+                    source_table=child_fragment.source_table,
+                    requires_unnest=child_fragment.requires_unnest,
+                    is_aggregate=child_fragment.is_aggregate,
+                    metadata=result_metadata
+                )
+        else:  # operator == '+'
+            # Unary plus is a no-op in SQL, just return the child fragment
+            return child_fragment
+
     def visit_type_operation(self, node: TypeOperationNode) -> SQLFragment:
         """Translate type operations to SQL.
 
