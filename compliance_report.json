@@ -1,22 +1,12 @@
 {
-  "total_tests": 50,
-  "passed_tests": 50,
-  "failed_tests": 0,
-  "compliance_percentage": 100.0,
-  "execution_time_total_ms": 18768.409967422485,
-  "execution_time_average_ms": 375.33812046051025,
-  "parser_type": "FHIRPathParser",
-  "database_type": "duckdb",
-  "timestamp": "2026-01-28T13:49:32.553073",
+  "total_tests": 934,
+  "passed_tests": 610,
+  "failed_tests": 324,
+  "compliance_percentage": 65.31049250535332,
   "test_categories": {
     "comments_syntax": {
-      "total": 8,
-      "passed": 8,
-      "failed": 0
-    },
-    "arithmetic_operators": {
-      "total": 4,
-      "passed": 4,
+      "total": 9,
+      "passed": 9,
       "failed": 0
     },
     "basic_expressions": {
@@ -25,36 +15,64 @@
       "failed": 0
     },
     "path_navigation": {
-      "total": 9,
+      "total": 10,
       "passed": 9,
-      "failed": 0
+      "failed": 1
     },
     "error_handling": {
-      "total": 2,
-      "passed": 2,
+      "total": 5,
+      "passed": 5,
       "failed": 0
     },
     "type_functions": {
-      "total": 8,
-      "passed": 8,
-      "failed": 0
+      "total": 116,
+      "passed": 69,
+      "failed": 47
     },
     "collection_functions": {
-      "total": 8,
-      "passed": 8,
-      "failed": 0
+      "total": 141,
+      "passed": 67,
+      "failed": 74
     },
     "function_calls": {
-      "total": 9,
-      "passed": 9,
+      "total": 113,
+      "passed": 64,
+      "failed": 49
+    },
+    "arithmetic_operators": {
+      "total": 71,
+      "passed": 32,
+      "failed": 39
+    },
+    "comparison_operators": {
+      "total": 338,
+      "passed": 246,
+      "failed": 92
+    },
+    "datetime_functions": {
+      "total": 6,
+      "passed": 5,
+      "failed": 1
+    },
+    "boolean_logic": {
+      "total": 6,
+      "passed": 4,
+      "failed": 2
+    },
+    "string_functions": {
+      "total": 89,
+      "passed": 70,
+      "failed": 19
+    },
+    "math_functions": {
+      "total": 28,
+      "passed": 28,
       "failed": 0
     }
   },
-  "performance_metrics": {
-    "min_execution_time_ms": 0.015020370483398438,
-    "max_execution_time_ms": 701.8630504608154,
-    "median_execution_time_ms": 413.04945945739746,
-    "std_dev_execution_time_ms": 161.89309126485375
-  },
-  "failed_test_analysis": []
+  "timestamp": "2026-02-03T11:40:56.435169",
+  "execution_time_total_ms": 346758.82601737976,
+  "execution_time_average_ms": 371.2294602036731,
+  "parser_type": "FHIRPathParser",
+  "database_type": "duckdb"
 }

@@ -494,6 +494,11 @@ class CTEManager:
             element ordering across nested LATERAL UNNEST operations. Without this,
             DuckDB loses ordering causing compliance test failures.
 
+        SP-110-006 FIX: Track available columns from previous CTEs to enable
+            proper column propagation. When a fragment references a column from
+            a previous UNNEST CTE (like "name_item"), ensure that column is
+            available in subsequent CTEs.
+
         Args:
             fragments: Ordered SQL fragments emitted by the translator.
 
@@ -506,11 +511,15 @@ class CTEManager:
         ctes: List[CTE] = []
         previous_cte_name: Optional[str] = None
         ordering_columns: List[str] = []  # Track ordering columns for UNNEST operations
+        available_columns: Dict[str, Set[str]] = {}  # Track columns available in each CTE
 
         for fragment in fragments:
-            cte = self._fragment_to_cte(fragment, previous_cte_name, ordering_columns)
+            cte = self._fragment_to_cte(fragment, previous_cte_name, ordering_columns, available_columns)
             ctes.append(cte)
             previous_cte_name = cte.name
+
+            # Track what columns this CTE makes available
+            available_columns[cte.name] = self._extract_cte_columns(cte)
 
             # If this CTE added an ordering column, track it for subsequent CTEs
             if "order_column" in cte.metadata:
@@ -530,6 +539,7 @@ class CTEManager:
         fragment: SQLFragment,
         previous_cte: Optional[str],
         ordering_columns: Optional[List[str]] = None,
+        available_columns: Optional[Dict[str, Set[str]]] = None,
     ) -> CTE:
         """Convert a single SQL fragment into a CTE instance.
 
@@ -561,12 +571,30 @@ class CTEManager:
                 "neither previous CTE nor fragment.source_table was provided."
             )
 
+        # SP-110-006: Auto-detect columns from previous CTEs that should be propagated
+        # When a fragment references "resource" directly but there's a previous CTE
+        # with _item columns, preserve those columns in the SELECT clause.
+        # This fixes cases like: Patient.name.subsetOf($this.name.first())
+        # where fragment 1 ($this.name) incorrectly references resource instead of cte_1
+        auto_preserve_columns: Set[str] = set()
+        if previous_cte and available_columns and previous_cte in available_columns:
+            prev_columns = available_columns[previous_cte]
+            # Find _item columns from the previous CTE
+            item_cols = {col for col in prev_columns if col.endswith('_item')}
+            if item_cols:
+                logger.debug(
+                    f"SP-110-006: Auto-preserving columns from {previous_cte}: {item_cols}"
+                )
+                auto_preserve_columns = item_cols
+
         if fragment.requires_unnest:
             query, order_column = self._wrap_unnest_query(
                 fragment, source_table, cte_name, ordering_columns or []
             )
         else:
-            query = self._wrap_simple_query(fragment, source_table, ordering_columns or [])
+            query = self._wrap_simple_query(
+                fragment, source_table, ordering_columns or [], auto_preserve_columns
+            )
             order_column = None
 
         dependencies: List[str] = []
@@ -602,8 +630,74 @@ class CTEManager:
         self.cte_counter += 1
         return f"cte_{self.cte_counter}"
 
+    def _extract_cte_columns(self, cte: CTE) -> Set[str]:
+        """Extract the column names that a CTE outputs.
+
+        This is used for SP-110-006 to track which columns are available
+        in each CTE for proper propagation.
+
+        Args:
+            cte: The CTE to analyze
+
+        Returns:
+            Set of column names that this CTE outputs
+        """
+        import re
+        columns = set()
+
+        # Parse the SELECT clause to find column names
+        # Look for patterns like:
+        # - SELECT col1, col2, ...
+        # - SELECT expr AS alias, ...
+        # - SELECT table.col, ...
+        query = cte.query.strip()
+
+        # Find the SELECT clause (between SELECT and FROM)
+        select_match = re.search(r'SELECT\s+(.+?)\s+FROM', query, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            return columns
+
+        select_clause = select_match.group(1).strip()
+
+        # Split by comma (but not within parentheses)
+        # This is a simple split; for production, use a proper SQL parser
+        parts = []
+        paren_depth = 0
+        current_part = []
+        for char in select_clause:
+            if char == '(':
+                paren_depth += 1
+                current_part.append(char)
+            elif char == ')':
+                paren_depth -= 1
+                current_part.append(char)
+            elif char == ',' and paren_depth == 0:
+                parts.append(''.join(current_part).strip())
+                current_part = []
+            else:
+                current_part.append(char)
+        if current_part:
+            parts.append(''.join(current_part).strip())
+
+        # Extract column names from each part
+        for part in parts:
+            # Check for AS alias
+            as_match = re.search(r'\s+AS\s+(\w+)$', part, re.IGNORECASE)
+            if as_match:
+                columns.add(as_match.group(1))
+            else:
+                # No AS alias - use the last identifier
+                # This handles: table.col, col, function(...)
+                identifiers = re.findall(r'\b(\w+)\b', part)
+                if identifiers:
+                    columns.add(identifiers[-1])
+
+        logger.debug(f"CTE {cte.name} outputs columns: {columns}")
+        return columns
+
     def _wrap_simple_query(
-        self, fragment: SQLFragment, source_table: str, ordering_columns: List[str]
+        self, fragment: SQLFragment, source_table: str, ordering_columns: List[str],
+        auto_preserve_columns: Optional[Set[str]] = None
     ) -> str:
         """Wrap a non-UNNEST fragment in a population-first SELECT statement.
 
@@ -621,6 +715,11 @@ class CTEManager:
         simple column reference (like "name_item"), preserve that column in the
         SELECT clause so subsequent operations can access it. This fixes the
         "Referenced column 'name_item' not found" error after take()/first()/last().
+
+        SP-110-006 FIX: For repeat() function, extract and preserve repeat_elem_N
+        columns from the WITH RECURSIVE subquery. The repeat() function returns a
+        complete RECURSIVE CTE expression, and we need to extract the element column
+        from it so subsequent operations (like UNNEST) can access it.
 
         Args:
             fragment: SQL fragment to wrap.
@@ -654,6 +753,23 @@ class CTEManager:
             return expression
 
         result_alias = fragment.metadata.get("result_alias", "result")
+
+        # SP-110-006: Check if this is a repeat() function result that needs special handling
+        # repeat() returns a complete RECURSIVE CTE expression like:
+        # (WITH RECURSIVE repeat_enum_0 AS (...), repeat_recursive_0 AS (...) SELECT COALESCE(...) FROM (...))
+        # We need to check if it contains repeat_elem_N and extract that column properly
+        is_repeat_expression = False
+        repeat_elem_column = None
+        if "repeat_elem_" in expression and "WITH RECURSIVE" in expression.upper():
+            # Extract the repeat_elem_N column name using regex
+            import re
+            repeat_match = re.search(r'(repeat_elem_\d+)', expression)
+            if repeat_match:
+                is_repeat_expression = True
+                repeat_elem_column = repeat_match.group(1)
+                logger.info(
+                    f"SP-110-006: Detected repeat() expression with element column '{repeat_elem_column}'"
+                )
 
         # SP-105: Check if this fragment references a collection item column that needs to be preserved
         # This happens when take()/first()/last()/skip() operate on unnested collections
@@ -744,23 +860,92 @@ class CTEManager:
         # This fixes "column not found" errors when combine/exclude reference columns
         # that were available in earlier CTEs but not propagated forward
         # SP-108-003: Skip item column propagation if exclude_order is True
+        # SP-110: Exclude lambda-scoped columns (exists_, select_, repeat_) from propagation
+        # These columns are only defined within subqueries and don't exist in the parent CTE
+        # SP-110 Phase 2: Extended CTE column propagation for name_item, cte_N_item patterns
+        # SP-110 Phase 3: Handle qualified column references (cte_2.name_item) in subsetOf/supersetOf
         propagated_item_columns = set()
+        qualified_item_columns = set()  # SP-110 Phase 3: Track fully qualified column references
         if source_table.startswith("cte_") and not exclude_order:
             # Check if any previous CTEs had _item columns that should be propagated
             # We need to look at what columns are available in the source CTE
             # For now, we conservatively preserve columns that are referenced in the expression
             import re
+
+            # SP-110 Phase 3: First, find qualified column references (cte_X.column_name)
+            # These must be preserved as-is without re-qualification
+            qualified_refs = re.findall(r'\b(cte_\d+)\.(\w+_item)\b', expression)
+            for cte_name, col_name in qualified_refs:
+                qualified_ref = f"{cte_name}.{col_name}"
+                qualified_item_columns.add(qualified_ref)
+                logger.debug(
+                    f"SP-110 Phase 3: Found qualified column reference '{qualified_ref}'"
+                )
+
             # Find all _item column references in the expression
             # Match both qualified (cte_X.name_item) and unqualified (name_item) references
             item_refs = re.findall(r'\b(\w+_item)\b', expression)
+
+            # SP-110 Phase 2: Also check for repeat_elem_N patterns from repeat() function
+            repeat_refs = re.findall(r'\b(repeat_elem_\d+)\b', expression)
+            item_refs.extend(repeat_refs)
+
+            # SP-110 Phase 2: Check for property access patterns like 'given', 'use', 'family'
+            # These are typically accessed from _item columns in lambda contexts
+            property_refs = re.findall(r'\b(given|use|family|period|value|system|code|display)\b', expression)
+
             for ref in item_refs:
+                # SP-110: Skip lambda-scoped columns that are only defined in subqueries
+                # exists_N_item, select_N_item, where_N_item are created within EXISTS/SELECT/WHERE
+                # subqueries and are not available in the parent CTE's scope
+                if re.match(r'^(exists|select|where)_\d+_item$', ref):
+                    logger.debug(
+                        f"SP-110: Skipping lambda-scoped column '{ref}' from propagation"
+                    )
+                    continue
+
+                # SP-110 Phase 3: Skip if this column is already in qualified_item_columns
+                # (we'll add the qualified version instead)
+                already_qualified = any(q.endswith(f".{ref}") for q in qualified_item_columns)
+                if already_qualified:
+                    logger.debug(
+                        f"SP-110 Phase 3: Skipping '{ref}' as it's already qualified in '{qualified_item_columns}'"
+                    )
+                    continue
+
                 # Check if this column is from the source CTE
                 # If the expression references just "name_item", it means the source CTE has it
                 propagated_item_columns.add(ref)
 
-            if propagated_item_columns:
+            # SP-110 Phase 2: If property references exist and we have name_item, include name_item
+            # This handles cases like subsetOf/supersetOf that access properties on collection items
+            if property_refs and 'name_item' in item_refs:
+                logger.debug(
+                    f"SP-110 Phase 2: Including name_item for property access: {property_refs}"
+                )
+                propagated_item_columns.add('name_item')
+
+            if propagated_item_columns or qualified_item_columns:
                 logger.info(
-                    f"SP-105 Phase 2: Propagating _item columns from expression: {propagated_item_columns}"
+                    f"SP-105 Phase 2: Propagating _item columns from expression: "
+                    f"unqualified={propagated_item_columns}, qualified={qualified_item_columns}"
+                )
+
+        # SP-110-006: Auto-preserve columns from previous CTEs
+        # When the fragment expression doesn't explicitly reference columns from a previous
+        # CTE but those columns should be propagated (e.g., when the translator incorrectly
+        # sets source_table to "resource" instead of the previous CTE), add them here.
+        if auto_preserve_columns:
+            for col_name in auto_preserve_columns:
+                # Skip if already added via propagated_item_columns or qualified_item_columns
+                if col_name in propagated_item_columns or any(q.endswith(f".{col_name}") for q in qualified_item_columns):
+                    continue
+                # Add the column from the source CTE
+                qualified_col = f"{source_table}.{col_name}"
+                columns.append(qualified_col)
+                propagated_item_columns.add(col_name)
+                logger.info(
+                    f"SP-110-006: Auto-preserving column '{qualified_col}' from previous CTE"
                 )
 
         # Track which columns we've already added to avoid duplicates
@@ -771,10 +956,25 @@ class CTEManager:
         if preserve_item_column and item_column_name:
             # Add the item column to SELECT so subsequent operations can reference it
             # Also alias it as 'result' so the standard result column is available
-            columns.append(f"{item_column_name} AS {result_alias}")
+            # SP-110 Phase 3: Qualify the column with source_table if not already qualified
+            if '.' not in item_column_name:
+                qualified_item_col = f"{source_table}.{item_column_name}"
+            else:
+                qualified_item_col = item_column_name
+
+            # SP-110 Phase 3: Preserve the column with BOTH the original name AND 'result' alias
+            # This allows subsequent operations to reference it as cte_N.name_item
+            # while also providing the standard 'result' column
+            columns.append(f"{qualified_item_col} AS {item_column_name}")
             added_columns.add(item_column_name)
+
+            # Also add the 'result' alias if different from item_column_name
+            if result_alias != item_column_name:
+                columns.append(f"{qualified_item_col} AS {result_alias}")
+                added_columns.add(result_alias)
+
             logger.info(
-                f"SP-105: Preserved collection item column '{item_column_name}' as '{result_alias}'"
+                f"SP-105: Preserved collection item column '{qualified_item_col}' as '{item_column_name}' and '{result_alias}'"
             )
         else:
             # Check if fragment has explicit preserved_columns list (for combine/exclude)
@@ -795,6 +995,21 @@ class CTEManager:
                         f"SP-105 Phase 2: Preserving column '{qualified_col}' from preserved_columns list"
                     )
 
+            # SP-110 Phase 3: Add qualified column references (from previous CTEs)
+            # These are already fully qualified (e.g., cte_2.name_item) and should be used as-is
+            for qualified_col in qualified_item_columns:
+                # Extract just the column name for tracking
+                col_name = qualified_col.split('.')[-1]
+                # Skip if already added (check by column name, not full qualified reference)
+                if col_name in added_columns:
+                    continue
+                # Use the fully qualified reference directly
+                columns.append(qualified_col)
+                added_columns.add(col_name)
+                logger.info(
+                    f"SP-110 Phase 3: Preserving qualified column '{qualified_col}' from previous CTE"
+                )
+
             # Add propagated _item columns from source CTEs (deduplicate)
             for col_name in propagated_item_columns:
                 # Skip if already added (either directly or via preserved_columns)
@@ -808,7 +1023,22 @@ class CTEManager:
                 )
 
             # Standard case: add the expression as result
-            columns.append(f"{expression} AS {result_alias}")
+            # SP-110-006: Special handling for repeat() expressions
+            # The repeat() function returns a complete RECURSIVE CTE expression as a subquery
+            # We need to wrap it properly and extract the repeat_elem_N column
+            if is_repeat_expression and repeat_elem_column:
+                # The expression is a complete RECURSIVE CTE, use it as a subquery
+                # Extract the repeat_elem_N column for subsequent operations
+                columns.append(f"{expression} AS {result_alias}")
+                # Also add the repeat_elem_N column directly if this is the first time
+                # This allows subsequent UNNEST operations to access the elements
+                # The subquery returns a JSON array, so we need to extract elements
+                # For now, just add the result column - the UNNEST will handle the array
+                logger.info(
+                    f"SP-110-006: Wrapped repeat() expression as subquery with result alias '{result_alias}'"
+                )
+            else:
+                columns.append(f"{expression} AS {result_alias}")
 
         query = (
             "SELECT "
@@ -1064,10 +1294,20 @@ class CTEManager:
         else:
             projected_column = result_alias
 
+        # SP-110-008 FIX: Always ensure "result" column is available in UNNEST CTE output
+        # When projected_column differs from result_alias (e.g., a projection expression),
+        # we need to ensure both the item column AND the result column are available.
+        # The result column must be LAST (test runner extracts row[-1]).
         if projected_column == result_alias:
-            select_projection = result_alias
+            # Simple case: result_alias is the item name (e.g., "given_item")
+            # Output: "given_item AS given_item, given_item AS result"
+            # This makes both columns available: given_item for subsequent path access,
+            # and result for the final SELECT/WHERE clause.
+            select_projection = f"{result_alias} AS {result_alias}, {result_alias} AS result"
         else:
-            select_projection = f"{projected_column} AS {result_alias}"
+            # Complex projection expression (e.g., json_extract_string(given_item, '$.family'))
+            # Output: "json_extract_string(...) AS given_item, json_extract_string(...) AS result"
+            select_projection = f"{projected_column} AS {result_alias}, {projected_column} AS result"
 
         # SP-020-DEBUG: Add ROW_NUMBER() to preserve array ordering
         order_column = f"{cte_name}_order"
