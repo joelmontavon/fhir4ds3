@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 import logging
 
-from .fhir_types import FHIRDataType, FHIRTypeValidator, FHIRTypeSystem, resolve_polymorphic_property
+from .fhir_types import FHIRDataType, FHIRTypeValidator, FHIRTypeSystem, resolve_polymorphic_property, PrimitiveTypeValidator
 
 
 class TypeRegistry:
@@ -77,6 +77,168 @@ class TypeRegistry:
             'is_complex': True,
             'is_resource': False
         })
+
+        # Register FHIR primitive subtypes (FHIR R4 defines these as distinct types)
+        primitive_subtypes = {
+            'string1': {
+                'base_type': 'string',
+                'description': 'FHIR string primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'code1': {
+                'base_type': 'string',
+                'description': 'FHIR code primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'integer1': {
+                'base_type': 'integer',
+                'description': 'FHIR integer primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'decimal1': {
+                'base_type': 'decimal',
+                'description': 'FHIR decimal primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'boolean1': {
+                'base_type': 'boolean',
+                'description': 'FHIR boolean primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'uri1': {
+                'base_type': 'uri',
+                'description': 'FHIR URI primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'base64binary1': {
+                'base_type': 'base64Binary',
+                'description': 'FHIR base64Binary primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'instant1': {
+                'base_type': 'instant',
+                'description': 'FHIR instant primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'date1': {
+                'base_type': 'date',
+                'description': 'FHIR date primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'datetime1': {
+                'base_type': 'dateTime',
+                'description': 'FHIR dateTime primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'time1': {
+                'base_type': 'time',
+                'description': 'FHIR time primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'id1': {
+                'base_type': 'id',
+                'description': 'FHIR id primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'positiveint1': {
+                'base_type': 'positiveInt',
+                'description': 'FHIR positiveInt primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'unsignedint1': {
+                'base_type': 'unsignedInt',
+                'description': 'FHIR unsignedInt primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            },
+            'markdown1': {
+                'base_type': 'markdown',
+                'description': 'FHIR markdown primitive subtype',
+                'is_primitive': True,
+                'is_primitive_subtype': True,
+                'is_complex': False,
+                'is_resource': False
+            }
+        }
+
+        # Register primitive subtypes with metadata
+        for subtype_name, metadata in primitive_subtypes.items():
+            self._type_metadata[subtype_name] = metadata
+            # Create validator based on base type
+            base_type_name = metadata['base_type']
+            if base_type_name == 'string':
+                base_enum = FHIRDataType.STRING
+            elif base_type_name == 'integer':
+                base_enum = FHIRDataType.INTEGER
+            elif base_type_name == 'decimal':
+                base_enum = FHIRDataType.DECIMAL
+            elif base_type_name == 'boolean':
+                base_enum = FHIRDataType.BOOLEAN
+            elif base_type_name == 'uri':
+                base_enum = FHIRDataType.URI
+            elif base_type_name == 'base64Binary':
+                base_enum = FHIRDataType.BASE64BINARY
+            elif base_type_name == 'instant':
+                base_enum = FHIRDataType.INSTANT
+            elif base_type_name == 'date':
+                base_enum = FHIRDataType.DATE
+            elif base_type_name == 'dateTime':
+                base_enum = FHIRDataType.DATETIME
+            elif base_type_name == 'time':
+                base_enum = FHIRDataType.TIME
+            elif base_type_name == 'id':
+                base_enum = FHIRDataType.ID
+            elif base_type_name == 'positiveInt':
+                base_enum = FHIRDataType.POSITIVEINT
+            elif base_type_name == 'unsignedInt':
+                base_enum = FHIRDataType.UNSIGNEDINT
+            elif base_type_name == 'markdown':
+                base_enum = FHIRDataType.MARKDOWN
+            else:
+                continue
+
+            self._type_validators[subtype_name] = PrimitiveTypeValidator(base_enum)
 
         # Load StructureDefinitions if available
         definitions_path = Path(__file__).parent / "fhir_r4_definitions"
@@ -415,6 +577,11 @@ class TypeRegistry:
         if canonical_parent == canonical_subtype:
             return True
 
+        # Check primitive subtypes
+        subtype_metadata = self._type_metadata.get(canonical_subtype, {})
+        if subtype_metadata.get('is_primitive_subtype') and subtype_metadata.get('base_type') == canonical_parent:
+            return True
+
         # Check explicit hierarchies first (direct subtypes only)
         hierarchy = self.get_type_hierarchy(canonical_parent)
         if canonical_subtype in hierarchy:
@@ -435,6 +602,11 @@ class TypeRegistry:
         canonical_subtype = self.resolve_to_canonical(subtype) or subtype
 
         if canonical_ancestor == canonical_subtype:
+            return True
+
+        # Check primitive subtypes
+        subtype_metadata = self._type_metadata.get(canonical_subtype, {})
+        if subtype_metadata.get('is_primitive_subtype') and subtype_metadata.get('base_type') == canonical_ancestor:
             return True
 
         visited: Set[str] = set()

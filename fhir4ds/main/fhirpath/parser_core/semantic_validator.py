@@ -41,18 +41,22 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     'convertsToDateTime', 'toDateTime', 'convertsToTime', 'toTime',
     # String functions
     'startsWith', 'endsWith', 'contains', 'substring', 'length', 'upper',
-    'lower', 'matches', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',
-    'toChars',
+    'lower', 'matches', 'matchesFull', 'replace', 'replaceMatches', 'split', 'join', 'indexOf',
+    'toChars', 'trim',
+    # Encoding/decoding functions
+    'encode', 'decode', 'escape', 'unescape',
     # Math functions
     'abs', 'ceiling', 'exp', 'floor', 'ln', 'log', 'power', 'round', 'sqrt', 'truncate',
     # Type functions
     'is', 'as', 'ofType', 'conformsTo', 'type',
     # Date/time functions
-    'now', 'today',
+    'now', 'today', 'timeofday',
     # Additional functions not in base FunctionLibrary
     'exclude', 'isDistinct', 'intersect', 'repeat', 'aggregate',
     'extension', 'allTrue', 'anyTrue', 'allFalse', 'anyFalse',
-    'sum', 'average', 'subsetOf', 'supersetOf',
+    'sum', 'average', 'subsetOf', 'supersetOf', 'children',
+    # Hierarchical and collection functions
+    'descendants', 'sort', 'trace',
 }
 
 

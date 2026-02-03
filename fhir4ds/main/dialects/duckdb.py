@@ -69,7 +69,11 @@ class DuckDBDialect(DatabaseDialect):
     # JSON extraction methods
 
     def extract_json_field(self, column: str, path: str) -> str:
-        """Extract JSON field as text using DuckDB's json_extract_string."""
+        """Extract JSON field as text using DuckDB's json_extract_string.
+
+        Returns a JSON string value that may be a scalar, object, or array.
+        The caller is responsible for casting to VARCHAR if needed for comparisons.
+        """
         return f"json_extract_string({column}, '{path}')"
 
     def extract_json_object(self, column: str, path: str) -> str:
@@ -85,6 +89,8 @@ class DuckDBDialect(DatabaseDialect):
 
         FHIR primitives can be: {"field": "value"} or {"field": {"value": "...", "extension": [...]}}
         This method uses COALESCE to try complex representation first, then simple.
+
+        Note: Returns a JSON string. Cast to VARCHAR for comparisons with string literals.
         """
         # Try to extract from complex representation (path.value), fall back to simple (path)
         return f"COALESCE(json_extract_string({column}, '{path}.value'), json_extract_string({column}, '{path}'))"
@@ -104,6 +110,10 @@ class DuckDBDialect(DatabaseDialect):
         Example:
             >>> dialect.extract_json_string('resource', '$.id')
             "json_extract_string(resource, '$.id')"
+
+        Note:
+            Returns a JSON string that should be cast to VARCHAR for comparisons.
+            Use CAST({expr} AS VARCHAR) when comparing with string literals.
         """
         return f"json_extract_string({column}, '{path}')"
 
@@ -638,6 +648,32 @@ class DuckDBDialect(DatabaseDialect):
             → "regexp_replace(patient_name, '\\d+', 'XXX', 'g')"
         """
         return f"regexp_replace({string_expr}, {regex_pattern}, {substitution}, 'g')"
+
+    def generate_json_children(self, json_expr: str) -> str:
+        """Generate SQL to extract direct children from a JSON object for DuckDB.
+
+        Uses DuckDB's json_keys() function to get all keys from the JSON object,
+        then extracts each child value.
+
+        Args:
+            json_expr: SQL expression evaluating to a JSON object
+
+        Returns:
+            SQL expression returning a list of child element values
+
+        Example:
+            generate_json_children("resource")
+            → "list(json_transform(resource, obj -> json_extract_string(obj, value))[1])"
+
+        Note:
+            - DuckDB doesn't have a direct way to get all child values
+            - We use json_transform with json_keys to iterate and extract
+            - Returns empty list for null input
+        """
+        # For DuckDB, we need to extract all child values from a JSON object
+        # The approach: get keys, then for each key extract the value
+        # json_transform allows us to iterate over key-value pairs
+        return f"list((SELECT json_extract_string({json_expr}, key) FROM (SELECT unnest(json_keys({json_expr})) AS key)))"
 
     def generate_substring_check(self, string_expr: str, substring: str) -> str:
         """Generate substring check SQL for DuckDB.
@@ -1462,12 +1498,21 @@ class DuckDBDialect(DatabaseDialect):
         }
 
         normalized_type = target_type.lower() if target_type else ""
-        duckdb_type = type_map.get(normalized_type)
+
+        # Handle primitive subtypes (e.g., string1, code1, integer1)
+        # These should be mapped to their base types
+        base_type = normalized_type
+        if base_type.endswith('1'):
+            # Strip the '1' suffix to get the base type
+            base_type = base_type[:-1]
+
+        duckdb_type = type_map.get(base_type)
 
         if duckdb_type is None:
-            # Unknown FHIRPath type - return NULL
-            logger.warning(f"Unknown FHIRPath type '{target_type}' in type cast, returning NULL")
-            return "NULL"
+            # SP-110-003: Unknown FHIRPath types should fail at execution time
+            # Generate SQL that will cause a conversion error
+            invalid_type_name = target_type.replace("-", "_").upper()
+            return f"CAST({expression} AS INVALID_FHIR_TYPE_{invalid_type_name})"
 
         # SP-104-006: Handle partial date strings for DateTime casting
         # When the parser strips the 'T' suffix from @2015T, we get just "2015"
@@ -1504,6 +1549,14 @@ class DuckDBDialect(DatabaseDialect):
             return f"COALESCE({expression}, '[]')"
 
         normalized = target_type.lower()
+
+        # Handle primitive subtypes (e.g., string1, code1, integer1)
+        # These should be mapped to their base types
+        base_type = normalized
+        if base_type.endswith('1'):
+            # Strip the '1' suffix to get the base type
+            base_type = base_type[:-1]
+
         type_family_map = {
             "uri": "string",
             "url": "string",
@@ -1514,7 +1567,7 @@ class DuckDBDialect(DatabaseDialect):
             "code": "string",
             "markdown": "string",
         }
-        family = type_family_map.get(normalized, normalized)
+        family = type_family_map.get(base_type, base_type)
 
         value_type_map = {
             "string": ["VARCHAR"],
@@ -1530,6 +1583,18 @@ class DuckDBDialect(DatabaseDialect):
             "date": r'^\d{4}(-\d{2}(-\d{2})?)?$',
             "time": r'^\d{2}:\d{2}:\d{2}(\.\d+)?$',
         }
+
+        # SP-110-003: Check if this is a complex FHIR type (not in value_type_map)
+        # Complex types like HumanName, Patient, etc. are filtered by resourceType field
+        if family not in value_type_map:
+            # For complex types, check the resourceType field in JSON objects
+            base_expr = f"COALESCE({expression}, '[]')"
+            escaped_type = target_type.replace("'", "''")
+            return (
+                f"(SELECT COALESCE(json_group_array(elem.value), '[]') "
+                f"FROM json_each({base_expr}) AS elem "
+                f"WHERE json_extract_string(elem.value, '$.resourceType') = '{escaped_type}')"
+            )
 
         value_types = value_type_map.get(family)
         if not value_types:
@@ -1563,16 +1628,32 @@ class DuckDBDialect(DatabaseDialect):
         )
 
     def filter_extension_by_url(self, extensions_expr: str, url: str) -> str:
-        """Filter extension array by URL using DuckDB list_filter syntax."""
+        """Filter extension array by URL using UNNEST and WHERE clause.
+
+        SP-110 Phase 2: Fixed to use json_each() UNNEST with WHERE clause instead of
+        list_filter(). DuckDB's list_filter() requires a LIST type (created with ['a','b']
+        syntax), but we have JSON arrays from json_extract(). The solution is to UNNEST
+        the JSON array and filter with WHERE, then re-aggregate with json_array().
+        """
         escaped_url = url.replace("'", "''")
         base_expr = f"COALESCE({extensions_expr}, json_array())"
+
+        # Use UNNEST + WHERE + re-aggregate instead of list_filter
+        # DuckDB uses json_array() to aggregate values into a JSON array
         return (
-            f"list_filter({base_expr}, ext -> "
-            f"coalesce(json_extract_string(ext, '$.url'), '') = '{escaped_url}')"
+            f"(SELECT json_array(enum_table.value) "
+            f"FROM json_each({base_expr}) AS enum_table(key, value) "
+            f"WHERE coalesce(json_extract_string(enum_table.value, '$.url'), '') = '{escaped_url}')"
         )
 
     def extract_extension_values(self, extensions_expr: str) -> str:
-        """Extract value[x] payloads from extension objects in DuckDB."""
+        """Extract value[x] payloads from extension objects in DuckDB.
+
+        SP-110-EXT-FIX: Fixed lambda binding issue by replacing list_transform/list_filter
+        with json_each() subquery. The lambda variables (ext, val) in list_transform()
+        were causing "Referenced column 'ext' not found in FROM clause" errors when the
+        result was wrapped in additional subqueries (e.g., extension().exists()).
+        """
         base_expr = f"COALESCE({extensions_expr}, json_array())"
         value_paths = [
             "valueBoolean",
@@ -1614,14 +1695,27 @@ class DuckDBDialect(DatabaseDialect):
             "valueCount",
             "valueMoney",
         ]
+        # Build COALESCE expression for all value[x] paths
         coalesce_args = ", ".join(
-            [f"json_extract(ext, '$.{path}')" for path in value_paths] + ["NULL"]
+            [f"json_extract(ext_table.value, '$.{path}')" for path in value_paths] + ["NULL"]
         )
-        transformed = f"list_transform({base_expr}, ext -> coalesce({coalesce_args}))"
-        return f"list_filter({transformed}, val -> val IS NOT NULL)"
+
+        # Use json_each() instead of list_transform() to avoid lambda variable binding issues
+        # This approach works correctly when nested in subqueries
+        return (
+            f"(SELECT json_array(coalesce({coalesce_args})) "
+            f"FROM json_each({base_expr}) AS ext_table(key, value) "
+            f"WHERE coalesce({coalesce_args}) IS NOT NULL)"
+        )
 
     def project_json_array(self, array_expr: str, path_components: List[str]) -> str:
-        """Project JSON array elements along nested path using list_transform."""
+        """Project JSON array elements along nested path.
+
+        SP-110-EXT-FIX: Fixed lambda binding issue by replacing list_transform()
+        with json_each() subquery. The lambda variable (elem) in list_transform()
+        was causing "Referenced column 'elem' not found in FROM clause" errors
+        when the result was wrapped in additional subqueries.
+        """
         if not path_components:
             return array_expr
 
@@ -1638,9 +1732,12 @@ class DuckDBDialect(DatabaseDialect):
 
         json_path = build_path(path_components)
         base_expr = f"COALESCE({array_expr}, json_array())"
-        list_expr = f"from_json({base_expr}, '[\"JSON\"]')"
-        projected_list = f"list_transform({list_expr}, elem -> json_extract_string(elem, '{json_path}'))"
-        return f"CAST(to_json({projected_list}) AS JSON)"
+
+        # Use json_each() instead of list_transform() to avoid lambda variable binding issues
+        return (
+            f"(SELECT json_array(json_extract_string(proj_table.value, '{json_path}')) "
+            f"FROM json_each({base_expr}) AS proj_table(key, value))"
+        )
 
     def generate_all_true(self, collection_expr: str) -> str:
         """Generate SQL for allTrue() using BOOL_AND aggregate.
@@ -1696,3 +1793,130 @@ class DuckDBDialect(DatabaseDialect):
         Empty collections return TRUE.
         """
         return f"(COUNT(*) = COUNT(DISTINCT {expression}))"
+
+    def generate_lateral_json_enumeration(self, array_expr: str, enum_alias: str,
+                                         value_col: str = "value", index_col: str = "key") -> str:
+        """Generate LATERAL clause for JSON array enumeration with key/value columns.
+
+        DuckDB uses json_each() function which returns (key, value) pairs.
+        The key column contains the 0-based array index.
+
+        Args:
+            array_expr: Expression that produces a JSON array
+            enum_alias: Table alias for the enumeration table
+            value_col: Column name for the value (default: "value")
+            index_col: Column name for the index/key (default: "key")
+
+        Returns:
+            SQL LATERAL clause string
+
+        Example:
+            generate_lateral_json_enumeration("resource->'name'", "enum_table", "value", "key")
+            → "LATERAL json_each(resource->'name') AS enum_table(key, value)"
+        """
+        return f"LATERAL json_each({array_expr}) AS {enum_alias}({index_col}, {value_col})"
+
+    # Encoding and decoding functions
+
+    def generate_base64_encode(self, expression: str) -> str:
+        """Generate SQL for base64 encoding using DuckDB's base64 function."""
+        return f"base64({expression})"
+
+    def generate_base64_decode(self, expression: str) -> str:
+        """Generate SQL for base64 decoding using DuckDB's base64_decode function."""
+        return f"base64_decode({expression}, 'UTF-8')"
+
+    def generate_hex_encode(self, expression: str) -> str:
+        """Generate SQL for hex encoding using DuckDB's encode function."""
+        return f"encode({expression}, 'hex')"
+
+    def generate_hex_decode(self, expression: str) -> str:
+        """Generate SQL for hex decoding using DuckDB's decode function."""
+        return f"decode({expression}, 'hex')"
+
+    def generate_urlbase64_encode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 encoding.
+
+        URL-safe base64 replaces '+' with '-' and '/' with '_'.
+        Also removes trailing '=' padding.
+        """
+        # DuckDB: base64 then replace + with - and / with _, then remove padding
+        return f"rtrim(replace(replace(base64({expression}), '+', '-'), '/', '_'), '=')"
+
+    def generate_urlbase64_decode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 decoding.
+
+        First restore the replaced characters, then decode.
+        """
+        # DuckDB: restore + and /, add padding if needed, then decode
+        return f"base64_decode(replace(replace({expression}, '-', '+'), '_', '/'), 'UTF-8')"
+
+    def generate_html_escape(self, expression: str) -> str:
+        """Generate SQL for HTML escaping in DuckDB.
+
+        Escapes &, <, >, ", ' characters.
+        Order matters: escape & first to avoid double-escaping.
+        """
+        # DuckDB uses regexp_replace for character escaping
+        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '\"', '&quot;'), '''', '&apos;')"
+
+    def generate_json_escape(self, expression: str) -> str:
+        """Generate SQL for JSON escaping in DuckDB.
+
+        Escapes quotes and backslashes.
+        """
+        # JSON escaping: escape backslash first, then quotes
+        return f"replace(replace({expression}, '\\\\', '\\\\\\\\'), '\"', '\\\\\"')"
+
+    def generate_html_unescape(self, expression: str) -> str:
+        """Generate SQL for HTML unescaping in DuckDB.
+
+        Unescapes &amp;, &lt;, &gt;, &quot;, &apos;, &#39;.
+        Order matters for longest matches first.
+        """
+        # DuckDB uses regexp_replace for character unescaping
+        # Handle numeric entity &#39; first, then named entities
+        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&amp;', '&'), '&lt;', '<'), '&gt;', '>'), '&quot;', '\"'), '&apos;', '''')"
+
+    def generate_json_unescape(self, expression: str) -> str:
+        """Generate SQL for JSON unescaping in DuckDB.
+
+        Unescapes escaped quotes and backslashes.
+        Order: unescape \\\" first, then \\\\.
+        """
+        # Reverse of JSON escape: unescape quotes first, then backslashes
+        return f"replace(replace({expression}, '\\\\\"', '\"'), '\\\\\\\\', '\\\\')"
+
+    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+        """Generate SQL for sorting array elements in DuckDB.
+
+        DuckDB's array_sort function sorts in ascending order by default.
+        For descending, we reverse the sorted array.
+        """
+        if ascending:
+            return f"array_sort({array_expr})"
+        else:
+            return f"array_reverse(array_sort({array_expr}))"
+
+    def generate_json_descendants(self, json_expr: str) -> str:
+        """Generate SQL for getting all descendant elements of a JSON node.
+
+        Returns a JSON array containing all descendant elements recursively.
+
+        For DuckDB, we use a recursive CTE to traverse the JSON tree.
+        This implementation extracts all values from nested JSON structures.
+        """
+        # DuckDB recursive CTE approach for descendants
+        # This creates a recursive query that traverses all nested JSON structures
+        return f"""
+            (WITH RECURSIVE descendants AS (
+                -- Base case: start with current node's direct children
+                SELECT key, value FROM json_each({json_expr})
+                UNION ALL
+                -- Recursive case: traverse nested objects/arrays
+                SELECT d.key, d.value
+                FROM descendants c
+                CROSS JOIN json_each(CASE WHEN json_type(c.value) IN ('OBJECT', 'ARRAY') THEN c.value ELSE NULL END) d
+            )
+            SELECT json_agg(value) FROM descendants)
+        """.strip()

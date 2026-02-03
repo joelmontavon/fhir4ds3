@@ -23,6 +23,7 @@ Author: FHIR4DS Development Team
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
@@ -54,6 +55,18 @@ from ...dialects.base import DatabaseDialect
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NegatedQuantityMarker:
+    """Marker for a negated quantity literal value.
+
+    Used to track when a quantity has been negated (e.g., -5 'mm' becomes -5 with unit 'mm').
+    This marker preserves both the numeric value and the unit string for proper type conversion.
+    """
+    value: Decimal
+    unit: str
+    is_quantity_literal: bool = True
 
 
 class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
@@ -331,17 +344,33 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return sql
 
-    def _resolve_canonical_type(self, type_name: Any) -> str:
-        """Resolve provided type name to canonical FHIR type, enforcing validation."""
+    def _resolve_canonical_type(self, type_name: Any, strict: bool = False) -> str:
+        """Resolve provided type name to canonical FHIR type, enforcing validation.
+
+        SP-110-003: Changed strict=False by default to allow unknown types during translation.
+        Unknown types should fail at execution time (FHIRPath spec), not translation time.
+
+        Args:
+            type_name: Type name or alias to resolve
+            strict: If True, raise translation error for unknown types.
+                   If False, return the original type name for execution-time validation.
+
+        Returns:
+            Canonical type name if known, otherwise the original type name (if not strict)
+        """
         raw_value = "" if type_name is None else str(type_name).strip()
         canonical = self.type_registry.get_canonical_type_name(raw_value)
 
         if canonical is None:
-            display_name = raw_value or str(type_name)
-            valid_types = ", ".join(self.type_registry.get_all_type_names())
-            raise FHIRPathTranslationError(
-                f"Unknown FHIR type '{display_name}'. Valid types: {valid_types}"
-            )
+            if strict:
+                display_name = raw_value or str(type_name)
+                valid_types = ", ".join(self.type_registry.get_all_type_names())
+                raise FHIRPathTranslationError(
+                    f"Unknown FHIR type '{display_name}'. Valid types: {valid_types}"
+                )
+            # SP-110-003: Return original type name for unknown types
+            # This allows translation to succeed, and execution will fail if the type is truly invalid
+            return raw_value
 
         return canonical
 
@@ -1313,6 +1342,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Include temporal_info if available (for date/time literals)
         if hasattr(node, 'temporal_info') and node.temporal_info:
             fragment_metadata["temporal_info"] = node.temporal_info
+        # SP-110-001: Include quantity_value and quantity_unit for temporal quantities
+        # This enables _generate_quantity_comparison() to detect and normalize quantities
+        # (e.g., "7 days" vs "1 'wk'" -> both normalized to days for comparison)
+        if (node.literal_type == "quantity" and
+            hasattr(node, 'temporal_info') and node.temporal_info and
+            node.temporal_info.get('kind') == 'duration'):
+            value = node.temporal_info.get('value', str(node.value))
+            unit = node.temporal_info.get('unit', 'days')
+            fragment_metadata["quantity_value"] = str(value)
+            fragment_metadata["quantity_unit"] = self._normalize_quantity_unit(unit) if unit else unit
 
         return SQLFragment(
             expression=sql_expr,
@@ -1787,6 +1826,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 dependencies=binding.dependencies.copy()
             )
 
+        # SP-110: Handle special Type object properties (.namespace, .name)
+        # These are used after type() function calls: e.g., 1.type().namespace
+        if self.fragments and self.fragments[-1].metadata.get('function') == 'type':
+            # Check if this is accessing .namespace or .name on a Type object
+            if identifier_value in ('namespace', 'name'):
+                # Extract the field from the JSON Type object returned by type()
+                # Type object format: {"namespace": "System", "name": "Integer"}
+                type_object_expr = self.fragments[-1].expression
+                field_extraction = self.dialect.extract_json_field(
+                    column=f"({type_object_expr})",
+                    path=f"$.{identifier_value}"
+                )
+                return SQLFragment(
+                    expression=field_extraction,
+                    source_table=self.context.current_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=self.fragments[-1].dependencies.copy(),
+                    metadata={"function": "type", "property": identifier_value}
+                )
+
         # Check if this is a root resource reference (e.g., "Patient", "Observation")
         # Root resource references don't require JSON extraction; they refer to the
         # resource table itself
@@ -2236,6 +2296,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_endswith(node)
         elif function_name == "matches":
             return self._translate_matches(node)
+        elif function_name == "matchesfull":
+            return self._translate_matchesfull(node)
         elif function_name == "replacematches":
             return self._translate_replacematches(node)
         elif function_name == "tochars":
@@ -2320,7 +2382,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_min(node)
         elif function_name == "max":
             return self._translate_max(node)
-        # Type functions (temporary handlers until AST adapter is fixed in SP-007-XXX)
+        # Type functions - handlers for function call syntax type operations
+        # These bridge FunctionCallNode (from AST adapter) to type operation implementations
+        elif function_name == "type":
+            return self._translate_type(node)
         elif function_name == "is":
             return self._translate_is_from_function_call(node)
         elif function_name == "as":
@@ -2334,6 +2399,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_now(node)
         elif function_name == "timeofday":
             return self._translate_timeofday(node)
+        elif function_name == "children":
+            return self._translate_children(node)
+        elif function_name == "encode":
+            return self._translate_encode(node)
+        elif function_name == "decode":
+            return self._translate_decode(node)
+        elif function_name == "escape":
+            return self._translate_escape(node)
+        elif function_name == "unescape":
+            return self._translate_unescape(node)
+        elif function_name == "sort":
+            return self._translate_sort(node)
+        elif function_name == "descendants":
+            return self._translate_descendants(node)
         else:
             raise ValueError(f"Unknown or unsupported function: {node.function_name}")
 
@@ -2848,11 +2927,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         self.context.pending_literal_value = (QuantityLiteralMarker(value, unit), sql_expr)
 
         # Create metadata with quantity information
+        # SP-110-001: Normalize unit to enable unit conversion in comparisons
+        normalized_unit = self._normalize_quantity_unit(unit) if unit else unit
         fragment_metadata = {
             'literal_type': 'quantity',
             'is_literal': True,
             'quantity_value': str(value),
-            'quantity_unit': unit
+            'quantity_unit': normalized_unit if normalized_unit else unit
         }
         if node.text:
             fragment_metadata['source_text'] = node.text
@@ -3324,6 +3405,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Return NULL to represent empty collection result
                     # This will be filtered out in the final result
                     sql_expr = "NULL"
+                # SP-110-001: Handle quantity unit conversion for comparisons
+                # When comparing quantities with different units (e.g., "7 days = 1 'wk'"),
+                # normalize units to canonical form before comparison
+                elif (left_metadata.get("literal_type") == "quantity" and
+                      right_metadata.get("literal_type") == "quantity"):
+                    sql_expr = self._generate_quantity_comparison(
+                        left_fragment, right_fragment, sql_operator, node
+                    )
                 elif operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
                     sql_expr = self._generate_collection_comparison(
                         left_fragment.expression,
@@ -3774,6 +3863,43 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             ")"
         )
 
+    def _is_simple_column_reference(self, expression: Optional[str]) -> bool:
+        """Check if an expression is a simple column reference.
+
+        A simple column reference:
+        - Contains only alphanumeric characters and underscores
+        - Does not contain operators, parentheses, brackets, or function calls
+        - Typically ends with _item (from UNNEST) or _result (from CTE outputs)
+
+        Args:
+            expression: The SQL expression to check
+
+        Returns:
+            True if the expression is a simple column reference, False otherwise
+        """
+        if not expression:
+            return False
+
+        # Remove leading/trailing whitespace
+        expr = expression.strip()
+
+        # Check for SQL operators and function calls (indicates complex expression)
+        sql_operators = '()[]{}+-*/%=<>!&|^~'
+        if any(char in expr for char in sql_operators):
+            return False
+
+        # Check for SQL keywords (indicates function call or complex expression)
+        sql_keywords = {'SELECT', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+                        'CAST', 'COALESCE', 'NULLIF', 'EXISTS', 'IN', 'LIKE', 'BETWEEN'}
+        # Only check if the word appears as a whole token (avoid false positives in column names)
+        tokens = set(re.findall(r'\b\w+\b', expr.upper()))
+        if not tokens.isdisjoint(sql_keywords):
+            return False
+
+        # At this point, it's a simple identifier
+        # Optionally check for common CTE column suffixes
+        return expr.endswith('_item') or expr.endswith('_result') or '_' in expr
+
     def _generate_collection_comparison(self, left_expr: str, right_expr: str, sql_operator: str) -> str:
         """Generate SQL comparison between two collection expressions."""
         normalized_left = self._normalize_collection_expression(left_expr)
@@ -3781,6 +3907,85 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         serialized_left = self.dialect.serialize_json_value(normalized_left)
         serialized_right = self.dialect.serialize_json_value(normalized_right)
         return f"({serialized_left} {sql_operator} {serialized_right})"
+
+    def _generate_quantity_comparison(
+        self,
+        left_fragment: SQLFragment,
+        right_fragment: SQLFragment,
+        sql_operator: str,
+        node: OperatorNode,
+    ) -> str:
+        """Generate SQL comparison between two quantity literals with unit normalization.
+
+        SP-110-001: Handle quantity comparisons with unit conversion.
+        When comparing quantities with different but compatible units (e.g., "7 days = 1 'wk'"),
+        normalize both quantities to a common unit before comparison.
+
+        This supports:
+        - Temporal units: days <-> weeks, hours <-> days, etc.
+        - UCUM canonical units for medical quantities
+        - Direct value comparison when units are the same
+
+        Args:
+            left_fragment: Left operand SQL fragment (quantity literal)
+            right_fragment: Right operand SQL fragment (quantity literal)
+            sql_operator: SQL comparison operator (=, !=, <, >, <=, >=)
+            node: Original operator node for accessing child nodes
+
+        Returns:
+            SQL expression for comparing quantities with normalized units
+        """
+        left_metadata = getattr(left_fragment, "metadata", {}) or {}
+        right_metadata = getattr(right_fragment, "metadata", {}) or {}
+
+        # Extract quantity information from metadata
+        left_value = left_metadata.get("quantity_value")
+        left_unit = left_metadata.get("quantity_unit")
+        right_value = right_metadata.get("quantity_value")
+        right_unit = right_metadata.get("quantity_unit")
+
+        # Parse quantity values as Decimals
+        try:
+            left_amount = Decimal(str(left_value)) if left_value else None
+            right_amount = Decimal(str(right_value)) if right_value else None
+        except (InvalidOperation, TypeError):
+            # If we can't parse as Decimal, fall back to simple string comparison
+            return f"({left_fragment.expression} {sql_operator} {right_fragment.expression})"
+
+        if left_amount is None or right_amount is None:
+            # Fall back to simple comparison if we can't extract values
+            return f"({left_fragment.expression} {sql_operator} {right_fragment.expression})"
+
+        # Normalize units to canonical form
+        left_unit_normalized = self._normalize_quantity_unit(left_unit) if left_unit else None
+        right_unit_normalized = self._normalize_quantity_unit(right_unit) if right_unit else None
+
+        # Check if units are compatible (both temporal or both canonicalizable to same unit)
+        if left_unit_normalized and right_unit_normalized and left_unit_normalized == right_unit_normalized:
+            # Units are the same after normalization - compare values directly
+            return f"({left_amount} {sql_operator} {right_amount})"
+
+        # Handle temporal unit conversions (days <-> weeks, hours <-> days, etc.)
+        temporal_units = {
+            "year": 365,  # Approximate
+            "month": 30,   # Approximate
+            "week": 7,
+            "day": 1,
+            "hour": 1/24,
+            "minute": 1/(24*60),
+            "second": 1/(24*60*60),
+        }
+
+        if (left_unit_normalized in temporal_units and
+            right_unit_normalized in temporal_units):
+            # Convert both to days for comparison
+            left_in_days = float(left_amount) * temporal_units[left_unit_normalized]
+            right_in_days = float(right_amount) * temporal_units[right_unit_normalized]
+            return f"({left_in_days} {sql_operator} {right_in_days})"
+
+        # For non-temporal quantities, we can't do unit conversion without UCUM
+        # Fall back to string comparison of the JSON representations
+        return f"({left_fragment.expression} {sql_operator} {right_fragment.expression})"
 
     def _apply_safe_cast_for_type(self, expression: str, target_type: str) -> str:
         """Apply safe type casting to an expression based on target literal type.
@@ -3816,9 +4021,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Time comparisons - cast to timestamp for comparison
             return self.dialect.safe_cast_to_timestamp(expression)
         elif target_type == "string":
-            # SP-022-007: For JSON values compared to string literals, extract as string
-            # UNNEST produces JSON-typed values; use json_extract_string to get plain text
-            return self.dialect.extract_json_string(expression, "$")
+            # SP-022-007: For JSON values compared to string literals, cast to VARCHAR
+            # The expression is already a JSON string from json_extract_string, we just need
+            # to cast it to VARCHAR so DuckDB doesn't try to parse the string literal as JSON
+            return f"CAST({expression} AS VARCHAR)"
         else:
             # For other types, no casting needed
             return expression
@@ -4382,6 +4588,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Args:
             subset_expr: Normalized collection expression (potential subset)
             superset_expr: Normalized collection expression (potential superset)
+            subset_source_table: Source table for subset (if it's a column reference)
+            superset_source_table: Source table for superset (if it's a column reference)
+            normalize_subset: Whether to normalize subset expression
+            normalize_superset: Whether to normalize superset expression
 
         Returns:
             SQL expression evaluating to boolean
@@ -4390,10 +4600,76 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             subset_expr = json_extract(resource, '$.name[0]')  # Single name
             superset_expr = json_extract(resource, '$.name')    # All names
             Result: TRUE (single element is in collection)
+
+        SP-110-002: Handle the case where subset_expr is a simple column reference
+        (like cte_2.name_item) that represents a single element, not an array.
+        In this case, we just need to check if that single element exists in the
+        superset collection, not enumerate it.
         """
         prefix = self._generate_internal_alias("subset")
         empty_array = self.dialect.empty_json_array()
 
+        # SP-110-002: Check if subset_expr is a simple column reference (single element)
+        # This happens when first()/last() creates a fragment with expression="name_item"
+        # and subsetOf() is called. The subset is a single element, not an array.
+        subset_is_single_element = (
+            subset_source_table and
+            subset_expr.endswith('_item') and
+            '.' in subset_expr
+        )
+
+        if subset_is_single_element:
+            # Subset is a single element - just check if it exists in superset
+            # No need to enumerate the subset
+            logger.debug(f"SP-110-002: Subset is single element {subset_expr}, using direct comparison")
+
+            # Safe superset with NULL handling
+            if normalize_superset:
+                safe_superset = f"COALESCE({self._normalize_collection_expression(superset_expr)}, {empty_array})"
+            else:
+                safe_superset = f"COALESCE({superset_expr}, {empty_array})"
+
+            # Serialize the single element for comparison
+            subset_serialized = self.dialect.serialize_json_value(subset_expr)
+
+            # Build enumeration for superset only
+            if superset_source_table:
+                # Superset is also a column reference - enumerate it
+                lateral_clause = self.dialect.generate_lateral_json_enumeration(safe_superset, "enum_table", "value", "key")
+
+                if self.dialect.name == "POSTGRESQL":
+                    superset_enumeration = (
+                        f"SELECT {superset_source_table}.id, (enum_table.ordinality - 1) AS idx, enum_table.value AS val "
+                        f"FROM {superset_source_table}, {lateral_clause}"
+                    )
+                else:
+                    superset_enumeration = (
+                        f"SELECT {superset_source_table}.id, enum_table.key AS idx, enum_table.value AS val "
+                        f"FROM {superset_source_table}, {lateral_clause}"
+                    )
+            else:
+                # Superset is a JSON array expression - enumerate it
+                superset_enumeration = self.dialect.enumerate_json_array(safe_superset, "val", "idx")
+
+            # Check if the single element exists in the superset
+            superset_serialized = self.dialect.serialize_json_value("val")
+            superset_values = (
+                f"SELECT DISTINCT {superset_serialized} AS value "
+                f"FROM ({superset_enumeration}) AS enum_table"
+            )
+
+            # Return TRUE if the single element is in the superset, FALSE otherwise
+            # Handle NULL subset as TRUE (empty set is subset of any set)
+            return (
+                f"COALESCE("
+                f"(SELECT CASE WHEN {subset_expr} IS NULL THEN TRUE "
+                f"WHEN EXISTS (SELECT 1 FROM ({superset_values}) AS sup WHERE sup.value = {subset_serialized}) "
+                f"THEN TRUE ELSE FALSE END), "
+                "TRUE"
+                ")"
+            )
+
+        # Original logic for array-to-array comparison
         # Safe versions with NULL handling
         # For CTE references, normalization is deferred to the LATERAL subquery
         if normalize_subset:
@@ -4415,22 +4691,45 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         superset_enum_alias = f"{prefix}_supenum"
 
         # Enumerate both arrays
-        # If source table is provided, use LATERAL to bring it into scope for CTE column references
+        # SP-110 Phase 2: If source table is provided, use proper LATERAL table function syntax
+        # to avoid parser errors with "LATERAL (SELECT ...)" pattern
         if subset_source_table:
-            subset_enumeration = (
-                f"SELECT * FROM {subset_source_table}, LATERAL ("
-                f"{self.dialect.enumerate_json_array(safe_subset, subset_value, subset_index)}"
-                f") AS {subset_enum_alias}"
-            )
+            # Use dialect polymorphic method for LATERAL JSON enumeration
+            lateral_clause = self.dialect.generate_lateral_json_enumeration(safe_subset, "enum_table", "value", "key")
+
+            # Build SELECT with appropriate column references based on dialect
+            if self.dialect.name == "POSTGRESQL":
+                # PostgreSQL uses ordinality (1-based), need to convert to 0-based
+                subset_enumeration = (
+                    f"SELECT {subset_source_table}.id, (enum_table.ordinality - 1) AS {subset_index}, enum_table.value AS {subset_value} "
+                    f"FROM {subset_source_table}, {lateral_clause}"
+                )
+            else:
+                # DuckDB and others use key column directly (0-based)
+                subset_enumeration = (
+                    f"SELECT {subset_source_table}.id, enum_table.key AS {subset_index}, enum_table.value AS {subset_value} "
+                    f"FROM {subset_source_table}, {lateral_clause}"
+                )
         else:
             subset_enumeration = self.dialect.enumerate_json_array(safe_subset, subset_value, subset_index)
 
         if superset_source_table:
-            superset_enumeration = (
-                f"SELECT * FROM {superset_source_table}, LATERAL ("
-                f"{self.dialect.enumerate_json_array(safe_superset, superset_value, superset_index)}"
-                f") AS {superset_enum_alias}"
-            )
+            # Use dialect polymorphic method for LATERAL JSON enumeration
+            lateral_clause = self.dialect.generate_lateral_json_enumeration(safe_superset, "enum_table", "value", "key")
+
+            # Build SELECT with appropriate column references based on dialect
+            if self.dialect.name == "POSTGRESQL":
+                # PostgreSQL uses ordinality (1-based), need to convert to 0-based
+                superset_enumeration = (
+                    f"SELECT {superset_source_table}.id, (enum_table.ordinality - 1) AS {superset_index}, enum_table.value AS {superset_value} "
+                    f"FROM {superset_source_table}, {lateral_clause}"
+                )
+            else:
+                # DuckDB and others use key column directly (0-based)
+                superset_enumeration = (
+                    f"SELECT {superset_source_table}.id, enum_table.key AS {superset_index}, enum_table.value AS {superset_value} "
+                    f"FROM {superset_source_table}, {lateral_clause}"
+                )
         else:
             superset_enumeration = self.dialect.enumerate_json_array(safe_superset, superset_value, superset_index)
 
@@ -5023,9 +5322,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if not left_info or not right_info:
             return None
 
-        # Only apply range-based semantics when at least one operand has reduced precision
-        # Field references always have implicit precision (e.g., birthDate has day precision)
-        if not (left_info.get("is_partial") or right_info.get("is_partial")):
+        # SP-110-008: Apply range-based semantics when:
+        # 1. At least one operand has reduced precision (is_partial)
+        # 2. At least one operand is a temporal function (now(), today(), timeOfDay())
+        # 3. At least one operand is a field reference (which has implicit precision)
+        # This ensures proper comparison between temporal functions and date fields
+        has_partial = left_info.get("is_partial") or right_info.get("is_partial")
+        has_temporal_function = left_info.get("is_temporal_function") or right_info.get("is_temporal_function")
+        has_field_reference = left_info.get("is_field_reference") or right_info.get("is_field_reference")
+
+        if not (has_partial or has_temporal_function or has_field_reference):
             return None
 
         operator = (node.operator or "").strip()
@@ -5092,6 +5398,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if temporal_field_info:
             return temporal_field_info
 
+        # SP-110-008: Check if this is a temporal function call (now(), today(), timeOfDay())
+        # These functions return temporal values with specific precision
+        temporal_function_info = self._extract_temporal_function_info(node)
+        if temporal_function_info:
+            return temporal_function_info
+
         return None
 
     def _find_literal_node(self, node: FHIRPathASTNode) -> Optional[FHIRPathASTNode]:
@@ -5131,12 +5443,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         from ..types.element_type_resolver import resolve_element_type
 
-        # Check if this is an InvocationExpression (field reference)
+        # SP-110-008: Handle multiple node types that can represent field references
+        # The parser may represent Patient.birthDate as different node types depending
+        # on the context (e.g., IdentifierNode, InvocationExpression, etc.)
+        # We accept any node that has a text attribute with a dot-separated path
         node_type = getattr(node, 'node_type', '')
-        if node_type != 'InvocationExpression':
-            return None
+        # Don't restrict to just InvocationExpression - accept any node with path text
 
-        # Get the field name from the invocation
+        # Get the field name from the node
         # For Patient.birthDate, we need to extract "birthDate"
         text = getattr(node, 'text', '')
         if not text or '.' not in text:
@@ -5183,6 +5497,60 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             "field_name": field_name,
             "original": text
         }
+
+    def _extract_temporal_function_info(self, node: FHIRPathASTNode) -> Optional[Dict[str, Any]]:
+        """Extract temporal metadata from temporal function calls.
+
+        This handles cases where the node is a function call like now(), today(), or timeOfDay()
+        which return temporal values with specific precision.
+
+        Args:
+            node: AST node representing a function call
+
+        Returns:
+            Dict with temporal info including kind, precision, is_partial
+            or None if not a temporal function
+        """
+        from ..ast.nodes import FunctionCallNode
+
+        # Check if this is a FunctionCallNode
+        if not isinstance(node, FunctionCallNode):
+            return None
+
+        function_name = getattr(node, 'function_name', '').lower()
+
+        # Define temporal functions and their return types
+        temporal_functions = {
+            'now': {
+                'kind': 'datetime',
+                'precision': 'full',
+                'is_partial': False,
+                'literal_type': 'datetime',
+                'function_name': 'now'
+            },
+            'today': {
+                'kind': 'date',
+                'precision': 'day',
+                'is_partial': False,
+                'literal_type': 'date',
+                'function_name': 'today'
+            },
+            'timeofday': {
+                'kind': 'time',
+                'precision': 'millisecond',
+                'is_partial': False,
+                'literal_type': 'time',
+                'function_name': 'timeofday'
+            }
+        }
+
+        if function_name in temporal_functions:
+            info = temporal_functions[function_name].copy()
+            info['original'] = function_name + '()'
+            info['is_temporal_function'] = True
+            return info
+
+        return None
 
     def _parse_temporal_literal_from_text(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse FHIR temporal literal from text, returning metadata for range comparisons.
@@ -5513,6 +5881,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # Check if this is a field reference
         is_field_ref = temporal_info.get("is_field_reference", False)
+        is_temporal_function = temporal_info.get("is_temporal_function", False)
+
         if is_field_ref and node:
             # Visit the node to get its SQL expression
             # This handles cases like Patient.birthDate where we need the actual SQL
@@ -5523,11 +5893,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # - start: The date itself (at midnight)
             # - end: The next day (exclusive)
             if kind == "date":
-                # Cast to TIMESTAMP and use date truncation for proper comparison
-                # DATE '1974-12-25' should compare as TIMESTAMP '1974-12-25 00:00:00'
-                # to TIMESTAMP '1974-12-26 00:00:00'
-                start_expr = f"CAST({fragment.expression} AS TIMESTAMP)"
-                end_expr = f"CAST({fragment.expression} AS TIMESTAMP) + INTERVAL '1 day'"
+                # SP-110-008: json_extract_string returns the JSON value including quotes
+                # (e.g., '"1974-12-25"'). We need to strip the quotes before casting to TIMESTAMP.
+                # Try-catch approach: first try to parse as-is, if that fails strip quotes
+                # Use a CASE expression to handle both quoted and unquoted values
+                json_extracted = fragment.expression
+                # Strip leading and trailing quotes from JSON string before casting
+                # json_extract_string returns '"value"' - we need to extract just 'value'
+                start_expr = f"CAST(CASE WHEN {json_extracted} LIKE '\"\"%' THEN NULL ELSE try_cast({json_extracted} AS TIMESTAMP) END AS TIMESTAMP)"
+                # For quoted strings, strip the quotes and cast
+                start_expr = f"CAST( CASE WHEN LEFT({json_extracted}, 1) = '\"' THEN SUBSTRING({json_extracted}, 2, LENGTH({json_extracted}) - 2) ELSE {json_extracted} END AS TIMESTAMP)"
+                end_expr = f"({start_expr} + INTERVAL '1 day')"
             elif kind == "datetime":
                 # For datetime fields, use the expression directly
                 # The field already has second precision
@@ -5537,6 +5913,36 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # For time fields, use the expression directly
                 start_expr = fragment.expression
                 end_expr = f"({fragment.expression} + INTERVAL '1 second')"
+            else:
+                return None
+
+            return start_expr, end_expr
+
+        # SP-110-008: Handle temporal functions (now(), today(), timeOfDay())
+        if is_temporal_function and node:
+            # Visit the node to get its SQL expression
+            fragment = self.visit(node)
+
+            function_name = temporal_info.get("function_name", "")
+
+            if function_name == "now":
+                # now() returns a full precision timestamp
+                # For comparison purposes, we treat it as an instant (no duration)
+                # start = end = now() to indicate it's a point in time
+                start_expr = fragment.expression
+                end_expr = fragment.expression
+            elif function_name == "today":
+                # today() returns the current date at day precision
+                # - start: Today at midnight
+                # - end: Tomorrow at midnight
+                # For comparisons with timestamps, we need to cast today() to timestamp range
+                start_expr = f"CAST({fragment.expression} AS TIMESTAMP)"
+                end_expr = f"CAST({fragment.expression} AS TIMESTAMP) + INTERVAL '1 day'"
+            elif function_name == "timeofday":
+                # timeOfDay() returns current time with millisecond precision
+                # Treat as point in time (no duration)
+                start_expr = fragment.expression
+                end_expr = fragment.expression
             else:
                 return None
 
@@ -5842,7 +6248,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _translate_count_function_call(self, node: FunctionCallNode) -> SQLFragment:
-        """Handle count() when represented as a function call node."""
+        """Handle count() when represented as a function call node.
+
+        SP-110-004 FIX: When count() is called on a where() result (or other filtered
+        collection), we need to count the filtered rows, not get the JSON array length.
+        This happens when the previous fragment has where_filter metadata or when
+        the collection_expr is a simple column reference from a CTE.
+        """
         collection_expr, dependencies, literal_value, snapshot, target_ast, target_path = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
         try:
@@ -5869,6 +6281,38 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if not collection_expr:
                 raise ValueError("count() requires a resolvable target expression")
 
+            # SP-110-004: Check if the previous fragment has where_filter or subset_filter metadata
+            # This indicates we're counting a filtered collection, not a raw JSON array
+            has_previous_filter = False
+            previous_fragment_result_col = None
+            if self.fragments:
+                prev_fragment = self.fragments[-1]
+                has_previous_filter = prev_fragment.metadata.get("where_filter") or prev_fragment.metadata.get("subset_filter")
+                previous_fragment_result_col = prev_fragment.metadata.get("result_alias")
+
+            logger.debug(f"SP-110-004 count(): has_previous_filter={has_previous_filter}")
+
+            # SP-110-004: Check if collection_expr is a simple column reference (like name_item)
+            # If so, and we have a filter, count the rows instead of getting JSON array length
+            is_simple_column_ref = self._is_simple_column_reference(collection_expr)
+
+            logger.debug(f"SP-110-004 count(): is_simple_column_ref={is_simple_column_ref}")
+
+            if has_previous_filter and is_simple_column_ref:
+                # Count filtered rows using COUNT(*) with the filter applied
+                # The CTEManager will handle the WHERE clause application
+                count_sql = f"COUNT(*)"
+
+                return SQLFragment(
+                    expression=count_sql,
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=True,  # This is an aggregate operation
+                    dependencies=list(dict.fromkeys(dependencies)),
+                    metadata={"function": "count", "result_type": "integer", "exclude_order_from_group_by": True}
+                )
+
+            # Default: count JSON array length
             base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
             normalized_expr = self._normalize_collection_expression(base_expr)
             length_expr = self.dialect.get_json_array_length(normalized_expr)
@@ -6268,7 +6712,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     expression=sql_expr,
                     source_table=source_table,
                     requires_unnest=False,
-                    is_aggregate=False
+                    is_aggregate=False,
+                    metadata={
+                        "function": f"convertsTo{target_type}",
+                        "result_type": "boolean"
+                    }
                 )
 
             if not value_expr:
@@ -6282,7 +6730,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 source_table=source_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                dependencies=dependencies
+                dependencies=dependencies,
+                metadata={
+                    "function": f"convertsTo{target_type}",
+                    "result_type": "boolean"
+                }
             )
         finally:
             self._restore_context(snapshot)
@@ -6479,6 +6931,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 f"got {len(node.arguments)}"
             )
 
+        # SP-110-004: Save and clear _pending_target_is_multi_item flag before resolving target
+        # This ensures that nested function calls (like toString() inside iif arguments)
+        # don't incorrectly set this flag for the outer iif() call
+        saved_pending_multi_item = getattr(self, '_pending_target_is_multi_item', False)
+        self._pending_target_is_multi_item = False
+
         # Get function target (the collection iif is called on, if any)
         (
             target_expr,
@@ -6488,6 +6946,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             target_ast,
             target_path,
         ) = self._resolve_function_target(node)
+
+        # SP-110-004: Capture the _pending_target_is_multi_item flag IMMEDIATELY after
+        # _resolve_function_target returns, before processing any arguments.
+        # This ensures the flag reflects whether the TARGET of iif() is a multi-item
+        # collection, not whether nested function calls have multi-item collections.
+        target_is_multi_item = getattr(self, '_pending_target_is_multi_item', False)
+
+        # SP-110-004: Only use target_is_multi_item if there's an actual target
+        # For standalone iif(...) calls without a target, this flag should be False
+        if not target_expr and not target_ast and not target_path:
+            target_is_multi_item = False
+        elif not target_is_multi_item and target_ast:
+            # Check if target_ast is a multi-item collection
+            target_is_multi_item = self._is_multi_item_collection(target_ast)
 
         try:
             # Extract arguments
@@ -6501,6 +6973,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 raise FHIRPathValidationError(
                     message=f"iif() criterion must be a boolean expression, got: {criterion_node.node_type}",
                     validation_rule="iif_criterion_must_be_boolean"
+                )
+
+            # SP-110-004: Validate criterion is not a multi-item collection (testCollectionBoolean1)
+            # Multi-item collections like (1 | 2 | 3) are not valid for iif() criterion
+            # The criterion must evaluate to a single boolean value
+            # Exception: unions with empty collections like {} | true are valid (reduce to single value)
+            if self._is_multi_item_collection_excluding_empty_unions(criterion_node):
+                raise FHIRPathValidationError(
+                    message=f"iif() criterion must be a single-value boolean expression, got multi-item collection",
+                    validation_rule="iif_criterion_must_be_single_value"
                 )
 
             # Translate criterion to SQL
@@ -6558,6 +7040,49 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             else:
                 false_result_sql = "NULL"
 
+            # SP-110: Add type coercion to ensure CASE branches have compatible types
+            # When branches have different types (e.g., DOUBLE vs BOOLEAN), cast to VARCHAR
+            # This prevents "Cannot mix values of type DOUBLE and BOOLEAN in CASE expression" errors
+            if false_result_node:
+                # Check if we need type coercion by examining fragment metadata
+                true_result_type = true_result_fragment.metadata.get('result_type', '')
+                false_result_type = false_result_fragment.metadata.get('result_type', '')
+
+                # If types are explicitly different, cast both to VARCHAR for compatibility
+                if true_result_type and false_result_type and true_result_type != false_result_type:
+                    # Use dialect's cast to string method
+                    true_result_sql = self.dialect.cast_to_string(true_result_sql)
+                    false_result_sql = self.dialect.cast_to_string(false_result_sql)
+                    logger.debug(
+                        f"iif() type coercion: {true_result_type} vs {false_result_type} -> VARCHAR"
+                    )
+                else:
+                    # Try to detect type incompatibility from SQL patterns
+                    # Pattern: numeric functions (AVG, SUM, etc.) vs boolean literals
+                    numeric_patterns = ['AVG(', 'SUM(', 'COUNT(', 'json_extract']
+                    boolean_patterns = ['TRUE', 'FALSE', 'boolean']
+
+                    true_is_numeric = any(p in true_result_sql.upper() for p in numeric_patterns)
+                    false_is_boolean = any(p in false_result_sql.upper() for p in boolean_patterns)
+                    false_is_numeric = any(p in false_result_sql.upper() for p in numeric_patterns)
+                    true_is_boolean = any(p in true_result_sql.upper() for p in boolean_patterns)
+
+                    # SP-110: Also detect numeric literals (digits with optional decimal point)
+                    # Pattern matches: 123, 1.5, 0.123 (not negative numbers, those have '-')
+                    numeric_literal_pattern = r'^\s*\d+(\.\d+)?\s*$'
+                    true_is_numeric_literal = bool(re.match(numeric_literal_pattern, true_result_sql))
+                    false_is_numeric_literal = bool(re.match(numeric_literal_pattern, false_result_sql))
+
+                    # Expand numeric detection to include numeric literals
+                    true_is_numeric = true_is_numeric or true_is_numeric_literal
+                    false_is_numeric = false_is_numeric or false_is_numeric_literal
+
+                    # If we have numeric vs boolean mismatch, cast to VARCHAR
+                    if (true_is_numeric and false_is_boolean) or (false_is_numeric and true_is_boolean):
+                        true_result_sql = self.dialect.cast_to_string(true_result_sql)
+                        false_result_sql = self.dialect.cast_to_string(false_result_sql)
+                        logger.debug("iif() type coercion: numeric vs boolean -> VARCHAR")
+
             # Build CASE expression with explicit empty-condition handling
             null_check_clause = f"WHEN {criterion_sql} IS NULL THEN NULL"
             true_clause = f"WHEN {criterion_sql} THEN {true_result_sql}"
@@ -6572,45 +7097,34 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # If iif is called on a collection (e.g., collection.iif(...)), validate cardinality
             # The collection must have 0 or 1 items (execution validation - testIif10)
-            if target_expr and (target_ast is not None or target_path is not None or hasattr(self, '_pending_target_is_multi_item')):
-                # Check if target is a multi-item literal union (e.g., 'item1' | 'item2')
-                # This can be detected at translation time or from pending fragment
-                is_multi_target = False
-                if target_ast and self._is_multi_item_collection(target_ast):
-                    is_multi_target = True
-                elif hasattr(self, '_pending_target_is_multi_item') and self._pending_target_is_multi_item:
-                    is_multi_target = True
-                    # Clear the flag after checking
-                    self._pending_target_is_multi_item = False
+            if target_is_multi_item:
+                raise FHIRPathEvaluationError(
+                    "iif() cannot be called on a collection with multiple items"
+                )
 
-                if is_multi_target:
-                    raise FHIRPathEvaluationError(
-                        "iif() cannot be called on a collection with multiple items"
-                    )
+            # For dynamic collections, add runtime validation
+            if target_path:
+                # Get the JSON path for the target collection
+                json_path = self._build_json_path_from_components(target_path)
 
-                # For dynamic collections, add runtime validation
-                if target_path:
-                    # Get the JSON path for the target collection
-                    json_path = self._build_json_path_from_components(target_path)
+                # Extract the collection
+                collection_expr = self.dialect.extract_json_object(
+                    column=snapshot["current_table"],
+                    path=json_path
+                )
 
-                    # Extract the collection
-                    collection_expr = self.dialect.extract_json_object(
-                        column=snapshot["current_table"],
-                        path=json_path
-                    )
+                array_length_expr = self.dialect.get_json_array_length(collection_expr)
 
-                    array_length_expr = self.dialect.get_json_array_length(collection_expr)
-
-                    # Validate cardinality: must be 0 or 1 items
-                    # Wrap the CASE expression with validation check
-                    validation_clauses = [
-                        f"WHEN {collection_expr} IS NULL THEN {case_expression}",
-                        f"WHEN {array_length_expr} <= 1 THEN {case_expression}",
-                        "ELSE NULL  -- Error: collection has multiple items",
-                    ]
-                    case_expression = "CASE\n" + "\n".join(
-                        f"    {clause}" for clause in validation_clauses
-                    ) + "\nEND"
+                # Validate cardinality: must be 0 or 1 items
+                # Wrap the CASE expression with validation check
+                validation_clauses = [
+                    f"WHEN {collection_expr} IS NULL THEN {case_expression}",
+                    f"WHEN {array_length_expr} <= 1 THEN {case_expression}",
+                    "ELSE NULL  -- Error: collection has multiple items",
+                ]
+                case_expression = "CASE\n" + "\n".join(
+                    f"    {clause}" for clause in validation_clauses
+                ) + "\nEND"
 
             # Combine dependencies from all fragments
             all_dependencies = dependencies.copy() if dependencies else []
@@ -6827,6 +7341,95 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return False
 
         # Single item is OK
+        return False
+
+    def _is_multi_item_collection_excluding_empty_unions(self, node) -> bool:
+        """
+        Check if an AST node represents a multi-item collection, excluding unions with empty collections.
+
+        This is a stricter version of _is_multi_item_collection that allows unions like
+        {} | true which reduce to a single value (the first non-empty value).
+
+        Args:
+            node: AST node to check
+
+        Returns:
+            True if node represents a multi-item collection with no empty collections, False otherwise
+        """
+        # Check for union operator (|) which creates multi-item collections
+        if hasattr(node, 'node_type') and node.node_type == "UnionExpression":
+            # Check if this union contains only non-empty literals
+            # If it has an empty collection {}, it's allowed (reduces to single value)
+            return self._union_has_only_non_empty_items(node)
+
+        # Also check for legacy operator node type
+        if hasattr(node, 'node_type') and node.node_type == "operator":
+            if hasattr(node, 'operator') and node.operator == '|':
+                return self._union_has_only_non_empty_items(node)
+
+        # SP-100-002: Recursively check children for union expressions
+        if hasattr(node, 'children'):
+            for child in node.children:
+                if self._is_multi_item_collection_excluding_empty_unions(child):
+                    return True
+
+        return False
+
+    def _union_has_only_non_empty_items(self, node) -> bool:
+        """
+        Check if a union expression contains only non-empty items.
+
+        Returns True if the union has multiple non-empty items (invalid for iif criterion).
+        Returns False if the union contains at least one empty collection or has only one item.
+
+        Args:
+            node: Union expression node to check
+
+        Returns:
+            True if union has multiple non-empty items, False otherwise
+        """
+        if not hasattr(node, 'children') or len(node.children) < 2:
+            return False
+
+        # Check each side of the union
+        non_empty_count = 0
+        for child in node.children:
+            if self._is_empty_collection_literal(child):
+                # Empty collection found - this union reduces to single value
+                return False
+            elif hasattr(child, 'node_type') and child.node_type == "UnionExpression":
+                # Nested union - recursively check
+                if self._union_has_only_non_empty_items(child):
+                    # Nested union has multiple non-empty items
+                    non_empty_count += 2  # At least 2 items in nested union
+                else:
+                    # Nested union has empty collection or single item
+                    return False
+            elif not self._is_multi_item_collection(child):
+                # This is a non-empty single item
+                non_empty_count += 1
+
+        # If we have 2+ non-empty items, this is a multi-item collection
+        return non_empty_count >= 2
+
+    def _is_empty_collection_literal(self, node) -> bool:
+        """
+        Check if an AST node represents an empty collection literal {}.
+
+        Args:
+            node: AST node to check
+
+        Returns:
+            True if node is an empty collection literal, False otherwise
+        """
+        if hasattr(node, 'node_type') and node.node_type == "literal":
+            text = getattr(node, 'text', '')
+            return text == '{}'
+
+        # Recursively check wrapper nodes
+        if hasattr(node, 'children') and len(node.children) == 1:
+            return self._is_empty_collection_literal(node.children[0])
+
         return False
 
     def _split_function_path(self, path: str) -> List[str]:
@@ -7940,14 +8543,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             right_source = right_fragment.source_table if right_is_cte_ref and hasattr(right_fragment, 'source_table') else None
 
             # Prepare expressions - normalize non-CTE refs, leave CTE refs as-is
+            # SP-110-002: When left_expr is a simple column reference (like name_item),
+            # it will be aliased as 'result' in the CTE output. We need to reference it
+            # with the source_table qualifier to make it accessible in the current scope.
             if left_is_cte_ref:
-                subset_expr = left_expr
+                # Check if this is a simple _item column reference that needs qualification
+                if left_expr.endswith('_item'):
+                    # Qualify with source_table for proper reference in SQL
+                    subset_expr = f"{source_table}.{left_expr}"
+                else:
+                    subset_expr = left_expr
             else:
                 base_expr = self._extract_collection_source(left_expr, target_path, snapshot)
                 subset_expr = self._normalize_collection_expression(base_expr)
 
             if right_is_cte_ref:
-                superset_expr = right_expr
+                # Check if this is a simple _item column reference that needs qualification
+                if right_expr.endswith('_item') and right_fragment.source_table:
+                    # Qualify with source_table for proper reference in SQL
+                    superset_expr = f"{right_fragment.source_table}.{right_expr}"
+                else:
+                    superset_expr = right_expr
             else:
                 superset_expr = self._normalize_collection_expression(right_expr)
 
@@ -8056,14 +8672,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # Prepare expressions - note: supersetOf swaps the arguments
             # (right is subset of left)
+            # SP-110-002: When expressions are simple _item column references,
+            # qualify them with their source tables for proper SQL reference.
             if left_is_cte_ref:
-                normalized_left = left_expr
+                if left_expr.endswith('_item'):
+                    normalized_left = f"{source_table}.{left_expr}"
+                else:
+                    normalized_left = left_expr
             else:
                 base_expr = self._extract_collection_source(left_expr, target_path, snapshot)
                 normalized_left = self._normalize_collection_expression(base_expr)
 
             if right_is_cte_ref:
-                normalized_right = right_expr
+                if right_expr.endswith('_item') and right_fragment.source_table:
+                    normalized_right = f"{right_fragment.source_table}.{right_expr}"
+                else:
+                    normalized_right = right_expr
             else:
                 normalized_right = self._normalize_collection_expression(right_expr)
 
@@ -8230,6 +8854,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         aggregate_expr = self.dialect.aggregate_to_json_array(f"{element_alias}")
         empty_array = self.dialect.empty_json_array()
 
+        # SP-110-002: For repeat() with non-JSON values (like strings), we need to convert
+        # the value to JSON before aggregation. The iteration expression might return
+        # a string that's not valid JSON (e.g., "test" instead of "\"test\"").
+        # Use to_json() to ensure proper JSON serialization.
+        aggregate_expr = self.dialect.aggregate_to_json_array(f"to_json({element_alias})")
+
         sql = f"""(
     WITH RECURSIVE {enum_cte} AS (
         {enumerate_sql}
@@ -8264,6 +8894,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         logger.debug(f"Complete repeat() SQL generated with RECURSIVE CTE and $this binding")
 
+        # SP-110-002: No preserved columns needed - repeat() returns a complete SQL expression
+        # that wraps everything. The result is available as a JSON array in the 'result' column
+        # of the outer CTE.
         return SQLFragment(
             expression=sql,
             source_table=old_table,
@@ -8386,17 +9019,82 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             )
 
         child = node.children[0]
+
+        # Visit the child expression to get the operand
+        # CRITICAL: In FHIRPath grammar, -1.convertsToInteger() parses as -(1.convertsToInteger())
+        # NOT as (-1).convertsToInteger()
+        # The InvocationExpression has LOWER precedence than PolarityExpression in the grammar
+        # So we must visit the child first, then apply the polarity operator
         child_fragment = self.visit(child)
 
         if operator == '-':
             # Check if the child is a literal (simple numeric negation)
             if (hasattr(child_fragment, 'metadata') and
                 child_fragment.metadata.get('is_literal')):
-                # Direct literal negation: -1, -3.14, etc.
-                negated_expr = f"-({child_fragment.expression})"
+                # SP-110-003: Direct literal negation for numeric types
+                # For numeric literals (integer, decimal), produce negative literal directly
+                # e.g., -1, -0.1 instead of -("1"), -("0.1")
+                # This ensures convertsToInteger() and convertsToDecimal() work correctly
+                # SP-110-005: Handle quantity literals with negation (e.g., (-5.5 'mg').abs())
+                literal_type = child_fragment.metadata.get('literal_type', '')
+                if literal_type in ('integer', 'decimal'):
+                    # Strip quotes if expression is quoted (shouldn't happen but safety check)
+                    expr = child_fragment.expression
+                    if expr.startswith("'") and expr.endswith("'"):
+                        expr = expr[1:-1]
+                    # Direct negation: -1, -0.1
+                    negated_expr = f"-{expr}"
+
+                    # SP-110-003: Update pending_literal_value with negated value
+                    # This ensures convertsTo*() functions get the correct negated literal
+                    if self.context.pending_literal_value is not None:
+                        old_value, old_expr = self.context.pending_literal_value
+                        # Negate the value
+                        if literal_type == 'integer':
+                            new_value = -int(old_value) if isinstance(old_value, (int, float)) else old_value
+                        else:  # decimal
+                            new_value = -float(old_value) if isinstance(old_value, (int, float)) else old_value
+                        self.context.pending_literal_value = (new_value, negated_expr)
+                elif literal_type == 'quantity':
+                    # SP-110-005: Handle quantity literal negation
+                    # For quantities like "5.5 'mg'", we need to negate the value but keep the unit
+                    quantity_value = child_fragment.metadata.get('quantity_value')
+                    quantity_unit = child_fragment.metadata.get('quantity_unit')
+
+                    if quantity_value is not None:
+                        # Negate the quantity value
+                        try:
+                            negated_value = -Decimal(str(quantity_value))
+                            # Build new quantity JSON with negated value
+                            from ..types.quantity_builder import build_quantity_json_string
+                            quantity_json = build_quantity_json_string(negated_value, quantity_unit)
+                            negated_expr = f"'{quantity_json}'"
+
+                            # Update pending_literal_value with negated quantity
+                            self.context.pending_literal_value = (NegatedQuantityMarker(negated_value, quantity_unit), negated_expr)
+
+                            # Update metadata with negated value
+                            result_metadata = dict(child_fragment.metadata)
+                            result_metadata['quantity_value'] = str(negated_value)
+
+                            return SQLFragment(
+                                expression=negated_expr,
+                                source_table=child_fragment.source_table,
+                                requires_unnest=child_fragment.requires_unnest,
+                                is_aggregate=child_fragment.is_aggregate,
+                                metadata=result_metadata
+                            )
+                        except (InvalidOperation, TypeError):
+                            # Fall through to default negation
+                            pass
+                else:
+                    # For other literals, use parenthesized negation
+                    negated_expr = f"-({child_fragment.expression})"
 
                 # Create new fragment with negated expression
                 result_metadata = dict(child_fragment.metadata)
+                # Keep is_literal flag for downstream functions
+                result_metadata['is_literal'] = True
                 return SQLFragment(
                     expression=negated_expr,
                     source_table=child_fragment.source_table,
@@ -9416,7 +10114,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return args
 
-    # Type function call handlers (temporary until AST adapter fix in SP-007-XXX)
+    # Type function call handlers - bridge function call syntax to type operations
+    # The AST adapter creates FunctionCallNode for type functions; these handlers
+    # convert them to the appropriate type checking SQL.
 
     def _translate_is_from_function_call(self, node: FunctionCallNode) -> SQLFragment:
         """Translate is() function call to type checking SQL.
@@ -9440,8 +10140,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             Output: SQL type check for Quantity type
 
         Note:
-            This is a temporary adapter until SP-007-XXX fixes AST adapter
-            to generate TypeOperationNode for type functions.
+            The AST adapter creates FunctionCallNode for type functions.
+            This handler bridges to the type operation implementation.
         """
         # Validate argument count
         if not node.arguments or len(node.arguments) == 0:
@@ -9987,6 +10687,165 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             is_aggregate=False  # Type filtering is not an aggregation
         )
 
+    def _translate_type(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate type() function to SQL that returns a Type structure.
+
+        The type() function returns a Type object with namespace and name properties.
+        For single values, it returns a Type describing the value's type.
+        For collections, it returns Type objects for each element.
+
+        FHIRPath Specification:
+            - type() : Type - returns a Type object with .namespace and .name
+            - The Type object has properties: namespace (e.g., 'System') and name (e.g., 'Integer')
+
+        Args:
+            node: FunctionCallNode representing type() function call (no arguments)
+
+        Returns:
+            SQLFragment with Type structure as JSON object
+
+        Raises:
+            ValueError: If type() has arguments (should have 0)
+
+        Example:
+            Input: 1.type()
+            Output: {"namespace": "System", "name": "Integer"} as JSON
+
+            Input: 1.type().namespace
+            Output: 'System'
+
+            Input: 1.type().name
+            Output: 'Integer'
+        """
+        logger.debug("Translating type() function")
+
+        # Validate no arguments
+        if node.arguments:
+            raise ValueError(
+                f"type() function takes no arguments, got {len(node.arguments)}"
+            )
+
+        # Get the target expression (what we're getting the type of)
+        (
+            target_expr,
+            dependencies,
+            _,
+            snapshot,
+            target_ast,
+            target_path,
+        ) = self._resolve_function_target(node)
+
+        source_table = snapshot["current_table"]
+
+        try:
+            # Determine the type based on the target AST
+            if target_ast:
+                # Check for literal nodes
+                if hasattr(target_ast, 'literal_type'):
+                    # For literals, we can directly return the type as a JSON structure
+                    literal_type = target_ast.literal_type
+                    if literal_type:
+                        # Map FHIRPath types to their canonical forms
+                        type_mapping = {
+                            'Integer': 'Integer',
+                            'Decimal': 'Decimal',
+                            'String': 'String',
+                            'Boolean': 'Boolean',
+                            'Date': 'Date',
+                            'DateTime': 'DateTime',
+                            'Time': 'Time',
+                            'Quantity': 'Quantity',
+                        }
+                        canonical_type = type_mapping.get(literal_type, literal_type)
+
+                        # Return as JSON object with namespace and name
+                        type_json = f"{{'namespace': 'System', 'name': '{canonical_type}'}}"
+                        return SQLFragment(
+                            expression=type_json,
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=dependencies or [],
+                            metadata={"function": "type", "result_type": "Type"}
+                        )
+
+                # Check for identifier nodes (field references)
+                if hasattr(target_ast, 'identifier') and target_ast.identifier:
+                    # For field references, we need to determine the type from the schema
+                    field_name = target_ast.identifier
+                    current_type = self.resource_type
+
+                    # Walk through the path to get the final type
+                    if target_path:
+                        element_type = self._get_element_type_for_path(target_path)
+                    else:
+                        element_type = self.type_registry.get_element_type(
+                            current_type, field_name
+                        )
+
+                    if element_type:
+                        # Validate element_type contains only safe characters (alphanumeric, underscore, hyphen)
+                        # This prevents potential SQL injection if type definitions are compromised
+                        if not re.match(r'^[A-Za-z][A-Za-z0-9_\-]*$', element_type):
+                            logger.warning(f"Invalid element type format: {element_type}")
+                            element_type = "Any"  # Safe fallback
+
+                        # Return as JSON object with namespace and name
+                        type_json = f"{{'namespace': 'FHIR', 'name': '{element_type}'}}"
+                        return SQLFragment(
+                            expression=type_json,
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=dependencies or [],
+                            metadata={"function": "type", "result_type": "Type"}
+                        )
+
+            # For complex expressions or when we can't determine statically,
+            # we need to construct a Type object from the runtime type
+            # Use CASE statement to map typeof() results to FHIRPath types
+            if target_expr:
+                # Get the runtime type using dialect's typeof function
+                runtime_type = self.dialect.get_json_typeof(target_expr)
+
+                # Map SQL types to FHIRPath Type objects
+                # This creates a JSON object with namespace and name
+                type_mapping_sql = f"""
+CASE
+    WHEN {runtime_type} = 'INTEGER' THEN '{{"namespace": "System", "name": "Integer"}}'
+    WHEN {runtime_type} = 'VARCHAR' THEN '{{"namespace": "System", "name": "String"}}'
+    WHEN {runtime_type} = 'BOOLEAN' THEN '{{"namespace": "System", "name": "Boolean"}}'
+    WHEN {runtime_type} = 'DOUBLE' THEN '{{"namespace": "System", "name": "Decimal"}}'
+    WHEN {runtime_type} = 'DATE' THEN '{{"namespace": "System", "name": "Date"}}'
+    WHEN {runtime_type} = 'TIMESTAMP' THEN '{{"namespace": "System", "name": "DateTime"}}'
+    WHEN {runtime_type} = 'TIME' THEN '{{"namespace": "System", "name": "Time"}}'
+    ELSE '{{"namespace": "System", "name": "Any"}}'
+END
+                """.strip()
+
+                return SQLFragment(
+                    expression=type_mapping_sql,
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    dependencies=dependencies or [],
+                    metadata={"function": "type", "result_type": "Type"}
+                )
+
+            # Fallback: return System.Any as the most general type
+            type_json = "{'namespace': 'System', 'name': 'Any'}"
+            return SQLFragment(
+                expression=type_json,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=dependencies or [],
+                metadata={"function": "type", "result_type": "Type"}
+            )
+
+        finally:
+            self._restore_context(snapshot)
+
     # Function translation methods
 
     def _translate_where(self, node: FunctionCallNode) -> SQLFragment:
@@ -10414,8 +11273,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         old_table = source_table
         old_path = self.context.parent_path.copy()
 
-        # Update context to reference array elements for projection expression translation
-        self.context.current_table = array_alias
+        # SP-110 Phase 2: Update context to reference array elements for projection expression translation
+        # Use 'value' as the element alias (from json_each/jsonb_array_elements)
+        # This matches what the LATERAL clause actually produces
+        element_alias = "enum_table.value"
+        index_alias = "key"  # For DuckDB; PostgreSQL will use (ordinality - 1)
+
+        self.context.current_table = element_alias
         self.context.parent_path.clear()
 
         # Translate the projection expression argument
@@ -10426,16 +11290,16 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # For $index support, we need to use enumerate_json_array instead of simple unnest
         # Define aliases for index and value
-        index_alias = f"{array_alias}_idx"
+        index_binding_alias = f"{array_alias}_idx"
 
         with self._variable_scope({
             "$this": VariableBinding(
-                expression=array_alias,
-                source_table=array_alias
+                expression=element_alias,
+                source_table=element_alias
             ),
             "$index": VariableBinding(
-                expression=index_alias,
-                source_table=array_alias
+                expression=index_binding_alias,
+                source_table=element_alias
             ),
             "$total": VariableBinding(
                 expression=total_expr,
@@ -10472,29 +11336,73 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Root level table - use table directly
             array_expr = "<<SOURCE_TABLE>>"
 
-        enumerate_sql = self.dialect.enumerate_json_array(array_expr, array_alias, index_alias)
+        # SP-110 Phase 2: Fix select() to use proper LATERAL UNNEST syntax
+        # The enumerate_json_array returns a SELECT, but we need to use it as a table function
+        # Instead of LATERAL (SELECT...), we need LATERAL ... AS alias
+        # For DuckDB: LATERAL json_each(...) AS enum(key, value)
+        # For PostgreSQL: LATERAL jsonb_array_elements(...) WITH ORDINALITY AS enum(value, ordinality)
 
-        logger.debug(f"Enumerate SQL: {enumerate_sql}")
+        # Get the array source expression for enumeration
+        # SP-110 Phase 2: If the source_table is a CTE (not 'resource'), we should enumerate
+        # from the result column if it contains JSON array data, or from the _item column
+        if has_subset_filter:
+            # After a subset filter, data is in the 'result' column
+            array_source_expr = "<<SOURCE_TABLE>>.result"
+        elif source_table.startswith("cte_"):
+            # Source is a CTE - check if we have an _item column to enumerate
+            # The _item column contains the JSON element from the previous UNNEST
+            # For select(), we need to enumerate from that column
+            array_source_expr = "<<SOURCE_TABLE>>.result"
+        elif array_path and array_path != "$":
+            # Original resource table - extract from JSON path
+            array_source_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
+        else:
+            # Root level table - use table directly
+            array_source_expr = "<<SOURCE_TABLE>>"
 
-        # Generate database-specific JSON array aggregation
+        logger.debug(f"Array source expression for select(): {array_source_expr}")
+
+        # SP-110 Phase 2: Generate database-specific JSON array aggregation
         # Need to order by index to preserve array order
         # SP-108-003: Wrap projection in to_json() to handle scalar values correctly
         # When projection extracts strings (via json_extract_string), they're VARCHAR type
         # to_json() converts them to JSON format (e.g., "Chalmers" -> "\"Chalmers\"")
-        aggregate_expr = self.dialect.aggregate_to_json_array(f"to_json({projection_fragment.expression}) ORDER BY {index_alias}")
+
+        # Build LATERAL UNNEST clause using dialect polymorphic method
+        # CRITICAL FIX: Use old_table directly in the lateral clause, not <<SOURCE_TABLE>>
+        # This prevents circular reference where select() returns source_table=cte_name
+        # but the SQL uses <<SOURCE_TABLE>> which gets replaced with cte_name
+        lateral_clause_source = array_source_expr.replace("<<SOURCE_TABLE>>", old_table)
+        lateral_clause = self.dialect.generate_lateral_json_enumeration(lateral_clause_source, "enum_table", "value", "key")
+
+        # Set index column and binding expression based on dialect
+        if self.dialect.name == "POSTGRESQL":
+            # PostgreSQL uses ordinality (1-based), need to convert to 0-based
+            index_col = "(enum_table.ordinality - 1)"
+            index_binding_expr = "(enum_table.ordinality - 1)"
+        else:
+            # DuckDB and others use key column directly (0-based)
+            index_col = "enum_table.key"
+            index_binding_expr = "enum_table.key"
+
+        # Update the $index binding to reference the correct column
+        self.context.bind_variable("$index", VariableBinding(
+            expression=index_binding_expr,
+            source_table="enum_table"
+        ))
+
+        aggregate_expr = self.dialect.aggregate_to_json_array(f"to_json({projection_fragment.expression}) ORDER BY {index_col}")
 
         # Construct complete SQL fragment with SELECT, FROM, LATERAL enumeration, GROUP BY
-        # This is population-friendly: processes entire array without row-by-row iteration
-        # SP-022-019: Include resource column for subsequent CTEs to reference
-        # SP-109-004: Use unqualified column references and a placeholder table name.
-        # The CTEManager will substitute the correct source table when wrapping this fragment.
-        sql = f"""SELECT <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource,
+        # CRITICAL FIX: Use old_table directly, not <<SOURCE_TABLE>>, to avoid circular reference
+        # When select() returns source_table=cte_name, using <<SOURCE_TABLE>> would cause
+        # CTEManager to substitute it with cte_name, creating "FROM cte_1, ... cte_1" (self-reference)
+        sql = f"""SELECT {old_table}.id, {old_table}.resource,
        {aggregate_expr} as result
-FROM <<SOURCE_TABLE>>, LATERAL ({enumerate_sql}) AS enum_table
-GROUP BY <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource"""
-        # Note: '<<SOURCE_TABLE>>' will be replaced by CTEManager with the actual source table
+FROM {old_table}, {lateral_clause}
+GROUP BY {old_table}.id, {old_table}.resource"""
 
-        logger.debug(f"Complete select() SQL fragment generated")
+        logger.debug(f"Complete select() SQL fragment generated: {sql}")
 
         # Update context to reference the new CTE for subsequent operations
         self.context.current_table = cte_name
@@ -11091,6 +11999,53 @@ END"""
         finally:
             self._restore_context(snapshot)
 
+    def _handle_not_on_collection(
+        self, prev_fragment: SQLFragment, source_table: str, dependencies: List[str]
+    ) -> Optional[SQLFragment]:
+        """Handle not() function when applied to a collection.
+
+        According to FHIRPath spec, not() on collections:
+        - Empty collection → Empty collection (NULL)
+        - Single boolean → Negated boolean
+        - Multiple values → Raises error (per official test suite)
+
+        Args:
+            prev_fragment: The previous SQLFragment to check
+            source_table: The source table for the SQL fragment
+            dependencies: List of dependencies for the SQL fragment
+
+        Returns:
+            SQLFragment with NULL expression if input is empty collection, None otherwise
+
+        Raises:
+            FHIRPathTranslationError: If input is a multi-item collection (e.g., union)
+        """
+        prev_metadata = prev_fragment.metadata or {}
+        is_collection = prev_metadata.get('is_collection') is True
+        operator = prev_metadata.get('operator')
+
+        if is_collection:
+            # Check if this is a multi-item collection (union operation)
+            # According to official FHIRPath tests, not() on multi-item collections should fail
+            if operator == 'union':
+                raise FHIRPathTranslationError(
+                    f"Cannot apply not() function to a multi-item collection. "
+                    f"The not() function requires a single boolean value or empty collection, "
+                    f"but got a collection with multiple values (e.g., from a union operation)."
+                )
+
+            # Empty or single-item collection returns NULL
+            logger.debug("SP-110-008: not() on collection returning NULL")
+            return SQLFragment(
+                expression="NULL",
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "not", "result_type": "boolean"}
+            )
+        return None
+
     def _translate_not(self, node: FunctionCallNode) -> SQLFragment:
         """Translate not() function to SQL for boolean negation.
 
@@ -11150,9 +12105,15 @@ END"""
         if not path_expr and self.fragments:
             # No path in node.text, but we have previous fragments.
             # Use the previous fragment's expression as the value to negate.
-            value_expr = self.fragments[-1].expression
-            source_table = self.fragments[-1].source_table or self.context.current_table
-            dependencies = list(self.fragments[-1].dependencies) if self.fragments[-1].dependencies else []
+            prev_fragment = self.fragments[-1]
+            value_expr = prev_fragment.expression
+            source_table = prev_fragment.source_table or self.context.current_table
+            dependencies = list(prev_fragment.dependencies) if prev_fragment.dependencies else []
+
+            # SP-110-008: Handle collections for not() function
+            collection_result = self._handle_not_on_collection(prev_fragment, source_table, dependencies)
+            if collection_result:
+                return collection_result
 
             not_sql = self.dialect.generate_boolean_not(value_expr)
 
@@ -11182,6 +12143,13 @@ END"""
         source_table = snapshot["current_table"]
 
         try:
+            # SP-110-008: Handle collections for not() function
+            if value_expr and self.fragments:
+                prev_fragment = self.fragments[-1]
+                collection_result = self._handle_not_on_collection(prev_fragment, source_table, dependencies)
+                if collection_result:
+                    return collection_result
+
             if literal_value is not None:
                 bool_value = self._evaluate_literal_to_boolean(literal_value)
                 if bool_value is None:
@@ -12237,6 +13205,29 @@ END"""
         if value_expression is None:
             raise ValueError(f"Unable to resolve target for {node.function_name}()")
 
+        # SP-110-008: Detect and fix unary minus literals that were incorrectly parsed as JSON paths
+        # When the parser sees (-5).abs(), it may incorrectly treat the '-' as a path component
+        # resulting in expressions like "json_extract_string(resource, '$.-')" instead of "-5"
+        # We detect this pattern and extract the actual numeric value
+        if "json_extract" in value_expression and "'$.-'" in value_expression:
+            logger.debug(f"Detected unary minus JSON path in math function: {value_expression}")
+            # This is a unary minus literal mis-parsed as JSON path - extract the numeric value
+            # The expression should be a simple negative number, not a JSON extraction
+            if value_fragment and value_fragment.metadata:
+                # Check if we have a literal value in metadata
+                if "text" in value_fragment.metadata:
+                    text_value = value_fragment.metadata.get("text", "")
+                    # Extract numeric value from text like "-5" or "-5.5"
+                    if text_value and text_value.startswith("-"):
+                        try:
+                            # Parse the numeric value
+                            numeric_value = float(text_value) if "." in text_value else int(text_value)
+                            # Use the direct numeric value instead of JSON path
+                            value_expression = str(numeric_value)
+                            logger.debug(f"Extracted numeric value from unary minus: {value_expression}")
+                        except (ValueError, TypeError):
+                            logger.debug(f"Could not parse numeric value from text: {text_value}")
+
         # Functions that accept an optional additional argument (e.g., precision for round/truncate)
         functions_with_optional_arg = {"round", "truncate", "log"}
 
@@ -12262,6 +13253,56 @@ END"""
                 for dep in arg_fragment.dependencies:
                     if dep not in dependencies:
                         dependencies.append(dep)
+
+        # SP-110-005: Special handling for abs() on quantity literals
+        # When abs() is called on a quantity literal like (-5.5 'mg'),
+        # we need to extract the value, apply abs(), and reconstruct the quantity JSON
+        if function_name == "abs" and value_fragment and value_fragment.metadata:
+            literal_type = value_fragment.metadata.get('literal_type')
+            if literal_type == 'quantity':
+                # Extract quantity value and unit
+                quantity_value = value_fragment.metadata.get('quantity_value')
+                quantity_unit = value_fragment.metadata.get('quantity_unit')
+
+                if quantity_value is not None and quantity_unit is not None:
+                    try:
+                        # Parse the value and apply abs()
+                        value_decimal = Decimal(str(quantity_value))
+                        abs_value = abs(value_decimal)
+
+                        # Build new quantity JSON with absolute value
+                        from ..types.quantity_builder import build_quantity_json_string
+                        quantity_json = build_quantity_json_string(abs_value, quantity_unit)
+                        math_sql = f"'{quantity_json}'"
+
+                        # Prepare dependency list (before dependency_list is defined later)
+                        abs_dependency_list = list(dict.fromkeys(dependencies))
+
+                        # Determine source table before the early return
+                        abs_source_table = (
+                            value_fragment.source_table
+                            if value_fragment and value_fragment.source_table
+                            else self.context.current_table
+                        )
+                        abs_requires_unnest = value_fragment.requires_unnest if value_fragment else False
+                        abs_is_aggregate = value_fragment.is_aggregate if value_fragment else False
+
+                        return SQLFragment(
+                            expression=math_sql,
+                            source_table=abs_source_table,
+                            requires_unnest=abs_requires_unnest,
+                            is_aggregate=abs_is_aggregate,
+                            dependencies=abs_dependency_list,
+                            metadata={
+                                'literal_type': 'quantity',
+                                'quantity_value': str(abs_value),
+                                'quantity_unit': quantity_unit,
+                                'is_literal': True
+                            }
+                        )
+                    except (InvalidOperation, TypeError):
+                        # Fall through to default handling
+                        pass
 
         if function_name == "sqrt":
             value_as_double = self.dialect.cast_to_double(value_expression)
@@ -12484,6 +13525,7 @@ END"""
         source_table: Optional[str] = None
         requires_unnest = False
         is_aggregate = False
+        metadata: Dict[str, Any] = {}  # SP-110-007: Initialize metadata for preserving array_column etc.
 
         if node.target is not None:
             target_snapshot = self._snapshot_context()
@@ -12494,6 +13536,9 @@ END"""
             is_aggregate = getattr(target_fragment, "is_aggregate", False)
             if hasattr(target_fragment, "dependencies"):
                 dependencies.extend(target_fragment.dependencies)
+            # SP-110-007: Preserve metadata from target fragment
+            if hasattr(target_fragment, "metadata") and target_fragment.metadata:
+                metadata = target_fragment.metadata.copy()
             self._restore_context(target_snapshot)
 
         string_arg_allowed = func_name in {"substring", "length", "replace", "indexof"}
@@ -12518,6 +13563,9 @@ END"""
             is_aggregate = getattr(string_fragment, "is_aggregate", False)
             if hasattr(string_fragment, "dependencies"):
                 dependencies.extend(string_fragment.dependencies)
+            # SP-110-007: Preserve metadata from string fragment
+            if hasattr(string_fragment, "metadata") and string_fragment.metadata:
+                metadata = string_fragment.metadata.copy()
             args = args[1:]
 
         if string_expr is None:
@@ -12525,7 +13573,11 @@ END"""
             # This handles cases like $this.length() where $this was visited before length()
             # and its expression was stored in pending_fragment_result
             # SP-102-001: pending_fragment_result is a tuple (sql_expression, parent_path, is_multi_item)
+            # SP-110-007: metadata is initialized here to ensure it exists for all code paths
             if self.context.pending_fragment_result is not None:
+                # Ensure metadata is initialized if not already set
+                if not metadata:
+                    metadata = {}
                 logger.debug(f"SP-102-001 DEBUG: substring found pending_fragment_result = {self.context.pending_fragment_result}")
                 # Extract the SQL expression from the tuple
                 pending_result = self.context.pending_fragment_result
@@ -12550,6 +13602,27 @@ END"""
                         source_table = pending_fragment.source_table or source_table
                         requires_unnest = getattr(pending_fragment, "requires_unnest", requires_unnest)
                         is_aggregate = getattr(pending_fragment, "is_aggregate", is_aggregate)
+                        # SP-110-007: Preserve metadata including array_column for UNNEST operations
+                        # This is critical for CTE manager to properly handle the fragment
+                        if hasattr(pending_fragment, "metadata") and pending_fragment.metadata:
+                            metadata = pending_fragment.metadata.copy()
+                            # SP-110-007 CRITICAL FIX: When processing a UNNEST result, use the CTE column name
+                            # directly. The projection_expression contains 'given_item.unnest' which is how
+                            # we get the UNNEST result in the CTE SELECT clause. But once we're in the next CTE,
+                            # the column is available directly as 'given_item' (the result_alias).
+                            # So we should use the result_alias to reference the CTE column.
+                            pending_metadata = pending_fragment.metadata
+                            if metadata.get("unnest_level", 0) > 0:
+                                # This fragment came from a UNNEST operation
+                                # Use the result_alias to reference the CTE column
+                                result_alias = metadata.get("result_alias")
+                                if result_alias:
+                                    # Use the result_alias which is the CTE column name (e.g., 'given_item')
+                                    # This is the column that contains the UNNEST result
+                                    string_expr = result_alias
+                                    # Mark that we're not requiring UNNEST since we're using the CTE column
+                                    requires_unnest = False
+                                    logger.debug(f"SP-110-007: Using CTE column {string_expr} (result_alias) instead of re-extracting")
                 # Clear the pending result after consuming it
                 self.context.pending_fragment_result = None
                 if source_table is None:
@@ -12567,6 +13640,8 @@ END"""
                     source_table = self.context.current_table
                     requires_unnest = False
                     is_aggregate = False
+                    # SP-110-007: Initialize empty metadata for context path case
+                    metadata = {}
                     logger.debug(
                         f"Using context path for string function: {current_path} -> {string_expr}"
                     )
@@ -12603,6 +13678,9 @@ END"""
                         is_aggregate = this_binding.is_aggregate
                         if this_binding.dependencies:
                             dependencies.extend(this_binding.dependencies)
+                        # SP-110-007: Preserve metadata from $this binding
+                        if hasattr(this_binding, "metadata") and this_binding.metadata:
+                            metadata = this_binding.metadata.copy()
                         logger.debug(
                             f"SP-102-001: Using $this as implicit string argument for {func_name}"
                         )
@@ -12822,7 +13900,8 @@ END"""
             source_table=source_table,
             requires_unnest=requires_unnest,
             is_aggregate=is_aggregate,
-            dependencies=list(dict.fromkeys(dependencies))
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata=metadata  # SP-110-007: Preserve metadata including array_column for UNNEST operations
         )
 
 
@@ -13600,9 +14679,9 @@ END"""
             >>> node = FunctionCallNode(function_name="matches", arguments=[regex_node])
             >>> fragment = translator._translate_matches(node)
             >>> fragment.expression  # DuckDB
-            "regexp_matches(json_extract(resource, '$.name[0].family'), '[A-Z][a-z]+')"
+            "regexp_matches(json_extract(name_item, '$.family'), '[A-Z][a-z]+')"
             >>> fragment.expression  # PostgreSQL
-            "(jsonb_extract_path_text(resource, 'name', '0', 'family') ~ '[A-Z][a-z]+')"
+            "(jsonb_extract_path_text(name_item, 'family') ~ '[A-Z][a-z]+')"
 
         Note:
             - Operates on current context (implicit string)
@@ -13610,6 +14689,7 @@ END"""
             - Returns boolean (true if matches, false if not)
             - NULL handling: null input → null output (both databases)
             - Regex syntax: Both DuckDB (PCRE) and PostgreSQL (POSIX) tested compatible
+            - SP-110-007: Uses pending_fragment_result to get string from CTEs
         """
         logger.debug(f"Translating matches() function")
 
@@ -13620,36 +14700,296 @@ END"""
                 f"got {len(node.arguments)}"
             )
 
-        # Get target string expression from current context
-        # For chained expressions like "name.family.matches('[A-Z]+')"
-        current_path = self.context.get_json_path()
-        target_expr = self.dialect.extract_json_field(
-            column=self.context.current_table,
-            path=current_path
-        )
+        # SP-110-007: Get target string expression from pending_fragment_result or current context
+        # This handles cases like "Patient.name.family.matches(...)" where the family
+        # field is in a CTE (name_item), not the base resource
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+        metadata: Dict[str, Any] = {}
+
+        # Check for pending_fragment_result from InvocationExpression chain
+        if self.context.pending_fragment_result is not None:
+            pending_result = self.context.pending_fragment_result
+            if isinstance(pending_result, tuple):
+                string_expr = pending_result[0]  # sql_expression is first element
+            else:
+                string_expr = pending_result
+
+            # Track dependencies from the pending fragment
+            if self.fragments:
+                pending_fragment = self.fragments[-1]
+                fragment_expr = pending_fragment.expression
+                if isinstance(fragment_expr, str) and fragment_expr == string_expr:
+                    if hasattr(pending_fragment, "dependencies") and pending_fragment.dependencies:
+                        dependencies.extend(pending_fragment.dependencies)
+                    source_table = pending_fragment.source_table or source_table
+                    requires_unnest = getattr(pending_fragment, "requires_unnest", requires_unnest)
+                    is_aggregate = getattr(pending_fragment, "is_aggregate", is_aggregate)
+                    # SP-110-007: Preserve metadata including array_column for UNNEST operations
+                    if hasattr(pending_fragment, "metadata") and pending_fragment.metadata:
+                        metadata = pending_fragment.metadata.copy()
+
+            # Clear the pending result after consuming it
+            self.context.pending_fragment_result = None
+            if source_table is None:
+                source_table = self.context.current_table
+        else:
+            # Fallback to current context path
+            current_path = self.context.get_json_path()
+            if current_path and current_path != "$":
+                string_expr = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=current_path
+                )
+                source_table = self.context.current_table
+
+        if string_expr is None:
+            string_expr = self.context.current_table
+            source_table = self.context.current_table
 
         # Get regex pattern argument
         regex_pattern_node = node.arguments[0]
         regex_fragment = self.visit(regex_pattern_node)
         regex_pattern = regex_fragment.expression
 
+        # Collect regex pattern dependencies
+        if hasattr(regex_fragment, 'dependencies'):
+            dependencies.extend(regex_fragment.dependencies)
+
         # Generate regex matching SQL using dialect
         matches_sql = self.dialect.generate_regex_match(
-            target_expr,
+            string_expr,
             regex_pattern
         )
 
         logger.debug(f"Generated matches() SQL: {matches_sql}")
 
-        # Collect dependencies
-        dependencies = regex_fragment.dependencies if hasattr(regex_fragment, 'dependencies') else []
-
         return SQLFragment(
             expression=matches_sql,
-            source_table=self.context.current_table,
-            requires_unnest=False,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata=metadata
+        )
+
+    def _translate_matchesfull(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate matchesFull() function to SQL for full-string regex matching.
+
+        FHIRPath: string.matchesFull(regex)
+        SQL: regexp_matches(string, '^' || regex || '$') [DuckDB]
+             (string ~ ('^' || regex || '$')) [PostgreSQL]
+
+        The matchesFull() function tests if a string matches a regular expression pattern
+        across the ENTIRE string (not just a substring). This differs from matches() which
+        returns true if the pattern matches anywhere in the string.
+
+        This is a method call where the string is the implicit target (from context)
+        and the regex pattern is the explicit argument.
+
+        Args:
+            node: FunctionCallNode representing matchesFull() function call
+
+        Returns:
+            SQLFragment containing the full-string regex matching SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            'hello'.matchesFull('ll'):
+            >>> node = FunctionCallNode(function_name="matchesFull", arguments=[regex_node])
+            >>> fragment = translator._translate_matchesfull(node)
+            >>> fragment.expression  # DuckDB
+            "regexp_matches('hello', '^ll$')"
+            >>> fragment.expression  # PostgreSQL
+            "('hello' ~ ('^ll$'))"
+
+        Note:
+            - Operates on current context (implicit string)
+            - Takes exactly 1 argument (regex pattern)
+            - Returns boolean (true if full string matches, false if not)
+            - NULL handling: null input → null output (both databases)
+            - Regex syntax: Both DuckDB (PCRE) and PostgreSQL (POSIX) tested compatible
+            - The regex is anchored with ^ and $ to ensure full-string matching
+            - SP-110-007: Uses pending_fragment_result to get string from CTEs
+        """
+        logger.debug(f"Translating matchesFull() function")
+
+        # Validate arguments
+        if len(node.arguments) != 1:
+            raise ValueError(
+                f"matchesFull() function requires exactly 1 argument (regex pattern), "
+                f"got {len(node.arguments)}"
+            )
+
+        # SP-110-007: Get target string expression from pending_fragment_result or current context
+        # This handles cases like "Patient.name.family.matchesFull(...)" where the family
+        # field is in a CTE (name_item), not the base resource
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+        metadata: Dict[str, Any] = {}
+
+        # Check for pending_fragment_result from InvocationExpression chain
+        if self.context.pending_fragment_result is not None:
+            pending_result = self.context.pending_fragment_result
+            if isinstance(pending_result, tuple):
+                string_expr = pending_result[0]  # sql_expression is first element
+            else:
+                string_expr = pending_result
+
+            # Track dependencies from the pending fragment
+            if self.fragments:
+                pending_fragment = self.fragments[-1]
+                fragment_expr = pending_fragment.expression
+                if isinstance(fragment_expr, str) and fragment_expr == string_expr:
+                    if hasattr(pending_fragment, "dependencies") and pending_fragment.dependencies:
+                        dependencies.extend(pending_fragment.dependencies)
+                    source_table = pending_fragment.source_table or source_table
+                    requires_unnest = getattr(pending_fragment, "requires_unnest", requires_unnest)
+                    is_aggregate = getattr(pending_fragment, "is_aggregate", is_aggregate)
+                    # SP-110-007: Preserve metadata including array_column for UNNEST operations
+                    if hasattr(pending_fragment, "metadata") and pending_fragment.metadata:
+                        metadata = pending_fragment.metadata.copy()
+
+            # Clear the pending result after consuming it
+            self.context.pending_fragment_result = None
+            if source_table is None:
+                source_table = self.context.current_table
+        else:
+            # Fallback to current context path
+            current_path = self.context.get_json_path()
+            if current_path and current_path != "$":
+                string_expr = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=current_path
+                )
+                source_table = self.context.current_table
+
+        if string_expr is None:
+            string_expr = self.context.current_table
+            source_table = self.context.current_table
+
+        # Get regex pattern argument
+        regex_pattern_node = node.arguments[0]
+        regex_fragment = self.visit(regex_pattern_node)
+        regex_pattern = regex_fragment.expression
+
+        # Collect regex pattern dependencies
+        if hasattr(regex_fragment, 'dependencies'):
+            dependencies.extend(regex_fragment.dependencies)
+
+        # Anchor the regex pattern to match the full string
+        # We need to wrap the pattern with ^ and $ anchors
+        # Use concatenation to avoid modifying the user's pattern
+        anchored_pattern = f"('^' || {regex_pattern} || '$')"
+
+        # Generate regex matching SQL using dialect
+        matchesfull_sql = self.dialect.generate_regex_match(
+            string_expr,
+            anchored_pattern
+        )
+
+        logger.debug(f"Generated matchesFull() SQL: {matchesfull_sql}")
+
+        return SQLFragment(
+            expression=matchesfull_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata=metadata
+        )
+
+    def _translate_children(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate children() function to SQL for direct child access.
+
+        FHIRPath: resource.children()
+        SQL: Returns all direct child elements of the current node as a JSON array
+
+        The children() function returns the direct children of the current node in a
+        tree structure. For FHIR resources, this returns all child elements of the
+        current resource or element as a collection.
+
+        Args:
+            node: FunctionCallNode representing children() function call
+
+        Returns:
+            SQLFragment containing the children extraction SQL
+
+        Raises:
+            ValueError: If function has any arguments (takes none)
+
+        Example:
+            Patient.children():
+            >>> node = FunctionCallNode(function_name="children", arguments=[])
+            >>> fragment = translator._translate_children(node)
+            >>> fragment.expression  # Both databases
+            Returns all child elements of Patient resource
+
+        Note:
+            - Operates on current context (implicit resource/element)
+            - Takes no arguments
+            - Returns collection of child elements
+            - For FHIR resources, returns direct child fields/elements
+            - NULL handling: null input → empty collection
+        """
+        logger.debug(f"Translating children() function")
+
+        # Validate arguments - children() takes no arguments
+        if len(node.arguments) != 0:
+            raise ValueError(
+                f"children() function requires no arguments, got {len(node.arguments)}"
+            )
+
+        # Get the current resource/element expression
+        current_expr = self.context.current_table
+        source_table = self.context.current_table
+
+        # For FHIR resources stored as JSON, children() returns all keys
+        # We need to extract all child elements from the JSON structure
+        # Both DuckDB and PostgreSQL support JSON key extraction
+
+        # Use duckdb_postgres_json_keys to get all keys from the JSON object
+        # Then for each key, extract the value
+        # This creates a collection of child elements
+
+        # Get the current JSON path (if any)
+        current_path = self.context.get_json_path()
+
+        if current_path and current_path != "$":
+            # We're navigating within a resource, extract children from the current path
+            parent_json = self.dialect.extract_json_field(
+                column=source_table,
+                path=current_path
+            )
+
+            # Get all keys from this JSON object
+            # DuckDB: json_keys(json), PostgreSQL: SELECT jsonb_object_keys(json)
+            children_sql = self.dialect.generate_json_children(parent_json)
+        else:
+            # We're at the resource level, get all children from the resource JSON
+            children_sql = self.dialect.generate_json_children(current_expr)
+
+        logger.debug(f"Generated children() SQL: {children_sql}")
+
+        return SQLFragment(
+            expression=children_sql,
+            source_table=source_table,
+            requires_unnest=True,  # children() returns a collection
             is_aggregate=False,
-            dependencies=dependencies
+            dependencies=[],
+            metadata={
+                "function": "children",
+                "result_type": "collection",
+                "array_column": children_sql  # JSON array column for UNNEST
+            }
         )
 
     def _translate_replacematches(self, node: FunctionCallNode) -> SQLFragment:
@@ -13677,7 +15017,7 @@ END"""
             >>> node = FunctionCallNode(function_name="replaceMatches", arguments=[regex_node, subst_node])
             >>> fragment = translator._translate_replacematches(node)
             >>> fragment.expression  # Both databases
-            "regexp_replace(json_extract(resource, '$.name[0].family'), '[0-9]', 'X', 'g')"
+            "regexp_replace(json_extract(name_item, '$.family'), '[0-9]', 'X', 'g')"
 
         Note:
             - Operates on current context (implicit string)
@@ -13687,6 +15027,7 @@ END"""
             - Regex syntax: Both DuckDB (PCRE) and PostgreSQL (POSIX) support regexp_replace
             - Global replacement: 'g' flag replaces all matches, not just first
             - Capture groups: Both support $1, $2 in substitution (DuckDB) or \1, \2 (PostgreSQL)
+            - SP-110-007: Uses pending_fragment_result to get string from CTEs
         """
         logger.debug(f"Translating replaceMatches() function")
 
@@ -13697,13 +15038,53 @@ END"""
                 f"got {len(node.arguments)}"
             )
 
-        # Get target string expression from current context
-        # For chained expressions like "name.family.replaceMatches('[0-9]', 'X')"
-        current_path = self.context.get_json_path()
-        target_expr = self.dialect.extract_json_field(
-            column=self.context.current_table,
-            path=current_path
-        )
+        # SP-110-007: Get target string expression from pending_fragment_result or current context
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+        metadata: Dict[str, Any] = {}
+
+        # Check for pending_fragment_result from InvocationExpression chain
+        if self.context.pending_fragment_result is not None:
+            pending_result = self.context.pending_fragment_result
+            if isinstance(pending_result, tuple):
+                string_expr = pending_result[0]  # sql_expression is first element
+            else:
+                string_expr = pending_result
+
+            # Track dependencies from the pending fragment
+            if self.fragments:
+                pending_fragment = self.fragments[-1]
+                fragment_expr = pending_fragment.expression
+                if isinstance(fragment_expr, str) and fragment_expr == string_expr:
+                    if hasattr(pending_fragment, "dependencies") and pending_fragment.dependencies:
+                        dependencies.extend(pending_fragment.dependencies)
+                    source_table = pending_fragment.source_table or source_table
+                    requires_unnest = getattr(pending_fragment, "requires_unnest", requires_unnest)
+                    is_aggregate = getattr(pending_fragment, "is_aggregate", is_aggregate)
+                    # SP-110-007: Preserve metadata including array_column for UNNEST operations
+                    if hasattr(pending_fragment, "metadata") and pending_fragment.metadata:
+                        metadata = pending_fragment.metadata.copy()
+
+            # Clear the pending result after consuming it
+            self.context.pending_fragment_result = None
+            if source_table is None:
+                source_table = self.context.current_table
+        else:
+            # Fallback to current context path
+            current_path = self.context.get_json_path()
+            if current_path and current_path != "$":
+                string_expr = self.dialect.extract_json_field(
+                    column=self.context.current_table,
+                    path=current_path
+                )
+                source_table = self.context.current_table
+
+        if string_expr is None:
+            string_expr = self.context.current_table
+            source_table = self.context.current_table
 
         # Get regex pattern argument
         regex_pattern_node = node.arguments[0]
@@ -13715,52 +15096,69 @@ END"""
         substitution_fragment = self.visit(substitution_node)
         substitution = substitution_fragment.expression
 
+        # Collect dependencies from both arguments
+        if hasattr(regex_fragment, 'dependencies'):
+            dependencies.extend(regex_fragment.dependencies)
+        if hasattr(substitution_fragment, 'dependencies'):
+            dependencies.extend(substitution_fragment.dependencies)
+
         # Generate regex replacement SQL using dialect
         replace_sql = self.dialect.generate_regex_replace(
-            target_expr,
+            string_expr,
             regex_pattern,
             substitution
         )
 
         logger.debug(f"Generated replaceMatches() SQL: {replace_sql}")
 
-        # Collect dependencies from both arguments
-        dependencies = []
-        if hasattr(regex_fragment, 'dependencies'):
-            dependencies.extend(regex_fragment.dependencies)
-        if hasattr(substitution_fragment, 'dependencies'):
-            dependencies.extend(substitution_fragment.dependencies)
-
         return SQLFragment(
             expression=replace_sql,
-            source_table=self.context.current_table,
-            requires_unnest=False,
-            is_aggregate=False,
-            dependencies=dependencies
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata=metadata
         )
 
     def _translate_all_true(self, node: FunctionCallNode) -> SQLFragment:
         """Translate allTrue() function to SQL using BOOL_AND aggregate.
-        
+
         FHIRPath Specification: Section 5.3.5
         Returns TRUE if all elements are TRUE. Empty collections return TRUE.
+
+        SP-110-002: Handle both JSON arrays (via json_each) and UNNESTed collections
+        (via direct aggregation on rows). When collection_expr is a simple column
+        reference that's already a JSON array from a previous CTE, we need to
+        enumerate it first.
         """
         logger.debug("Translating allTrue() function")
-        
+
         if node.arguments:
             raise ValueError(f"allTrue() takes no arguments, got {len(node.arguments)}")
-        
+
         (collection_expr, dependencies, _, snapshot, _, target_path) = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
-        
+
+        # SP-110-002: Check if there's a pre-built SELECT from select()
+        # In this case, the result column is already a JSON array
+        has_select_result = any(
+            f.metadata.get("function") == "select" for f in self.fragments
+        )
+
         try:
             if not collection_expr:
                 raise ValueError("allTrue() requires a collection expression")
-            
-            base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
-            normalized_expr = self._normalize_collection_expression(base_expr)
-            all_true_sql = self.dialect.generate_all_true(normalized_expr)
-            
+
+            # SP-110-002: If the collection comes from select(), it's already in 'result' column
+            # as a JSON array. We need to enumerate it with json_each.
+            if has_select_result:
+                # The result column contains the aggregated JSON array from select()
+                all_true_sql = f"COALESCE((SELECT BOOL_AND(CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), TRUE)"
+            else:
+                base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
+                normalized_expr = self._normalize_collection_expression(base_expr)
+                all_true_sql = self.dialect.generate_all_true(normalized_expr)
+
             return SQLFragment(
                 expression=all_true_sql,
                 source_table=source_table,
@@ -13774,26 +15172,43 @@ END"""
 
     def _translate_any_true(self, node: FunctionCallNode) -> SQLFragment:
         """Translate anyTrue() function to SQL using BOOL_OR aggregate.
-        
+
         FHIRPath Specification: Section 5.3.6
         Returns TRUE if any element is TRUE. Empty collections return FALSE.
+
+        SP-110-002: Handle both JSON arrays (via json_each) and UNNESTed collections
+        (via direct aggregation on rows). When collection_expr is a simple column
+        reference that's already a JSON array from a previous CTE, we need to
+        enumerate it first.
         """
         logger.debug("Translating anyTrue() function")
-        
+
         if node.arguments:
             raise ValueError(f"anyTrue() takes no arguments, got {len(node.arguments)}")
-        
+
         (collection_expr, dependencies, _, snapshot, _, target_path) = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
-        
+
+        # SP-110-002: Check if there's a pre-built SELECT from select()
+        # In this case, the result column is already a JSON array
+        has_select_result = any(
+            f.metadata.get("function") == "select" for f in self.fragments
+        )
+
         try:
             if not collection_expr:
                 raise ValueError("anyTrue() requires a collection expression")
-            
-            base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
-            normalized_expr = self._normalize_collection_expression(base_expr)
-            any_true_sql = self.dialect.generate_any_true(normalized_expr)
-            
+
+            # SP-110-002: If the collection comes from select(), it's already in 'result' column
+            # as a JSON array. We need to enumerate it with json_each.
+            if has_select_result:
+                # The result column contains the aggregated JSON array from select()
+                any_true_sql = f"COALESCE((SELECT BOOL_OR(CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), FALSE)"
+            else:
+                base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
+                normalized_expr = self._normalize_collection_expression(base_expr)
+                any_true_sql = self.dialect.generate_any_true(normalized_expr)
+
             return SQLFragment(
                 expression=any_true_sql,
                 source_table=source_table,
@@ -13807,26 +15222,43 @@ END"""
 
     def _translate_all_false(self, node: FunctionCallNode) -> SQLFragment:
         """Translate allFalse() function to SQL using BOOL_AND(NOT value).
-        
+
         FHIRPath Specification: Section 5.3.7
         Returns TRUE if all elements are FALSE. Empty collections return TRUE.
+
+        SP-110-002: Handle both JSON arrays (via json_each) and UNNESTed collections
+        (via direct aggregation on rows). When collection_expr is a simple column
+        reference that's already a JSON array from a previous CTE, we need to
+        enumerate it first.
         """
         logger.debug("Translating allFalse() function")
-        
+
         if node.arguments:
             raise ValueError(f"allFalse() takes no arguments, got {len(node.arguments)}")
-        
+
         (collection_expr, dependencies, _, snapshot, _, target_path) = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
-        
+
+        # SP-110-002: Check if there's a pre-built SELECT from select()
+        # In this case, the result column is already a JSON array
+        has_select_result = any(
+            f.metadata.get("function") == "select" for f in self.fragments
+        )
+
         try:
             if not collection_expr:
                 raise ValueError("allFalse() requires a collection expression")
-            
-            base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
-            normalized_expr = self._normalize_collection_expression(base_expr)
-            all_false_sql = self.dialect.generate_all_false(normalized_expr)
-            
+
+            # SP-110-002: If the collection comes from select(), it's already in 'result' column
+            # as a JSON array. We need to enumerate it with json_each.
+            if has_select_result:
+                # The result column contains the aggregated JSON array from select()
+                all_false_sql = f"COALESCE((SELECT BOOL_AND(NOT CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), TRUE)"
+            else:
+                base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
+                normalized_expr = self._normalize_collection_expression(base_expr)
+                all_false_sql = self.dialect.generate_all_false(normalized_expr)
+
             return SQLFragment(
                 expression=all_false_sql,
                 source_table=source_table,
@@ -13843,6 +15275,11 @@ END"""
 
         FHIRPath Specification: Section 5.3.8
         Returns TRUE if any element is FALSE. Empty collections return FALSE.
+
+        SP-110-002: Handle both JSON arrays (via json_each) and UNNESTed collections
+        (via direct aggregation on rows). When collection_expr is a simple column
+        reference that's already a JSON array from a previous CTE, we need to
+        enumerate it first.
         """
         logger.debug("Translating anyFalse() function")
 
@@ -13852,13 +15289,25 @@ END"""
         (collection_expr, dependencies, _, snapshot, _, target_path) = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
 
+        # SP-110-002: Check if there's a pre-built SELECT from select()
+        # In this case, the result column is already a JSON array
+        has_select_result = any(
+            f.metadata.get("function") == "select" for f in self.fragments
+        )
+
         try:
             if not collection_expr:
                 raise ValueError("anyFalse() requires a collection expression")
 
-            base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
-            normalized_expr = self._normalize_collection_expression(base_expr)
-            any_false_sql = self.dialect.generate_any_false(normalized_expr)
+            # SP-110-002: If the collection comes from select(), it's already in 'result' column
+            # as a JSON array. We need to enumerate it with json_each.
+            if has_select_result:
+                # The result column contains the aggregated JSON array from select()
+                any_false_sql = f"COALESCE((SELECT BOOL_OR(NOT CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), FALSE)"
+            else:
+                base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
+                normalized_expr = self._normalize_collection_expression(base_expr)
+                any_false_sql = self.dialect.generate_any_false(normalized_expr)
 
             return SQLFragment(
                 expression=any_false_sql,
@@ -14226,5 +15675,491 @@ END"""
                 'fhir_type': 'Time',
                 'returns_scalar': True,
                 'temporal_precision': 'millisecond'
+            }
+        )
+
+    def _translate_encode(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate encode() function to SQL for encoding strings.
+
+        FHIRPath: string.encode(encoding)
+        SQL: Database-specific encode function (base64, hex, urlbase64)
+
+        The encode() function encodes a string using the specified encoding.
+
+        Args:
+            node: FunctionCallNode representing encode() function call
+
+        Returns:
+            SQLFragment containing the encoding SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            'test'.encode('base64') → 'dGVzdA=='
+            'test'.encode('hex') → '74657374'
+        """
+        logger.debug(f"Translating encode() function")
+
+        # Validate arguments - encode() takes exactly 1 argument (encoding type)
+        if len(node.arguments) != 1:
+            raise ValueError(
+                f"encode() function requires exactly 1 argument (encoding type: base64, hex, urlbase64), "
+                f"got {len(node.arguments)}"
+            )
+
+        # Get the target string expression
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+
+        if node.target is not None:
+            snapshot = self._snapshot_context()
+            target_fragment = self.visit(node.target)
+            string_expr = target_fragment.expression
+            source_table = target_fragment.source_table
+            requires_unnest = getattr(target_fragment, "requires_unnest", False)
+            is_aggregate = getattr(target_fragment, "is_aggregate", False)
+            if hasattr(target_fragment, "dependencies"):
+                dependencies.extend(target_fragment.dependencies)
+            self._restore_context(snapshot)
+        elif self.fragments:
+            string_expr = self.fragments[-1].expression
+            source_table = self.fragments[-1].source_table
+            requires_unnest = getattr(self.fragments[-1], "requires_unnest", False)
+            is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
+            if hasattr(self.fragments[-1], "dependencies"):
+                dependencies.extend(self.fragments[-1].dependencies)
+            self.fragments.pop()
+        else:
+            raise ValueError("encode() requires a target string expression")
+
+        # Get the encoding type argument
+        encoding_arg = node.arguments[0]
+        if not isinstance(encoding_arg, LiteralNode):
+            raise ValueError("encode() encoding type must be a string literal")
+
+        encoding_type = encoding_arg.value.lower()
+        if encoding_type not in ("base64", "hex", "urlbase64"):
+            raise ValueError(f"encode() unsupported encoding type: {encoding_type}. Supported: base64, hex, urlbase64")
+
+        # Generate encoding SQL based on encoding type
+        if encoding_type == "base64":
+            encode_sql = self.dialect.generate_base64_encode(string_expr)
+        elif encoding_type == "hex":
+            encode_sql = self.dialect.generate_hex_encode(string_expr)
+        else:  # urlbase64
+            encode_sql = self.dialect.generate_urlbase64_encode(string_expr)
+
+        logger.debug(f"Generated encode() SQL: {encode_sql}")
+
+        return SQLFragment(
+            expression=encode_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "encode", "encoding": encoding_type}
+        )
+
+    def _translate_decode(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate decode() function to SQL for decoding strings.
+
+        FHIRPath: string.decode(encoding)
+        SQL: Database-specific decode function (base64, hex, urlbase64)
+
+        The decode() function decodes a string using the specified encoding.
+
+        Args:
+            node: FunctionCallNode representing decode() function call
+
+        Returns:
+            SQLFragment containing the decoding SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            'dGVzdA=='.decode('base64') → 'test'
+            '74657374'.decode('hex') → 'test'
+        """
+        logger.debug(f"Translating decode() function")
+
+        # Validate arguments - decode() takes exactly 1 argument (encoding type)
+        if len(node.arguments) != 1:
+            raise ValueError(
+                f"decode() function requires exactly 1 argument (encoding type: base64, hex, urlbase64), "
+                f"got {len(node.arguments)}"
+            )
+
+        # Get the target string expression
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+
+        if node.target is not None:
+            snapshot = self._snapshot_context()
+            target_fragment = self.visit(node.target)
+            string_expr = target_fragment.expression
+            source_table = target_fragment.source_table
+            requires_unnest = getattr(target_fragment, "requires_unnest", False)
+            is_aggregate = getattr(target_fragment, "is_aggregate", False)
+            if hasattr(target_fragment, "dependencies"):
+                dependencies.extend(target_fragment.dependencies)
+            self._restore_context(snapshot)
+        elif self.fragments:
+            string_expr = self.fragments[-1].expression
+            source_table = self.fragments[-1].source_table
+            requires_unnest = getattr(self.fragments[-1], "requires_unnest", False)
+            is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
+            if hasattr(self.fragments[-1], "dependencies"):
+                dependencies.extend(self.fragments[-1].dependencies)
+            self.fragments.pop()
+        else:
+            raise ValueError("decode() requires a target string expression")
+
+        # Get the encoding type argument
+        encoding_arg = node.arguments[0]
+        if not isinstance(encoding_arg, LiteralNode):
+            raise ValueError("decode() encoding type must be a string literal")
+
+        encoding_type = encoding_arg.value.lower()
+        if encoding_type not in ("base64", "hex", "urlbase64"):
+            raise ValueError(f"decode() unsupported encoding type: {encoding_type}. Supported: base64, hex, urlbase64")
+
+        # Generate decoding SQL based on encoding type
+        if encoding_type == "base64":
+            decode_sql = self.dialect.generate_base64_decode(string_expr)
+        elif encoding_type == "hex":
+            decode_sql = self.dialect.generate_hex_decode(string_expr)
+        else:  # urlbase64
+            decode_sql = self.dialect.generate_urlbase64_decode(string_expr)
+
+        logger.debug(f"Generated decode() SQL: {decode_sql}")
+
+        return SQLFragment(
+            expression=decode_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "decode", "encoding": encoding_type}
+        )
+
+    def _translate_escape(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate escape() function to SQL for escaping strings.
+
+        FHIRPath: string.escape(format)
+        SQL: Database-specific escape function (html, json)
+
+        The escape() function escapes special characters in a string.
+
+        Args:
+            node: FunctionCallNode representing escape() function call
+
+        Returns:
+            SQLFragment containing the escape SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            '"test"'.escape('html') → '&quot;test&quot;'
+            '"test"'.escape('json') → '\\"test\\"'
+        """
+        logger.debug(f"Translating escape() function")
+
+        # Validate arguments - escape() takes exactly 1 argument (format type)
+        if len(node.arguments) != 1:
+            raise ValueError(
+                f"escape() function requires exactly 1 argument (format type: html, json), "
+                f"got {len(node.arguments)}"
+            )
+
+        # Get the target string expression
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+
+        if node.target is not None:
+            snapshot = self._snapshot_context()
+            target_fragment = self.visit(node.target)
+            string_expr = target_fragment.expression
+            source_table = target_fragment.source_table
+            requires_unnest = getattr(target_fragment, "requires_unnest", False)
+            is_aggregate = getattr(target_fragment, "is_aggregate", False)
+            if hasattr(target_fragment, "dependencies"):
+                dependencies.extend(target_fragment.dependencies)
+            self._restore_context(snapshot)
+        elif self.fragments:
+            string_expr = self.fragments[-1].expression
+            source_table = self.fragments[-1].source_table
+            requires_unnest = getattr(self.fragments[-1], "requires_unnest", False)
+            is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
+            if hasattr(self.fragments[-1], "dependencies"):
+                dependencies.extend(self.fragments[-1].dependencies)
+            self.fragments.pop()
+        else:
+            raise ValueError("escape() requires a target string expression")
+
+        # Get the format type argument
+        format_arg = node.arguments[0]
+        if not isinstance(format_arg, LiteralNode):
+            raise ValueError("escape() format type must be a string literal")
+
+        format_type = format_arg.value.lower()
+        if format_type not in ("html", "json"):
+            raise ValueError(f"escape() unsupported format type: {format_type}. Supported: html, json")
+
+        # Generate escape SQL based on format type
+        if format_type == "html":
+            escape_sql = self.dialect.generate_html_escape(string_expr)
+        else:  # json
+            escape_sql = self.dialect.generate_json_escape(string_expr)
+
+        logger.debug(f"Generated escape() SQL: {escape_sql}")
+
+        return SQLFragment(
+            expression=escape_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "escape", "format": format_type}
+        )
+
+    def _translate_unescape(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate unescape() function to SQL for unescaping strings.
+
+        FHIRPath: string.unescape(format)
+        SQL: Database-specific unescape function (html, json)
+
+        The unescape() function unescapes special characters in a string.
+
+        Args:
+            node: FunctionCallNode representing unescape() function call
+
+        Returns:
+            SQLFragment containing the unescape SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            '&quot;test&quot;'.unescape('html') → '"test"'
+            '\\"test\\"'.unescape('json') → '"test"'
+        """
+        logger.debug(f"Translating unescape() function")
+
+        # Validate arguments - unescape() takes exactly 1 argument (format type)
+        if len(node.arguments) != 1:
+            raise ValueError(
+                f"unescape() function requires exactly 1 argument (format type: html, json), "
+                f"got {len(node.arguments)}"
+            )
+
+        # Get the target string expression
+        string_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+
+        if node.target is not None:
+            snapshot = self._snapshot_context()
+            target_fragment = self.visit(node.target)
+            string_expr = target_fragment.expression
+            source_table = target_fragment.source_table
+            requires_unnest = getattr(target_fragment, "requires_unnest", False)
+            is_aggregate = getattr(target_fragment, "is_aggregate", False)
+            if hasattr(target_fragment, "dependencies"):
+                dependencies.extend(target_fragment.dependencies)
+            self._restore_context(snapshot)
+        elif self.fragments:
+            string_expr = self.fragments[-1].expression
+            source_table = self.fragments[-1].source_table
+            requires_unnest = getattr(self.fragments[-1], "requires_unnest", False)
+            is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
+            if hasattr(self.fragments[-1], "dependencies"):
+                dependencies.extend(self.fragments[-1].dependencies)
+            self.fragments.pop()
+        else:
+            raise ValueError("unescape() requires a target string expression")
+
+        # Get the format type argument
+        format_arg = node.arguments[0]
+        if not isinstance(format_arg, LiteralNode):
+            raise ValueError("unescape() format type must be a string literal")
+
+        format_type = format_arg.value.lower()
+        if format_type not in ("html", "json"):
+            raise ValueError(f"unescape() unsupported format type: {format_type}. Supported: html, json")
+
+        # Generate unescape SQL based on format type
+        if format_type == "html":
+            unescape_sql = self.dialect.generate_html_unescape(string_expr)
+        else:  # json
+            unescape_sql = self.dialect.generate_json_unescape(string_expr)
+
+        logger.debug(f"Generated unescape() SQL: {unescape_sql}")
+
+        return SQLFragment(
+            expression=unescape_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "unescape", "format": format_type}
+        )
+
+    def _translate_sort(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate sort() function to SQL for sorting collections.
+
+        FHIRPath: collection.sort([criteria])
+        SQL: Database-specific array sort function
+
+        The sort() function sorts a collection. Optional criteria can specify
+        the sort key and direction (ascending/descending).
+
+        Args:
+            node: FunctionCallNode representing sort() function call
+
+        Returns:
+            SQLFragment containing the sort SQL
+
+        Raises:
+            ValueError: If function has invalid number of arguments
+
+        Example:
+            (3 | 2 | 1).sort() → (1 | 2 | 3)
+            (1 | 2 | 3).sort(-$this) → (3 | 2 | 1)
+        """
+        logger.debug(f"Translating sort() function")
+
+        # Get the target collection expression
+        collection_expr: Optional[str] = None
+        source_table: Optional[str] = None
+        requires_unnest = False
+        is_aggregate = False
+        dependencies: List[str] = []
+
+        if node.target is not None:
+            snapshot = self._snapshot_context()
+            target_fragment = self.visit(node.target)
+            collection_expr = target_fragment.expression
+            source_table = target_fragment.source_table
+            requires_unnest = getattr(target_fragment, "requires_unnest", False)
+            is_aggregate = getattr(target_fragment, "is_aggregate", False)
+            if hasattr(target_fragment, "dependencies"):
+                dependencies.extend(target_fragment.dependencies)
+            self._restore_context(snapshot)
+        elif self.fragments:
+            collection_expr = self.fragments[-1].expression
+            source_table = self.fragments[-1].source_table
+            requires_unnest = getattr(self.fragments[-1], "requires_unnest", False)
+            is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
+            if hasattr(self.fragments[-1], "dependencies"):
+                dependencies.extend(self.fragments[-1].dependencies)
+            self.fragments.pop()
+        else:
+            raise ValueError("sort() requires a target collection expression")
+
+        # Determine sort direction based on criteria
+        # Default is ascending (no criteria or $this)
+        # Criteria with -$this indicates descending
+        ascending = True
+
+        if len(node.arguments) > 0:
+            criteria_arg = node.arguments[0]
+            # Check if criteria is a unary minus expression (descending sort)
+            # The AST should represent -$this as a unary operation
+            # For now, we'll check if the argument expression contains a minus
+            # This is a simplified check - in production we'd properly inspect the AST
+            if hasattr(criteria_arg, 'operator') and criteria_arg.operator == '-':
+                ascending = False
+
+        # Generate sort SQL
+        sort_sql = self.dialect.generate_array_sort(collection_expr, ascending=ascending)
+
+        logger.debug(f"Generated sort() SQL: {sort_sql}")
+
+        return SQLFragment(
+            expression=sort_sql,
+            source_table=source_table or self.context.current_table,
+            requires_unnest=requires_unnest,
+            is_aggregate=is_aggregate,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "sort", "ascending": ascending}
+        )
+
+    def _translate_descendants(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate descendants() function to SQL for hierarchical traversal.
+
+        FHIRPath: resource.descendants()
+        SQL: Database-specific recursive CTE for JSON tree traversal
+
+        The descendants() function returns all descendant elements of the current
+        node in a hierarchical structure, traversing recursively through all
+        nested objects and arrays.
+
+        Args:
+            node: FunctionCallNode representing descendants() function call
+
+        Returns:
+            SQLFragment containing the descendants SQL
+
+        Raises:
+            ValueError: If function has any arguments (takes none)
+
+        Example:
+            Questionnaire.descendants() → All nested elements
+            Patient.name.descendants() → All nested elements within all names
+        """
+        logger.debug(f"Translating descendants() function")
+
+        # Validate arguments - descendants() takes no arguments
+        if len(node.arguments) != 0:
+            raise ValueError(
+                f"descendants() function requires no arguments, got {len(node.arguments)}"
+            )
+
+        # Get the current resource/element expression
+        current_expr = self.context.current_table
+        source_table = self.context.current_table
+
+        # Get the current JSON path (if any)
+        current_path = self.context.get_json_path()
+
+        if current_path and current_path != "$":
+            # We're navigating within a resource, extract descendants from the current path
+            parent_json = self.dialect.extract_json_field(
+                column=source_table,
+                path=current_path
+            )
+            descendants_sql = self.dialect.generate_json_descendants(parent_json)
+        else:
+            # We're at the resource level, get all descendants from the resource JSON
+            descendants_sql = self.dialect.generate_json_descendants(current_expr)
+
+        logger.debug(f"Generated descendants() SQL: {descendants_sql}")
+
+        # descendants() returns a JSON array collection that requires UNNEST for iteration
+        # The array_column metadata tells CTEManager how to handle the result
+        return SQLFragment(
+            expression=descendants_sql,
+            source_table=source_table,
+            requires_unnest=True,  # Returns a collection that needs UNNEST processing
+            is_aggregate=False,
+            dependencies=[],
+            metadata={
+                "function": "descendants",
+                "result_type": "collection",
+                "array_column": descendants_sql  # JSON array column for UNNEST
             }
         )

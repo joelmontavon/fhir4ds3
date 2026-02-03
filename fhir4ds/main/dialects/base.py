@@ -69,22 +69,27 @@ class DatabaseDialect(ABC):
         This method generates SQL that extracts just the primitive value, using COALESCE
         to handle both representations transparently.
 
+        CRITICAL: The returned SQL must cast the result to the appropriate native type
+        (VARCHAR for strings) to ensure it's treated as a plain value, not JSON. This
+        prevents comparison errors where the database tries to parse string literals as JSON.
+
         Args:
             column: Column name containing JSON (usually 'resource')
             path: JSON path to the primitive field (e.g., '$.birthDate', '$.gender')
 
         Returns:
-            Database-specific SQL expression using COALESCE to extract primitive value
+            Database-specific SQL expression using COALESCE to extract primitive value,
+            cast to the appropriate native type
 
         Example:
-            DuckDB: COALESCE(
+            DuckDB: CAST(COALESCE(
                 json_extract_string(resource, '$.birthDate.value'),
                 json_extract_string(resource, '$.birthDate')
-            )
+            ) AS VARCHAR)
             PostgreSQL: COALESCE(
                 resource->'birthDate'->>'value',
                 resource->>'birthDate'
-            )
+            )  -- Already returns text, no cast needed
         """
         pass
 
@@ -334,6 +339,49 @@ class DatabaseDialect(ABC):
         """Cast to time type."""
         pass
 
+    def cast_to_string(self, expression: str) -> str:
+        """Cast expression to string (VARCHAR) type.
+
+        This is a thin dialect method for type coercion in CASE expressions
+        where branches have incompatible types (e.g., DOUBLE vs BOOLEAN).
+
+        Args:
+            expression: SQL expression to cast to string
+
+        Returns:
+            SQL expression with CAST to VARCHAR
+
+        Example:
+            DuckDB: CAST(expression AS VARCHAR)
+            PostgreSQL: expression::VARCHAR or CAST(expression AS VARCHAR)
+
+        Note:
+            Default implementation uses standard SQL CAST syntax.
+            Dialects can override for specific syntax preferences.
+        """
+        return f"CAST({expression} AS VARCHAR)"
+
+    def get_json_typeof(self, expression: str) -> str:
+        """Get the type of a JSON expression as a string.
+
+        Used by the type() function to return runtime type information.
+
+        Args:
+            expression: SQL expression to get the type of
+
+        Returns:
+            SQL expression that evaluates to the type name
+
+        Example:
+            DuckDB: typeof(expression) - for native SQL types
+            PostgreSQL: pg_typeof(expression) or jsonb_typeof() for JSON
+
+        Note:
+            Default implementation uses standard SQL typeof().
+            Dialects should override based on their type system.
+        """
+        return f"typeof({expression})"
+
     # Mathematical functions
 
     @abstractmethod
@@ -431,6 +479,31 @@ class DatabaseDialect(ABC):
             - Both databases support global replacement with 'g' flag
             - Both support capture group references ($1, $2, etc.)
             - NULL handling: NULL input → NULL output (both databases)
+        """
+        pass
+
+    @abstractmethod
+    def generate_json_children(self, json_expr: str) -> str:
+        """Generate SQL to extract direct children from a JSON object.
+
+        Returns SQL expression that extracts all direct child elements from a JSON object.
+        This is used by the FHIRPath children() function.
+
+        Args:
+            json_expr: SQL expression evaluating to a JSON object
+
+        Returns:
+            SQL expression returning a collection/array of child elements
+
+        Example:
+            generate_json_children("resource")
+            DuckDB: "unnest(json_keys(resource))"
+            PostgreSQL: "jsonb_object_keys(resource)"
+
+        Note:
+            - Returns empty collection for null input
+            - Returns direct children only (not nested descendants)
+            - Both databases use UNNEST or similar to return a set/collection
         """
         pass
 
@@ -1266,3 +1339,240 @@ class DatabaseDialect(ABC):
             'json_functions': self.supports_json_functions,
         }
         return features.get(feature, False)
+
+    def generate_lateral_json_enumeration(self, array_expr: str, enum_alias: str,
+                                         value_col: str = "value", index_col: str = "key") -> str:
+        """Generate LATERAL clause for JSON array enumeration with key/value columns.
+
+        This is a thin dialect method containing ONLY syntax differences for how
+        each database enumerates JSON arrays with LATERAL joins. Business logic
+        about when and how to use this method is in the translator.
+
+        Args:
+            array_expr: Expression that produces a JSON array
+            enum_alias: Table alias for the enumeration table
+            value_col: Column name for the value (default: "value")
+            index_col: Column name for the index/key (default: "key")
+
+        Returns:
+            SQL LATERAL clause string
+
+        Example:
+            DuckDB: LATERAL json_each(array_expr) AS enum_table(key, value)
+            PostgreSQL: LATERAL jsonb_array_elements(array_expr) WITH ORDINALITY AS enum_table(value, ordinality)
+
+        Note:
+            DuckDB uses json_each() with (key, value) columns where key is 0-based index
+            PostgreSQL uses jsonb_array_elements() WITH ORDINALITY with (value, ordinality)
+            where ordinality is 1-based, requiring (ordinality - 1) for 0-based indexing
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement generate_lateral_json_enumeration()"
+        )
+
+    # Encoding and decoding functions
+
+    @abstractmethod
+    def generate_base64_encode(self, expression: str) -> str:
+        """Generate SQL for base64 encoding.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning base64-encoded string
+
+        Example:
+            DuckDB: base64(expression)
+            PostgreSQL: encode(expression, 'base64')
+        """
+        pass
+
+    @abstractmethod
+    def generate_base64_decode(self, expression: str) -> str:
+        """Generate SQL for base64 decoding.
+
+        Args:
+            expression: SQL expression evaluating to base64-encoded string
+
+        Returns:
+            SQL expression returning decoded string
+
+        Example:
+            DuckDB: base64_decode(expression, 'UTF-8')
+            PostgreSQL: decode(expression, 'base64')
+        """
+        pass
+
+    @abstractmethod
+    def generate_hex_encode(self, expression: str) -> str:
+        """Generate SQL for hex encoding.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning hex-encoded string
+
+        Example:
+            DuckDB: encode(expression, 'hex')
+            PostgreSQL: encode(expression, 'hex')
+        """
+        pass
+
+    @abstractmethod
+    def generate_hex_decode(self, expression: str) -> str:
+        """Generate SQL for hex decoding.
+
+        Args:
+            expression: SQL expression evaluating to hex-encoded string
+
+        Returns:
+            SQL expression returning decoded string
+
+        Example:
+            DuckDB: decode(expression, 'hex')
+            PostgreSQL: decode(expression, 'hex')
+        """
+        pass
+
+    @abstractmethod
+    def generate_urlbase64_encode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 encoding.
+
+        URL-safe base64 replaces '+' with '-' and '/' with '_'.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning URL-safe base64-encoded string
+
+        Example:
+            DuckDB: replace(replace(base64(expression), '+', '-'), '/', '_')
+            PostgreSQL: replace(replace(encode(expression, 'base64'), '+', '-'), '/', '_')
+        """
+        pass
+
+    @abstractmethod
+    def generate_urlbase64_decode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 decoding.
+
+        Args:
+            expression: SQL expression evaluating to URL-safe base64-encoded string
+
+        Returns:
+            SQL expression returning decoded string
+
+        Example:
+            DuckDB: base64_decode(replace(replace(expression, '-', '+'), '_', '/'), 'UTF-8')
+            PostgreSQL: decode(replace(replace(expression, '-', '+'), '_', '/'), 'base64')
+        """
+        pass
+
+    @abstractmethod
+    def generate_html_escape(self, expression: str) -> str:
+        """Generate SQL for HTML escaping.
+
+        Escapes &, <, >, ", ' characters.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning HTML-escaped string
+
+        Example:
+            DuckDB: regexp_replace(regexp_replace(...), ...)
+            PostgreSQL: regexp_replace(regexp_replace(...), ...)
+        """
+        pass
+
+    @abstractmethod
+    def generate_json_escape(self, expression: str) -> str:
+        """Generate SQL for JSON escaping.
+
+        Escapes quotes and backslashes.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning JSON-escaped string
+
+        Example:
+            DuckDB: replace(expression, '"', '\\"')
+            PostgreSQL: replace(expression, '"', '\\"')
+        """
+        pass
+
+    @abstractmethod
+    def generate_html_unescape(self, expression: str) -> str:
+        """Generate SQL for HTML unescaping.
+
+        Unescapes &amp;, &lt;, &gt;, &quot;, &apos;, &#39;.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning HTML-unescaped string
+
+        Example:
+            DuckDB: regexp_replace(regexp_replace(...), ...)
+            PostgreSQL: regexp_replace(regexp_replace(...), ...)
+        """
+        pass
+
+    @abstractmethod
+    def generate_json_unescape(self, expression: str) -> str:
+        """Generate SQL for JSON unescaping.
+
+        Unescapes escaped quotes and backslashes.
+
+        Args:
+            expression: SQL expression evaluating to string
+
+        Returns:
+            SQL expression returning JSON-unescaped string
+
+        Example:
+            DuckDB: replace(replace(expression, '\\"', '"'), '\\\\', '\\')
+            PostgreSQL: replace(replace(expression, '\\"', '"'), '\\\\', '\\')
+        """
+        pass
+
+    @abstractmethod
+    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+        """Generate SQL for sorting array elements.
+
+        Args:
+            array_expr: SQL expression evaluating to an array
+            ascending: True for ascending, False for descending
+
+        Returns:
+            SQL expression returning sorted array
+
+        Example:
+            DuckDB: array_sort(array_expr) or array_sort(array_expr, 'DESC')
+            PostgreSQL: SELECT array_agg(x ORDER BY x) FROM unnest(array_expr) x
+        """
+        pass
+
+    @abstractmethod
+    def generate_json_descendants(self, json_expr: str) -> str:
+        """Generate SQL for getting all descendant elements of a JSON node.
+
+        Returns a JSON array containing all descendant elements recursively.
+
+        Args:
+            json_expr: SQL expression evaluating to a JSON object
+
+        Returns:
+            SQL expression returning JSON array of all descendants
+
+        Example:
+            DuckDB: Uses recursive CTE to traverse JSON tree
+            PostgreSQL: Uses jsonb_array_elements recursively
+        """
+        pass

@@ -266,6 +266,9 @@ class PostgreSQLDialect(DatabaseDialect):
 
         FHIR primitives can be: {"field": "value"} or {"field": {"value": "...", "extension": [...]}}
         This method uses COALESCE to try complex representation first, then simple.
+
+        Note: PostgreSQL's jsonb_extract_path_text already returns TEXT type, so no
+        explicit cast is needed (unlike DuckDB which requires CAST AS VARCHAR).
         """
         # Convert JSONPath to PostgreSQL path format for complex representation (path.value)
         path_with_value = path + '.value'
@@ -277,6 +280,7 @@ class PostgreSQLDialect(DatabaseDialect):
         path_args_simple = ', '.join(f"'{part}'" for part in path_parts_simple if part)
 
         # Try to extract from complex representation (path.value), fall back to simple (path)
+        # jsonb_extract_path_text already returns TEXT, so no cast needed
         return f"COALESCE(jsonb_extract_path_text({column}, {path_args_complex}), jsonb_extract_path_text({column}, {path_args_simple}))"
 
     # Type-aware JSON extraction for SQL-on-FHIR ViewDefinitions
@@ -849,6 +853,31 @@ class PostgreSQLDialect(DatabaseDialect):
             → "regexp_replace(patient_name, '\\d+', 'XXX', 'g')"
         """
         return f"regexp_replace({string_expr}, {regex_pattern}, {substitution}, 'g')"
+
+    def generate_json_children(self, json_expr: str) -> str:
+        """Generate SQL to extract direct children from a JSON object for PostgreSQL.
+
+        Uses PostgreSQL's jsonb_object_keys() function to get all keys from the JSON object,
+        then extracts each child value.
+
+        Args:
+            json_expr: SQL expression evaluating to a JSONB object
+
+        Returns:
+            SQL expression returning an array of child element values
+
+        Example:
+            generate_json_children("resource")
+            → "array_agg(resource->jsonb_object_keys(resource))"
+
+        Note:
+            - PostgreSQL has jsonb_object_keys() which returns a set of keys
+            - We use the -> operator to extract values for each key
+            - Returns empty array for null input
+        """
+        # For PostgreSQL, we can use jsonb_object_keys to get all keys
+        # Then extract each value using the -> operator
+        return f"array_agg({json_expr} -> jsonb_object_keys({json_expr}))"
 
     def generate_substring_check(self, string_expr: str, substring: str) -> str:
         """Generate substring check SQL for PostgreSQL.
@@ -1669,12 +1698,22 @@ class PostgreSQLDialect(DatabaseDialect):
         }
 
         normalized_type = target_type.lower() if target_type else ""
-        pg_type = type_map.get(normalized_type)
+
+        # Handle primitive subtypes (e.g., string1, code1, integer1)
+        # These should be mapped to their base types
+        base_type = normalized_type
+        if base_type.endswith('1'):
+            # Strip the '1' suffix to get the base type
+            base_type = base_type[:-1]
+
+        pg_type = type_map.get(base_type)
 
         if pg_type is None:
             # Unknown FHIRPath type - return NULL
-            logger.warning(f"Unknown FHIRPath type '{target_type}' in type cast, returning NULL")
-            return "NULL"
+            # SP-110-003: Unknown FHIRPath types should fail at execution time
+            # Generate SQL that will cause a conversion error
+            invalid_type_name = target_type.replace("-", "_").upper()
+            return f"({expression})::INVALID_FHIR_TYPE_{invalid_type_name}"
 
         # Generate type casting SQL using PostgreSQL's :: casting syntax
         # Use a function to handle casting safely (returns NULL on failure)
@@ -1707,6 +1746,13 @@ class PostgreSQLDialect(DatabaseDialect):
         if not normalized:
             return f"COALESCE(({expression})::jsonb, '[]'::jsonb)"
 
+        # Handle primitive subtypes (e.g., string1, code1, integer1)
+        # These should be mapped to their base types
+        base_type = normalized
+        if base_type.endswith('1'):
+            # Strip the '1' suffix to get the base type
+            base_type = base_type[:-1]
+
         type_family_map = {
             "uri": "string",
             "url": "string",
@@ -1717,7 +1763,7 @@ class PostgreSQLDialect(DatabaseDialect):
             "code": "string",
             "markdown": "string",
         }
-        family = type_family_map.get(normalized, normalized)
+        family = type_family_map.get(base_type, base_type)
 
         value_type_map = {
             "string": "string",
@@ -1733,6 +1779,19 @@ class PostgreSQLDialect(DatabaseDialect):
             "date": r'^\d{4}(-\d{2}(-\d{2})?)?$',
             "time": r'^\d{2}:\d{2}:\d{2}(\.\d+)?$',
         }
+
+        # SP-110-003: Check if this is a complex FHIR type (not in value_type_map)
+        # Complex types like HumanName, Patient, etc. are filtered by resourceType field
+        if family not in value_type_map:
+            # For complex types, check the resourceType field in JSON objects
+            json_array_expr = f"COALESCE(({expression})::jsonb, '[]'::jsonb)"
+            escaped_type = target_type.replace("'", "''")
+            elem_alias = "elem"
+            return (
+                f"(SELECT jsonb_agg(jsonb_extract_path_text({elem_alias}, '{{}}')) "
+                f"FROM jsonb_array_elements({json_array_expr}) AS {elem_alias} "
+                f"WHERE jsonb_extract_path_text({elem_alias}, '{{resourceType}}') = '{escaped_type}')"
+            )
 
         json_value_type = value_type_map.get(family)
         if not json_value_type:
@@ -1912,3 +1971,138 @@ class PostgreSQLDialect(DatabaseDialect):
         Empty collections return TRUE.
         """
         return f"(COUNT(*) = COUNT(DISTINCT {expression}))"
+
+    def generate_lateral_json_enumeration(self, array_expr: str, enum_alias: str,
+                                         value_col: str = "value", index_col: str = "key") -> str:
+        """Generate LATERAL clause for JSON array enumeration with key/value columns.
+
+        PostgreSQL uses jsonb_array_elements() with WITH ORDINALITY, which returns
+        (value, ordinality) where ordinality is 1-based. For 0-based indexing, the
+        translator must use (ordinality - 1).
+
+        Args:
+            array_expr: Expression that produces a JSON array
+            enum_alias: Table alias for the enumeration table
+            value_col: Column name for the value (default: "value")
+            index_col: Column name for the index/key (default: "key")
+
+        Returns:
+            SQL LATERAL clause string
+
+        Example:
+            generate_lateral_json_enumeration("resource->'name'", "enum_table", "value", "key")
+            → "LATERAL jsonb_array_elements(resource->'name') WITH ORDINALITY AS enum_table(value, ordinality)"
+
+        Note:
+            The returned SQL uses 'ordinality' as the column name regardless of index_col
+            parameter. The translator must map this to the desired index column name
+            (typically "ordinality - 1" for 0-based indexing).
+        """
+        # PostgreSQL uses jsonb_array_elements() with WITH ORDINALITY
+        # The column order is (value, ordinality) where ordinality is 1-based
+        return f"LATERAL jsonb_array_elements({array_expr}) WITH ORDINALITY AS {enum_alias}({value_col}, ordinality)"
+
+    # Encoding and decoding functions
+
+    def generate_base64_encode(self, expression: str) -> str:
+        """Generate SQL for base64 encoding using PostgreSQL's encode function."""
+        return f"encode({expression}::bytea, 'base64')"
+
+    def generate_base64_decode(self, expression: str) -> str:
+        """Generate SQL for base64 decoding using PostgreSQL's decode function."""
+        return f"decode({expression}, 'base64')::text"
+
+    def generate_hex_encode(self, expression: str) -> str:
+        """Generate SQL for hex encoding using PostgreSQL's encode function."""
+        return f"encode({expression}::bytea, 'hex')"
+
+    def generate_hex_decode(self, expression: str) -> str:
+        """Generate SQL for hex decoding using PostgreSQL's decode function."""
+        return f"decode({expression}, 'hex')::text"
+
+    def generate_urlbase64_encode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 encoding.
+
+        URL-safe base64 replaces '+' with '-' and '/' with '_'.
+        Also removes trailing '=' padding.
+        """
+        # PostgreSQL: encode then replace + with - and / with _, then remove padding
+        return f"rtrim(replace(replace(encode({expression}::bytea, 'base64'), '+', '-'), '/', '_'), '=')"
+
+    def generate_urlbase64_decode(self, expression: str) -> str:
+        """Generate SQL for URL-safe base64 decoding.
+
+        First restore the replaced characters, then decode.
+        """
+        # PostgreSQL: restore + and /, add padding if needed, then decode
+        return f"decode(replace(replace({expression}, '-', '+'), '_', '/'), 'base64')::text"
+
+    def generate_html_escape(self, expression: str) -> str:
+        """Generate SQL for HTML escaping in PostgreSQL.
+
+        Escapes &, <, >, ", ' characters.
+        Order matters: escape & first to avoid double-escaping.
+        """
+        # PostgreSQL uses regexp_replace for character escaping
+        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&', '&amp;', 'g'), '<', '&lt;', 'g'), '>', '&gt;', 'g'), '\"', '&quot;', 'g'), '''', '&apos;', 'g')"
+
+    def generate_json_escape(self, expression: str) -> str:
+        """Generate SQL for JSON escaping in PostgreSQL.
+
+        Escapes quotes and backslashes.
+        """
+        # JSON escaping: escape backslash first, then quotes
+        return f"replace(replace({expression}, '\\\\', '\\\\\\\\'), '\"', '\\\\\"')"
+
+    def generate_html_unescape(self, expression: str) -> str:
+        """Generate SQL for HTML unescaping in PostgreSQL.
+
+        Unescapes &amp;, &lt;, &gt;, &quot;, &apos;, &#39;.
+        Order matters for longest matches first.
+        """
+        # PostgreSQL uses regexp_replace for character unescaping
+        # Handle numeric entity &#39; first, then named entities
+        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&amp;', '&', 'g'), '&lt;', '<', 'g'), '&gt;', '>', 'g'), '&quot;', '\"', 'g'), '&apos;', '''', 'g')"
+
+    def generate_json_unescape(self, expression: str) -> str:
+        """Generate SQL for JSON unescaping in PostgreSQL.
+
+        Unescapes escaped quotes and backslashes.
+        Order: unescape \\\" first, then \\\\.
+        """
+        # Reverse of JSON escape: unescape quotes first, then backslashes
+        return f"replace(replace({expression}, '\\\\\"', '\"'), '\\\\\\\\', '\\\\')"
+
+    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+        """Generate SQL for sorting array elements in PostgreSQL.
+
+        PostgreSQL doesn't have a native array_sort function, so we need to use
+        array_agg with ORDER BY on unnested elements.
+        """
+        if ascending:
+            return f"(SELECT array_agg(x ORDER BY x) FROM unnest({array_expr}) AS x)"
+        else:
+            return f"(SELECT array_agg(x ORDER BY x DESC) FROM unnest({array_expr}) AS x)"
+
+    def generate_json_descendants(self, json_expr: str) -> str:
+        """Generate SQL for getting all descendant elements of a JSON node.
+
+        Returns a JSON array containing all descendant elements recursively.
+
+        For PostgreSQL, we use a recursive CTE with jsonb_array_elements and
+        jsonb_each to traverse the JSON tree.
+        """
+        # PostgreSQL recursive CTE approach for descendants
+        # This creates a recursive query that traverses all nested JSON structures
+        return f"""
+            (WITH RECURSIVE descendants AS (
+                -- Base case: start with current node's direct children
+                SELECT key, value FROM jsonb_each({json_expr}::jsonb)
+                UNION ALL
+                -- Recursive case: traverse nested objects/arrays
+                SELECT d.key, d.value
+                FROM descendants c
+                CROSS JOIN jsonb_each(CASE WHEN jsonb_typeof(c.value) IN ('object', 'array') THEN c.value ELSE NULL END) d
+            )
+            SELECT jsonb_agg(value) FROM descendants)
+        """.strip()
