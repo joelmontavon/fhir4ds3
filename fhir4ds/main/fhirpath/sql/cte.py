@@ -1601,9 +1601,26 @@ class CTEManager:
         # For example, when we have count() > 5, the final CTE contains the comparison expression
         is_final_cte_comparison = final_cte.metadata.get("is_comparison", False)
         if is_final_cte_comparison and not comparison_op:
-            # The final CTE is the comparison, extract from its expression instead
-            final_cte_expr = final_cte.query or source_expr
+            # SP-110-XXX: Use source_expression (the fragment expression) instead of query (SELECT statement)
+            # The source_expression contains the actual comparison like (count() = (1 + 4))
+            final_cte_expr = source_expr  # This is the fragment's expression, not the SELECT query
             comparison_op, comparison_val = self._extract_comparison_parts(final_cte_expr)
+
+            # SP-110-XXX: If we still can't extract comparison parts, try to extract
+            # the right-hand side of the comparison (after the comparison operator)
+            # This handles expressions like: count() = (1 + 4), count() > 2 + 2, etc.
+            if not comparison_op and final_cte_expr:
+                # Try to find the comparison operator and extract everything after it
+                # The expression should end with )) due to wrapping, so we need to handle that
+                import re
+                # Look for patterns like: ... ) op (expression))
+                # where op is =, !=, <, >, <=, >=
+                # We want to extract both the operator and (expression)
+                match = re.search(r'\)\s*(=|!=|<|>|<=|>=)\s*\((.+)\)\)\s*$', final_cte_expr)
+                if match:
+                    comparison_op = match.group(1)
+                    # Preserve the outer parens of the RHS expression
+                    comparison_val = f"({match.group(2)})"
 
         # Generate aggregation expression based on function type
         if function_name == "count":
