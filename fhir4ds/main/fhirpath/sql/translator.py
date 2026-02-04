@@ -3688,6 +3688,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         is_aggregate = False
         dependencies: List[str] = []
 
+        # SP-110-XXX: Detect element type if all operands have same literal_type
+        # This enables sort() to use correct type casting (VARCHAR for strings, INTEGER for integers)
+        element_type: Optional[str] = None
+        first_type: Optional[str] = None
+
         for fragment in operand_fragments:
             if fragment.source_table and fragment.source_table != "resource":
                 source_table = fragment.source_table
@@ -3697,13 +3702,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 if dep not in dependencies:
                     dependencies.append(dep)
 
+            # Check literal_type to determine element type
+            literal_type = fragment.metadata.get("literal_type") if fragment.metadata else None
+            if literal_type in ("string", "integer", "decimal"):
+                if first_type is None:
+                    first_type = literal_type
+                    element_type = literal_type
+                elif literal_type != first_type:
+                    element_type = None
+
         return SQLFragment(
             expression=union_sql,
             source_table=source_table,
             requires_unnest=requires_unnest,
             is_aggregate=is_aggregate,
             dependencies=dependencies,
-            metadata={"operator": "union", "operator_text": node.text, "is_collection": True}
+            metadata={"operator": "union", "operator_text": node.text, "is_collection": True, "element_type": element_type}
         )
 
     def _collect_union_operands(self, node: FHIRPathASTNode) -> List[FHIRPathASTNode]:
@@ -16333,6 +16347,7 @@ END"""
         requires_unnest = False
         is_aggregate = False
         dependencies: List[str] = []
+        element_type: Optional[str] = None
 
         if node.target is not None:
             snapshot = self._snapshot_context()
@@ -16343,6 +16358,9 @@ END"""
             is_aggregate = getattr(target_fragment, "is_aggregate", False)
             if hasattr(target_fragment, "dependencies"):
                 dependencies.extend(target_fragment.dependencies)
+            # SP-110-XXX: Extract element_type for type-aware sorting
+            if hasattr(target_fragment, "metadata") and target_fragment.metadata:
+                element_type = target_fragment.metadata.get("element_type")
             self._restore_context(snapshot)
         elif self.fragments:
             collection_expr = self.fragments[-1].expression
@@ -16351,6 +16369,9 @@ END"""
             is_aggregate = getattr(self.fragments[-1], "is_aggregate", False)
             if hasattr(self.fragments[-1], "dependencies"):
                 dependencies.extend(self.fragments[-1].dependencies)
+            # SP-110-XXX: Extract element_type for type-aware sorting
+            if hasattr(self.fragments[-1], "metadata") and self.fragments[-1].metadata:
+                element_type = self.fragments[-1].metadata.get("element_type")
             self.fragments.pop()
         else:
             raise ValueError("sort() requires a target collection expression")
@@ -16369,8 +16390,8 @@ END"""
             if hasattr(criteria_arg, 'operator') and criteria_arg.operator == '-':
                 ascending = False
 
-        # Generate sort SQL
-        sort_sql = self.dialect.generate_array_sort(collection_expr, ascending=ascending)
+        # Generate sort SQL with element type
+        sort_sql = self.dialect.generate_array_sort(collection_expr, ascending=ascending, element_type=element_type)
 
         logger.debug(f"Generated sort() SQL: {sort_sql}")
 

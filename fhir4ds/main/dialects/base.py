@@ -1543,12 +1543,13 @@ class DatabaseDialect(ABC):
         pass
 
     @abstractmethod
-    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+    def generate_array_sort(self, array_expr: str, ascending: bool = True, element_type: Optional[str] = None) -> str:
         """Generate SQL for sorting array elements.
 
         Args:
             array_expr: SQL expression evaluating to an array
             ascending: True for ascending, False for descending
+            element_type: Optional type hint for elements ("string", "integer", "decimal")
 
         Returns:
             SQL expression returning sorted array

@@ -1819,20 +1819,20 @@ class DuckDBDialect(DatabaseDialect):
     # Encoding and decoding functions
 
     def generate_base64_encode(self, expression: str) -> str:
-        """Generate SQL for base64 encoding using DuckDB's base64 function."""
-        return f"base64({expression})"
+        """Generate SQL for base64 encoding using DuckDB's to_base64 function."""
+        return f"to_base64({expression})"
 
     def generate_base64_decode(self, expression: str) -> str:
-        """Generate SQL for base64 decoding using DuckDB's base64_decode function."""
-        return f"base64_decode({expression}, 'UTF-8')"
+        """Generate SQL for base64 decoding using DuckDB's from_base64 function."""
+        return f"from_base64({expression})"
 
     def generate_hex_encode(self, expression: str) -> str:
-        """Generate SQL for hex encoding using DuckDB's encode function."""
-        return f"encode({expression}, 'hex')"
+        """Generate SQL for hex encoding using DuckDB's to_hex function."""
+        return f"to_hex({expression})"
 
     def generate_hex_decode(self, expression: str) -> str:
-        """Generate SQL for hex decoding using DuckDB's decode function."""
-        return f"decode({expression}, 'hex')"
+        """Generate SQL for hex decoding using DuckDB's from_hex function."""
+        return f"from_hex({expression})"
 
     def generate_urlbase64_encode(self, expression: str) -> str:
         """Generate SQL for URL-safe base64 encoding.
@@ -1887,7 +1887,7 @@ class DuckDBDialect(DatabaseDialect):
         # Reverse of JSON escape: unescape quotes first, then backslashes
         return f"replace(replace({expression}, '\\\\\"', '\"'), '\\\\\\\\', '\\\\')"
 
-    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+    def generate_array_sort(self, array_expr: str, ascending: bool = True, element_type: Optional[str] = None) -> str:
         """Generate SQL for sorting array elements in DuckDB.
 
         DuckDB's array_sort function sorts in ascending order by default.
@@ -1896,13 +1896,28 @@ class DuckDBDialect(DatabaseDialect):
         Note: When array_expr is a JSON array (from union chains via aggregate_to_json_array),
         we need to convert it to a typed list first. The union produces a flat JSON array
         like '[1,2,3]' which we cast to VARCHAR (to get string representation) and then
-        to INTEGER[] for the typed list that array_sort() requires.
+        to a typed array (INTEGER[] for integers, VARCHAR[] for strings).
+
+        Args:
+            array_expr: SQL expression for the array to sort
+            ascending: True for ascending order, False for descending
+            element_type: Optional type hint for elements ("string", "integer", "decimal")
         """
         # For JSON arrays from union chains, we need to:
         # 1. Materialize the JSON array in a CTE (it's '[1,2,3]' from aggregate_to_json_array)
         # 2. Cast JSON to VARCHAR (gets string '[1,2,3]')
-        # 3. Cast VARCHAR to INTEGER[] (gets typed list [1,2,3])
+        # 3. Cast VARCHAR to typed array (INTEGER[] for integers, VARCHAR[] for strings)
         # 4. Apply array_sort and convert back to JSON
+
+        # SP-110-XXX: Use element_type to determine correct array type
+        # Default to INTEGER for backward compatibility if no type specified
+        if element_type == "string":
+            target_type = "VARCHAR[]"
+        elif element_type == "decimal":
+            target_type = "DECIMAL[]"
+        else:
+            # Default to INTEGER for integer or unknown types
+            target_type = "INTEGER[]"
 
         order_fn = "array_sort" if ascending else "array_reverse(array_sort"
 
@@ -1911,7 +1926,7 @@ class DuckDBDialect(DatabaseDialect):
                 SELECT {array_expr} AS arr
             ),
             typed_arr AS (
-                SELECT arr::VARCHAR::INTEGER[] AS typed_list
+                SELECT arr::VARCHAR::{target_type} AS typed_list
                 FROM json_arr
             )
             SELECT to_json({order_fn}(typed_list){')' if not ascending else ''}) FROM typed_arr)
