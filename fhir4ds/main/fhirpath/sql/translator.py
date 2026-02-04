@@ -7878,12 +7878,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         )
 
     def _build_converts_to_integer_expression(self, value_expr: str) -> str:
-        """Generate SQL for convertsToInteger() checks."""
+        """Generate SQL for convertsToInteger() checks.
+
+        SP-110-010: Strings containing decimal points should NOT convert to integer.
+        For example, '3.14'.convertsToInteger() should return FALSE.
+        """
         integer_cast = self.dialect.generate_type_cast(value_expr, "Integer")
         decimal_cast = self.dialect.generate_type_cast(value_expr, "Decimal")
         string_cast = self.dialect.generate_type_cast(value_expr, "String")
         trimmed_string = self.dialect.generate_trim(string_cast)
         lowered_string = f"LOWER({trimmed_string})"
+
+        # SP-110-010: Check if string contains a decimal point - if so, it cannot convert to integer
+        contains_decimal = f"POSITION('.' IN {trimmed_string}) > 0"
 
         numeric_condition = (
             f"({integer_cast} IS NOT NULL AND "
@@ -7893,8 +7900,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             f"({string_cast} IS NOT NULL AND {lowered_string} IN ('true', 'false', 't', 'f'))"
         )
 
+        # SP-110-010: Add check for decimal point - strings with '.' should return FALSE
         return (
             "CASE "
+            f"WHEN {string_cast} IS NOT NULL AND {contains_decimal} THEN FALSE "
             f"WHEN {numeric_condition} THEN TRUE "
             f"WHEN {boolean_condition} THEN TRUE "
             f"WHEN {integer_cast} IS NULL THEN FALSE "
@@ -12213,6 +12222,19 @@ END"""
         is_collection = prev_metadata.get('is_collection') is True
         operator = prev_metadata.get('operator')
 
+        # SP-110-010: Check for empty collection first
+        is_empty_collection = prev_metadata.get('is_empty_collection') is True
+        if is_empty_collection:
+            logger.debug("SP-110-010: not() on empty collection returning NULL")
+            return SQLFragment(
+                expression="NULL",
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=list(dict.fromkeys(dependencies)),
+                metadata={"function": "not", "result_type": "boolean"}
+            )
+
         if is_collection:
             # Check if this is a multi-item collection (union operation)
             # According to official FHIRPath tests, not() on multi-item collections should fail
@@ -12340,11 +12362,27 @@ END"""
                     return collection_result
 
             if literal_value is not None:
-                bool_value = self._evaluate_literal_to_boolean(literal_value)
-                if bool_value is None:
-                    sql_literal = "NULL"
+                # SP-110-010: Handle integer literals (0 and 1)
+                if isinstance(literal_value, (int, float)):
+                    if literal_value == 0:
+                        # 0.not() -> TRUE (0 is falsy, not(0) is truthy)
+                        sql_literal = "TRUE"
+                    elif literal_value == 1:
+                        # 1.not() -> FALSE (1 is truthy, not(1) is falsy)
+                        sql_literal = "FALSE"
+                    else:
+                        # Other integers - evaluate as boolean
+                        bool_value = self._evaluate_literal_to_boolean(literal_value)
+                        if bool_value is None:
+                            sql_literal = "NULL"
+                        else:
+                            sql_literal = "TRUE" if not bool_value else "FALSE"
                 else:
-                    sql_literal = "TRUE" if not bool_value else "FALSE"
+                    bool_value = self._evaluate_literal_to_boolean(literal_value)
+                    if bool_value is None:
+                        sql_literal = "NULL"
+                    else:
+                        sql_literal = "TRUE" if not bool_value else "FALSE"
                 return SQLFragment(
                     expression=sql_literal,
                     source_table=source_table,
