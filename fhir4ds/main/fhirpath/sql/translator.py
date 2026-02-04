@@ -7128,6 +7128,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # When branches have different types (e.g., DOUBLE vs BOOLEAN, VARCHAR vs BOOLEAN),
             # cast both to VARCHAR for compatibility. This prevents "Cannot mix values of type
             # X and Y in CASE expression" errors.
+            coerced_result_type = None  # Initialize before conditional block
+
             if false_result_node:
                 # Check if we need type coercion by examining fragment metadata
                 true_result_type = true_result_fragment.metadata.get('result_type', '')
@@ -7147,8 +7149,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     if sql_upper.strip() in ('TRUE', 'FALSE'):
                         return 'boolean'
 
+                    # Numeric type casts (TRY_CAST AS DECIMAL, CAST AS DOUBLE, etc.)
+                    # This handles arithmetic operations like 1/0 which generate DECIMAL casts
+                    if 'DECIMAL' in sql_upper or 'DOUBLE' in sql_upper or 'NUMERIC' in sql_upper:
+                        return 'numeric'
+
+                    # Arithmetic operators in expressions (indicate numeric result)
+                    # Check for division, multiplication, addition, subtraction
+                    if any(op in sql_upper for op in (' / ', ' * ', ' + ', ' - ', ') / ', ') * ', ') + ', ') - ')):
+                        return 'numeric'
+
                     # String/cast operations (toString, CAST AS VARCHAR, etc.)
-                    if 'TO_STRING' in sql_upper or 'CAST' in sql_upper and 'VARCHAR' in sql_upper:
+                    if 'TO_STRING' in sql_upper or ('CAST' in sql_upper and 'VARCHAR' in sql_upper):
                         return 'varchar'
 
                     # String literals (quoted)
@@ -7158,7 +7170,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Numeric functions
                     if any(p in sql_upper for p in ['AVG(', 'SUM(', 'COUNT(', 'MIN(', 'MAX(']):
                         # These can return numeric or varchar depending on context
-                        if 'TRY_CAST' in sql_upper or '::VARCHAR' in sql_upper:
+                        if 'TRY_CAST' in sql_upper and 'VARCHAR' in sql_upper:
                             return 'varchar'
                         return 'numeric'
 
@@ -7213,10 +7225,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     logger.debug("iif() type coercion: toString() detected, casting both to VARCHAR")
 
                 # Apply type coercion if needed
+                # Track the result type for final CAST
+                coerced_result_type = None
+
                 if needs_coercion:
-                    true_result_sql = self.dialect.cast_to_string(true_result_sql)
-                    false_result_sql = self.dialect.cast_to_string(false_result_sql)
-                    logger.info("iif() type coercion applied: both branches cast to VARCHAR")
+                    # Determine the common type for coercion
+                    # Per FHIRPath spec:
+                    # - Boolean + numeric -> numeric (true->1, false->0)
+                    #   Then cast entire result to BOOLEAN to preserve FHIRPath semantics
+                    # - Other incompatible types -> string
+                    types_pair = (true_detected_type, false_detected_type)
+                    if types_pair in [('boolean', 'numeric'), ('numeric', 'boolean')]:
+                        # Cast both to numeric: boolean -> 1.0 or 0.0
+                        true_result_sql = f"(CASE WHEN {true_result_sql} THEN 1.0 ELSE 0.0 END)" if true_detected_type == 'boolean' else true_result_sql
+                        false_result_sql = f"(CASE WHEN {false_result_sql} THEN 1.0 ELSE 0.0 END)" if false_detected_type == 'boolean' else false_result_sql
+                        # Mark that result should be cast back to BOOLEAN
+                        coerced_result_type = 'boolean'
+                        logger.info("iif() type coercion applied: boolean+numeric -> numeric (will cast to BOOLEAN)")
+                    else:
+                        # Other incompatible types: cast both to VARCHAR
+                        true_result_sql = self.dialect.cast_to_string(true_result_sql)
+                        false_result_sql = self.dialect.cast_to_string(false_result_sql)
+                        coerced_result_type = 'varchar'
+                        logger.info("iif() type coercion applied: both branches cast to VARCHAR")
 
             # Build CASE expression with explicit empty-condition handling
             null_check_clause = f"WHEN {criterion_sql} IS NULL THEN NULL"
@@ -7229,6 +7260,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 f"{else_clause} "
                 "END"
             )
+
+            # SP-110: Apply final type cast to preserve FHIRPath semantics
+            # When boolean and numeric were coerced to numeric, cast result back to BOOLEAN
+            if coerced_result_type == 'boolean':
+                case_expression = f"CAST({case_expression} AS BOOLEAN)"
+                logger.debug("iif() result cast to BOOLEAN to preserve semantics")
 
             # If iif is called on a collection (e.g., collection.iif(...)), validate cardinality
             # The collection must have 0 or 1 items (execution validation - testIif10)

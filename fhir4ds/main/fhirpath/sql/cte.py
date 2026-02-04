@@ -886,9 +886,11 @@ class CTEManager:
             # Match both qualified (cte_X.name_item) and unqualified (name_item) references
             item_refs = re.findall(r'\b(\w+_item)\b', expression)
 
-            # SP-110 Phase 2: Also check for repeat_elem_N patterns from repeat() function
-            repeat_refs = re.findall(r'\b(repeat_elem_\d+)\b', expression)
-            item_refs.extend(repeat_refs)
+            # SP-110 Phase 2: Do NOT propagate repeat_elem_N patterns from repeat() function
+            # These columns are only defined within the RECURSIVE CTE subquery and are not
+            # available in the parent CTE's scope. Propagating them causes "column not found" errors.
+            # repeat_refs = re.findall(r'\b(repeat_elem_\d+)\b', expression)
+            # item_refs.extend(repeat_refs)
 
             # SP-110 Phase 2: Check for property access patterns like 'given', 'use', 'family'
             # These are typically accessed from _item columns in lambda contexts
