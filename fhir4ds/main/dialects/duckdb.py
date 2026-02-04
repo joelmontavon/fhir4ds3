@@ -1905,9 +1905,12 @@ class DuckDBDialect(DatabaseDialect):
 
         For DuckDB, we use a recursive CTE to traverse the JSON tree.
         This implementation extracts all values from nested JSON structures.
+
+        SP-110-AUTOPILOT: Fixed to use DuckDB's list() instead of PostgreSQL's json_agg()
         """
         # DuckDB recursive CTE approach for descendants
         # This creates a recursive query that traverses all nested JSON structures
+        # SP-110-AUTOPILOT: Use list() instead of json_agg() for DuckDB compatibility
         return f"""
             (WITH RECURSIVE descendants AS (
                 -- Base case: start with current node's direct children
@@ -1918,5 +1921,5 @@ class DuckDBDialect(DatabaseDialect):
                 FROM descendants c
                 CROSS JOIN json_each(CASE WHEN json_type(c.value) IN ('OBJECT', 'ARRAY') THEN c.value ELSE NULL END) d
             )
-            SELECT json_agg(value) FROM descendants)
+            SELECT list(value) FROM descendants)
         """.strip()

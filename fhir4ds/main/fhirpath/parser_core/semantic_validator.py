@@ -863,23 +863,25 @@ class SemanticValidator:
             right_temporal = self._get_temporal_type_of_operand(right_child)
 
             # Check if one is TIME and the other is DATE or DATETIME
-            if left_temporal and right_temporal:
-                if left_temporal == "time" and right_temporal in {"date", "datetime"}:
-                    raise FHIRPathParseError(
-                        f"Cannot compare TIME literal with {right_temporal.upper()} field/value. "
-                        f"TIME and {right_temporal.upper()} are incompatible types for comparison. "
-                        f"TIME represents time-of-day without date context, while {right_temporal.upper()} "
-                        f"represents a calendar date or timestamp. Use compatible temporal types or "
-                        f"extract components explicitly."
-                    )
-                elif right_temporal == "time" and left_temporal in {"date", "datetime"}:
-                    raise FHIRPathParseError(
-                        f"Cannot compare {left_temporal.upper()} field/value with TIME literal. "
-                        f"{left_temporal.upper()} and TIME are incompatible types for comparison. "
-                        f"{left_temporal.upper()} represents a calendar date or timestamp, while TIME "
-                        f"represents time-of-day without date context. Use compatible temporal types or "
-                        f"extract components explicitly."
-                    )
+            # Note: FHIRPath allows date vs time comparisons - they are simply unequal (false for =, true for !=)
+            # We allow these comparisons to proceed and let the translator handle them correctly
+            # if left_temporal and right_temporal:
+            #     if left_temporal == "time" and right_temporal in {"date", "datetime"}:
+            #         raise FHIRPathParseError(
+            #             f"Cannot compare TIME literal with {right_temporal.upper()} field/value. "
+            #             f"TIME and {right_temporal.upper()} are incompatible types for comparison. "
+            #             f"TIME represents time-of-day without date context, while {right_temporal.upper()} "
+            #             f"represents a calendar date or timestamp. Use compatible temporal types or "
+            #             f"extract components explicitly."
+            #         )
+            #     elif right_temporal == "time" and left_temporal in {"date", "datetime"}:
+            #         raise FHIRPathParseError(
+            #             f"Cannot compare {left_temporal.upper()} field/value with TIME literal. "
+            #             f"{left_temporal.upper()} and TIME are incompatible types for comparison. "
+            #             f"{left_temporal.upper()} represents a calendar date or timestamp, while TIME "
+            #             f"represents time-of-day without date context. Use compatible temporal types or "
+            #             f"extract components explicitly."
+            #         )
 
     def _get_temporal_type_of_operand(self, node: EnhancedASTNode) -> Optional[str]:
         """

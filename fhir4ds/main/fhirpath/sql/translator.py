@@ -5326,12 +5326,15 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # 1. At least one operand has reduced precision (is_partial)
         # 2. At least one operand is a temporal function (now(), today(), timeOfDay())
         # 3. At least one operand is a field reference (which has implicit precision)
-        # This ensures proper comparison between temporal functions and date fields
+        # 4. At least one operand has timezone offset (requires UTC conversion)
+        # This ensures proper comparison between temporal functions and date fields,
+        # as well as timezone-aware DateTime comparisons
         has_partial = left_info.get("is_partial") or right_info.get("is_partial")
         has_temporal_function = left_info.get("is_temporal_function") or right_info.get("is_temporal_function")
         has_field_reference = left_info.get("is_field_reference") or right_info.get("is_field_reference")
+        has_timezone = left_info.get("timezone_offset") or right_info.get("timezone_offset")
 
-        if not (has_partial or has_temporal_function or has_field_reference):
+        if not (has_partial or has_temporal_function or has_field_reference or has_timezone):
             return None
 
         operator = (node.operator or "").strip()
@@ -5344,16 +5347,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         true_condition, false_condition = conditions
 
-        # Use existential semantics for ALL comparison operators:
-        # - When the comparison is true, return TRUE
-        # - When the comparison is false, return NULL (empty result)
-        # This filters out non-matching rows from the result set
-        sql_expr = (
-            "CASE "
-            f"WHEN {true_condition} THEN TRUE "
-            "ELSE NULL "
-            "END"
-        )
+        # Determine if we need existential semantics (NULL for false) or standard boolean (FALSE for false)
+        # Existential semantics apply when comparing against data from a table (field references)
+        # Standard boolean applies for literal-to-literal comparisons
+        use_existential_semantics = has_field_reference
+
+        if use_existential_semantics:
+            # When the comparison is true, return TRUE
+            # When the comparison is false, return NULL (empty result)
+            # This filters out non-matching rows from the result set
+            sql_expr = (
+                "CASE "
+                f"WHEN {true_condition} THEN TRUE "
+                "ELSE NULL "
+                "END"
+            )
+        else:
+            # For literal-to-literal comparisons, return TRUE or FALSE
+            sql_expr = (
+                "CASE "
+                f"WHEN {true_condition} THEN TRUE "
+                f"WHEN {false_condition} THEN FALSE "
+                "ELSE NULL "
+                "END"
+            )
 
         return SQLFragment(
             expression=sql_expr,
@@ -5678,13 +5695,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
     def _parse_datetime_literal_from_text(self, original: str, body: str) -> Optional[Dict[str, Any]]:
         """Parse FHIR dateTime literal with optional reduced precision and timezone."""
         import re
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
         # Pattern with optional timezone suffix: Z or +/-HH:MM
+        # Capture the timezone offset for proper comparison
         pattern = re.compile(
             r"^(\d{4})-(\d{2})-(\d{2})T"
             r"(\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
-            r"(?:Z|[+-]\d{2}:\d{2})?$"
+            r"(?:(?P<tz>Z)|(?P<tz_offset>[+-]\d{2}:\d{2}))?$"
         )
         match = pattern.fullmatch(body)
         if not match:
@@ -5698,12 +5716,37 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         second = int(match.group(6) or 0)
         fraction = match.group(7)
 
-        # Build datetime
+        # Extract timezone offset
+        tz_match = match.group('tz')
+        tz_offset_match = match.group('tz_offset')
+        timezone_offset = None
+        tz_delta = None
+
+        if tz_match == 'Z':
+            timezone_offset = '+00:00'
+            tz_delta = timedelta(hours=0)
+        elif tz_offset_match:
+            timezone_offset = tz_offset_match
+            # Parse +/-HH:MM to timedelta
+            sign = 1 if tz_offset_match[0] == '+' else -1
+            tz_hours = int(tz_offset_match[1:3])
+            tz_minutes = int(tz_offset_match[4:6])
+            tz_delta = timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes)
+
+        # Build naive datetime first
         if fraction:
             microsecond = int(fraction.ljust(6, '0')[:6])
-            start_dt = datetime(year, month, day, hour, minute, second, microsecond)
+            naive_dt = datetime(year, month, day, hour, minute, second, microsecond)
         else:
-            start_dt = datetime(year, month, day, hour, minute, second)
+            naive_dt = datetime(year, month, day, hour, minute, second)
+
+        # Apply timezone offset to get UTC datetime for comparison
+        # If the datetime is 01:30-04:00, that means it's 01:30 in a timezone that's 4 hours behind UTC
+        # So in UTC, it would be 05:30. We subtract the offset to get UTC time.
+        if tz_delta is not None:
+            start_dt = naive_dt - tz_delta
+        else:
+            start_dt = naive_dt
 
         # Determine precision and end value
         if fraction:
@@ -5722,6 +5765,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             precision = "day"
             end_dt = start_dt + timedelta(days=1)
 
+        # Use UTC datetime for normalization and comparisons
         normalized = start_dt.isoformat()
 
         return {
@@ -5732,7 +5776,8 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             "end": self._format_datetime_iso(end_dt),
             "is_partial": precision != "subsecond",
             "literal_type": "datetime",
-            "original": original
+            "original": original,
+            "timezone_offset": timezone_offset  # Store for reference
         }
 
     def _parse_partial_datetime_literal_from_text(self, original: str, body: str, match) -> Optional[Dict[str, Any]]:
@@ -5807,6 +5852,25 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         For field references, we visit the node to get the SQL expression.
         For literals, we use the pre-computed start/end boundaries.
         """
+        # Check for incompatible temporal types (e.g., date vs time)
+        # According to FHIRPath spec, different temporal types cannot be compared
+        left_kind = left_info.get("kind")
+        right_kind = right_info.get("kind")
+
+        # Date and Time are incompatible types - comparisons always return false/empty
+        if (left_kind == "date" and right_kind == "time") or \
+           (left_kind == "time" and right_kind == "date"):
+            op = operator.strip()
+            if op == "=":
+                # Equality of date and time is always false
+                return ("FALSE", "TRUE")
+            elif op == "!=":
+                # Inequality of date and time is always true
+                return ("TRUE", "FALSE")
+            else:
+                # Ordering comparisons (<, >, <=, >=) return empty (NULL)
+                return ("FALSE", "FALSE")
+
         left_range = self._temporal_range_to_sql(left_info, left_node)
         right_range = self._temporal_range_to_sql(right_info, right_node)
 
@@ -6058,8 +6122,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # For count(), we count array elements or non-null values
         if agg_type == "count":
+            # SP-110-GROUP-BY-FIX: Check if we're counting a filtered collection (from where())
+            # When count() is called after where(), we need to count the filtered rows,
+            # not the JSON array length. Check if the previous fragment has where_filter.
+            has_where_filter = False
+            if self.fragments:
+                prev_fragment = self.fragments[-1]
+                has_where_filter = bool(prev_fragment.metadata.get("where_filter"))
+                logger.debug(
+                    f"SP-110-GROUP-BY-FIX: count() detected previous where_filter={has_where_filter}"
+                )
+
             # Check if we have a path (counting elements in a field)
-            if json_path and json_path != "$":
+            if json_path and json_path != "$" and not has_where_filter:
                 # Retrieve the JSON value so we can inspect its type before counting.
                 json_value_expr = self.dialect.extract_json_object(
                     column=self.context.current_table,
@@ -6203,13 +6278,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     sql_expr = "COUNT(*)"
                     logger.debug("Generated count(*) SQL")
 
+            # SP-110-GROUP-BY-FIX: Build metadata for count() after where()
+            # When counting filtered rows, exclude ordering columns from GROUP BY
+            count_metadata = {"function": "count", "result_type": "integer"}
+            if has_where_filter:
+                count_metadata["exclude_order_from_group_by"] = True
+                logger.debug(
+                    "SP-110-GROUP-BY-FIX: Setting exclude_order_from_group_by=True for count() after where()"
+                )
+
             return SQLFragment(
                 expression=sql_expr,
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=True,
                 dependencies=[],
-                metadata={"function": "count", "result_type": "integer"}
+                metadata=count_metadata
             )
 
         # For sum(), avg(), min(), max() - operate on numeric/comparable values
@@ -7040,48 +7124,99 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             else:
                 false_result_sql = "NULL"
 
-            # SP-110: Add type coercion to ensure CASE branches have compatible types
-            # When branches have different types (e.g., DOUBLE vs BOOLEAN), cast to VARCHAR
-            # This prevents "Cannot mix values of type DOUBLE and BOOLEAN in CASE expression" errors
+            # SP-110-AUTOPILOT: Enhanced type coercion for iif() CASE expressions
+            # When branches have different types (e.g., DOUBLE vs BOOLEAN, VARCHAR vs BOOLEAN),
+            # cast both to VARCHAR for compatibility. This prevents "Cannot mix values of type
+            # X and Y in CASE expression" errors.
             if false_result_node:
                 # Check if we need type coercion by examining fragment metadata
                 true_result_type = true_result_fragment.metadata.get('result_type', '')
                 false_result_type = false_result_fragment.metadata.get('result_type', '')
 
-                # If types are explicitly different, cast both to VARCHAR for compatibility
+                # SP-110-AUTOPILOT: Comprehensive type detection
+                # Detect various type patterns in SQL expressions
+                def detect_sql_type(sql_expr: str, metadata_type: str = '') -> str:
+                    """Detect the SQL type of an expression from patterns and metadata."""
+                    # Start with metadata type if available
+                    if metadata_type:
+                        return metadata_type
+
+                    sql_upper = sql_expr.upper()
+
+                    # Boolean literals
+                    if sql_upper.strip() in ('TRUE', 'FALSE'):
+                        return 'boolean'
+
+                    # String/cast operations (toString, CAST AS VARCHAR, etc.)
+                    if 'TO_STRING' in sql_upper or 'CAST' in sql_upper and 'VARCHAR' in sql_upper:
+                        return 'varchar'
+
+                    # String literals (quoted)
+                    if sql_expr.strip().startswith("'") or sql_expr.strip().startswith('"'):
+                        return 'varchar'
+
+                    # Numeric functions
+                    if any(p in sql_upper for p in ['AVG(', 'SUM(', 'COUNT(', 'MIN(', 'MAX(']):
+                        # These can return numeric or varchar depending on context
+                        if 'TRY_CAST' in sql_upper or '::VARCHAR' in sql_upper:
+                            return 'varchar'
+                        return 'numeric'
+
+                    # Numeric literals (digits with optional decimal point)
+                    if re.match(r'^\s*\d+(\.\d+)?\s*$', sql_expr):
+                        return 'numeric'
+
+                    # Boolean functions
+                    if any(p in sql_upper for p in ['EXISTS(', 'EMPTY(', 'IS_DISTINCT(']):
+                        return 'boolean'
+
+                    # JSON operations (often return strings)
+                    if 'JSON_EXTRACT' in sql_upper or '->>' in sql_upper:
+                        return 'varchar'
+
+                    # Default: unknown (will be detected dynamically)
+                    return 'unknown'
+
+                true_detected_type = detect_sql_type(true_result_sql, true_result_type)
+                false_detected_type = detect_sql_type(false_result_sql, false_result_type)
+
+                logger.debug(
+                    f"iif() type detection: true={true_detected_type}, false={false_detected_type}"
+                )
+
+                # SP-110-AUTOPILOT: Determine if we need type coercion
+                needs_coercion = False
+
+                # Explicit type mismatch from metadata
                 if true_result_type and false_result_type and true_result_type != false_result_type:
-                    # Use dialect's cast to string method
+                    needs_coercion = True
+                    logger.debug(f"iif() type coercion: metadata mismatch {true_result_type} vs {false_result_type}")
+
+                # Detected type mismatch (excluding unknown types)
+                elif (true_detected_type != 'unknown' and false_detected_type != 'unknown' and
+                      true_detected_type != false_detected_type):
+                    # Only coerce if types are actually different and incompatible
+                    incompatible_pairs = {
+                        ('boolean', 'numeric'), ('numeric', 'boolean'),
+                        ('boolean', 'varchar'), ('varchar', 'boolean'),
+                        ('numeric', 'varchar'), ('varchar', 'numeric'),
+                    }
+                    if (true_detected_type, false_detected_type) in incompatible_pairs:
+                        needs_coercion = True
+                        logger.debug(f"iif() type coercion: detected mismatch {true_detected_type} vs {false_detected_type}")
+
+                # SP-110-AUTOPILOT: Additional heuristic - check for function calls that return strings
+                # like toString() which may not be detected above
+                elif 'toString' in str(true_result_node) or 'toString' in str(false_result_node):
+                    # If one branch uses toString(), both should be VARCHAR
+                    needs_coercion = True
+                    logger.debug("iif() type coercion: toString() detected, casting both to VARCHAR")
+
+                # Apply type coercion if needed
+                if needs_coercion:
                     true_result_sql = self.dialect.cast_to_string(true_result_sql)
                     false_result_sql = self.dialect.cast_to_string(false_result_sql)
-                    logger.debug(
-                        f"iif() type coercion: {true_result_type} vs {false_result_type} -> VARCHAR"
-                    )
-                else:
-                    # Try to detect type incompatibility from SQL patterns
-                    # Pattern: numeric functions (AVG, SUM, etc.) vs boolean literals
-                    numeric_patterns = ['AVG(', 'SUM(', 'COUNT(', 'json_extract']
-                    boolean_patterns = ['TRUE', 'FALSE', 'boolean']
-
-                    true_is_numeric = any(p in true_result_sql.upper() for p in numeric_patterns)
-                    false_is_boolean = any(p in false_result_sql.upper() for p in boolean_patterns)
-                    false_is_numeric = any(p in false_result_sql.upper() for p in numeric_patterns)
-                    true_is_boolean = any(p in true_result_sql.upper() for p in boolean_patterns)
-
-                    # SP-110: Also detect numeric literals (digits with optional decimal point)
-                    # Pattern matches: 123, 1.5, 0.123 (not negative numbers, those have '-')
-                    numeric_literal_pattern = r'^\s*\d+(\.\d+)?\s*$'
-                    true_is_numeric_literal = bool(re.match(numeric_literal_pattern, true_result_sql))
-                    false_is_numeric_literal = bool(re.match(numeric_literal_pattern, false_result_sql))
-
-                    # Expand numeric detection to include numeric literals
-                    true_is_numeric = true_is_numeric or true_is_numeric_literal
-                    false_is_numeric = false_is_numeric or false_is_numeric_literal
-
-                    # If we have numeric vs boolean mismatch, cast to VARCHAR
-                    if (true_is_numeric and false_is_boolean) or (false_is_numeric and true_is_boolean):
-                        true_result_sql = self.dialect.cast_to_string(true_result_sql)
-                        false_result_sql = self.dialect.cast_to_string(false_result_sql)
-                        logger.debug("iif() type coercion: numeric vs boolean -> VARCHAR")
+                    logger.info("iif() type coercion applied: both branches cast to VARCHAR")
 
             # Build CASE expression with explicit empty-condition handling
             null_check_clause = f"WHEN {criterion_sql} IS NULL THEN NULL"
@@ -9037,6 +9172,14 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # This ensures convertsToInteger() and convertsToDecimal() work correctly
                 # SP-110-005: Handle quantity literals with negation (e.g., (-5.5 'mg').abs())
                 literal_type = child_fragment.metadata.get('literal_type', '')
+
+                # Reject unary minus on boolean literals (semantic error per FHIRPath spec)
+                if literal_type == 'boolean':
+                    raise FHIRPathTranslationError(
+                        f"Cannot apply unary minus operator to non-numeric result. "
+                        f"Operator '-' requires numeric operand, but got 'boolean'."
+                    )
+
                 if literal_type in ('integer', 'decimal'):
                     # Strip quotes if expression is quoted (shouldn't happen but safety check)
                     expr = child_fragment.expression
@@ -11121,6 +11264,14 @@ END
         self.context.current_table = old_table
         self.context.parent_path = old_path
 
+        # SP-110-GROUP-BY-FIX: Track the column being filtered for GROUP BY when aggregated
+        # When where() is followed by count() or other aggregate, the filtered column
+        # must be included in GROUP BY clause. We track it in preserved_columns.
+        preserved_cols = []
+        # If result_col is an _item column from UNNEST, it needs to be in GROUP BY for aggregates
+        if result_col.endswith('_item'):
+            preserved_cols.append(result_col)
+
         # Return a fragment with filter metadata for the CTE builder
         # The CTE builder will add a WHERE clause to filter the CTE results
         return SQLFragment(
@@ -11129,6 +11280,7 @@ END
             requires_unnest=False,
             is_aggregate=False,
             dependencies=[source_table],
+            preserved_columns=preserved_cols,  # Track for GROUP BY when aggregated
             metadata={
                 "function": "where",
                 "where_filter": condition_fragment.expression,  # The filter condition
@@ -12270,20 +12422,20 @@ END"""
             self.fragments.clear()
             self.fragments.extend(saved_fragments)
 
-            # Restore context but update current_table to source for the aggregation
+            # Restore context - keep current_table as is for CTE builder
+            # SP-110-009: Use old_table as source_table but don't add dependencies
+            # The CTE builder will use previous_cte which is the UNNEST CTE
             self.context.current_table = old_table
             self.context.parent_path = old_path
 
-            # Generate SQL using BOOL_AND on the unnested rows
-            # Return just the expression - CTE builder will handle wrapping
             all_check_sql = f"COALESCE(bool_and({criteria_fragment.expression}), true)"
 
             return SQLFragment(
                 expression=all_check_sql,
-                source_table=old_table,
+                source_table=self.context.current_table,  # Use current context table
                 requires_unnest=False,
                 is_aggregate=True,
-                dependencies=[old_table],
+                dependencies=[],  # SP-110-009: CTE builder will add previous_cte as dependency
                 metadata={
                     "function": "all",
                     "result_type": "boolean",
@@ -14979,16 +15131,18 @@ END"""
 
         logger.debug(f"Generated children() SQL: {children_sql}")
 
+        # children() returns a complete SQL expression (subquery) that produces a JSON array
+        # Unlike simple array path expressions that need UNNEST, this is a scalar array result
+        # Similar to repeat() - requires_unnest=False because the expression is self-contained
         return SQLFragment(
             expression=children_sql,
             source_table=source_table,
-            requires_unnest=True,  # children() returns a collection
+            requires_unnest=False,  # Returns a scalar array result, not requiring UNNEST
             is_aggregate=False,
             dependencies=[],
             metadata={
                 "function": "children",
                 "result_type": "collection",
-                "array_column": children_sql  # JSON array column for UNNEST
             }
         )
 
@@ -16149,17 +16303,17 @@ END"""
 
         logger.debug(f"Generated descendants() SQL: {descendants_sql}")
 
-        # descendants() returns a JSON array collection that requires UNNEST for iteration
-        # The array_column metadata tells CTEManager how to handle the result
+        # descendants() returns a complete SQL expression (recursive CTE subquery) that produces a JSON array
+        # Unlike simple array path expressions that need UNNEST, this is a scalar array result
+        # Similar to repeat() - requires_unnest=False because the expression is self-contained
         return SQLFragment(
             expression=descendants_sql,
             source_table=source_table,
-            requires_unnest=True,  # Returns a collection that needs UNNEST processing
+            requires_unnest=False,  # Returns a scalar array result, not requiring UNNEST
             is_aggregate=False,
             dependencies=[],
             metadata={
                 "function": "descendants",
                 "result_type": "collection",
-                "array_column": descendants_sql  # JSON array column for UNNEST
             }
         )

@@ -932,10 +932,11 @@ class CTEManager:
                 )
 
         # SP-110-006: Auto-preserve columns from previous CTEs
+        # SP-110-AUTOPILOT: Skip for aggregate functions to avoid GROUP BY errors
         # When the fragment expression doesn't explicitly reference columns from a previous
         # CTE but those columns should be propagated (e.g., when the translator incorrectly
         # sets source_table to "resource" instead of the previous CTE), add them here.
-        if auto_preserve_columns:
+        if auto_preserve_columns and not fragment.is_aggregate:
             for col_name in auto_preserve_columns:
                 # Skip if already added via propagated_item_columns or qualified_item_columns
                 if col_name in propagated_item_columns or any(q.endswith(f".{col_name}") for q in qualified_item_columns):
@@ -947,13 +948,20 @@ class CTEManager:
                 logger.info(
                     f"SP-110-006: Auto-preserving column '{qualified_col}' from previous CTE"
                 )
+        elif auto_preserve_columns and fragment.is_aggregate:
+            # SP-110-AUTOPILOT: Log that we're skipping auto-preserve for aggregate function
+            logger.info(
+                f"SP-110-AUTOPILOT: Skipping auto-preserve columns for aggregate function "
+                f"(auto_preserve_columns={auto_preserve_columns}, is_aggregate=True)"
+            )
 
         # Track which columns we've already added to avoid duplicates
         added_columns = set()
 
         # SP-105: Include the collection item column in SELECT if we need to preserve it
         # This fixes "Referenced column 'name_item' not found" after take()/first()/last()
-        if preserve_item_column and item_column_name:
+        # SP-110-AUTOPILOT: Skip preservation for aggregate functions to avoid GROUP BY errors
+        if preserve_item_column and item_column_name and not fragment.is_aggregate:
             # Add the item column to SELECT so subsequent operations can reference it
             # Also alias it as 'result' so the standard result column is available
             # SP-110 Phase 3: Qualify the column with source_table if not already qualified
@@ -976,51 +984,78 @@ class CTEManager:
             logger.info(
                 f"SP-105: Preserved collection item column '{qualified_item_col}' as '{item_column_name}' and '{result_alias}'"
             )
+        elif preserve_item_column and item_column_name and fragment.is_aggregate:
+            # SP-110-AUTOPILOT: For aggregate functions with subset filters,
+            # we need to skip preserving the item column to avoid GROUP BY errors
+            # Log this for debugging
+            logger.info(
+                f"SP-110-AUTOPILOT: Skipping item column preservation for aggregate function "
+                f"(preserve_item_column=True, item_column_name={item_column_name}, is_aggregate=True)"
+            )
         else:
+            # SP-110-AUTOPILOT: Track preserved columns for GROUP BY when is_aggregate=True
+            # When an aggregate function like COUNT() is used, preserved columns must either:
+            # 1. Be excluded from SELECT, OR
+            # 2. Be added to GROUP BY clause
+            # We'll track them here and handle them in the GROUP BY section below
+            preserved_non_aggregate_columns = []
+
             # Check if fragment has explicit preserved_columns list (for combine/exclude)
             if hasattr(fragment, 'preserved_columns') and fragment.preserved_columns:
-                # Add all preserved columns to SELECT (deduplicate)
-                for col_name in set(fragment.preserved_columns):
-                    # Skip if already added
-                    if col_name in added_columns:
-                        continue
-                    # Qualify column with source_table if not already qualified
-                    if '.' not in col_name and not col_name.startswith(source_table + '.'):
-                        qualified_col = f"{source_table}.{col_name}"
-                    else:
-                        qualified_col = col_name
-                    columns.append(qualified_col)
-                    added_columns.add(col_name)
-                    logger.info(
-                        f"SP-105 Phase 2: Preserving column '{qualified_col}' from preserved_columns list"
-                    )
+                # SP-110-AUTOPILOT: For aggregate functions, skip preserved columns unless explicitly needed
+                # Aggregate functions like COUNT() typically don't need the preserved columns in SELECT
+                if not fragment.is_aggregate:
+                    # Add all preserved columns to SELECT (deduplicate)
+                    for col_name in set(fragment.preserved_columns):
+                        # Skip if already added
+                        if col_name in added_columns:
+                            continue
+                        # Qualify column with source_table if not already qualified
+                        if '.' not in col_name and not col_name.startswith(source_table + '.'):
+                            qualified_col = f"{source_table}.{col_name}"
+                        else:
+                            qualified_col = col_name
+                        columns.append(qualified_col)
+                        added_columns.add(col_name)
+                        logger.info(
+                            f"SP-105 Phase 2: Preserving column '{qualified_col}' from preserved_columns list"
+                        )
+                else:
+                    # Track for GROUP BY - preserved columns must be in GROUP BY if in SELECT
+                    for col_name in set(fragment.preserved_columns):
+                        if col_name not in added_columns:
+                            preserved_non_aggregate_columns.append(col_name)
 
             # SP-110 Phase 3: Add qualified column references (from previous CTEs)
             # These are already fully qualified (e.g., cte_2.name_item) and should be used as-is
-            for qualified_col in qualified_item_columns:
-                # Extract just the column name for tracking
-                col_name = qualified_col.split('.')[-1]
-                # Skip if already added (check by column name, not full qualified reference)
-                if col_name in added_columns:
-                    continue
-                # Use the fully qualified reference directly
-                columns.append(qualified_col)
-                added_columns.add(col_name)
-                logger.info(
-                    f"SP-110 Phase 3: Preserving qualified column '{qualified_col}' from previous CTE"
-                )
+            # SP-110-AUTOPILOT: Skip for aggregate functions - we only need the aggregate result
+            if not fragment.is_aggregate:
+                for qualified_col in qualified_item_columns:
+                    # Extract just the column name for tracking
+                    col_name = qualified_col.split('.')[-1]
+                    # Skip if already added (check by column name, not full qualified reference)
+                    if col_name in added_columns:
+                        continue
+                    # Use the fully qualified reference directly
+                    columns.append(qualified_col)
+                    added_columns.add(col_name)
+                    logger.info(
+                        f"SP-110 Phase 3: Preserving qualified column '{qualified_col}' from previous CTE"
+                    )
 
             # Add propagated _item columns from source CTEs (deduplicate)
-            for col_name in propagated_item_columns:
-                # Skip if already added (either directly or via preserved_columns)
-                if col_name in added_columns:
-                    continue
-                qualified_col = f"{source_table}.{col_name}"
-                columns.append(qualified_col)
-                added_columns.add(col_name)
-                logger.info(
-                    f"SP-105 Phase 2: Propagating column '{qualified_col}' from source CTE"
-                )
+            # SP-110-AUTOPILOT: Skip for aggregate functions
+            if not fragment.is_aggregate:
+                for col_name in propagated_item_columns:
+                    # Skip if already added (either directly or via preserved_columns)
+                    if col_name in added_columns:
+                        continue
+                    qualified_col = f"{source_table}.{col_name}"
+                    columns.append(qualified_col)
+                    added_columns.add(col_name)
+                    logger.info(
+                        f"SP-105 Phase 2: Propagating column '{qualified_col}' from source CTE"
+                    )
 
             # Standard case: add the expression as result
             # SP-110-006: Special handling for repeat() expressions
@@ -1040,6 +1075,14 @@ class CTEManager:
             else:
                 columns.append(f"{expression} AS {result_alias}")
 
+            # SP-110-AUTOPILOT: Store preserved columns for GROUP BY handling
+            if preserved_non_aggregate_columns:
+                # Store in fragment metadata for use in GROUP BY clause
+                fragment.metadata['_preserved_non_aggregate_columns'] = preserved_non_aggregate_columns
+                logger.info(
+                    f"SP-110-AUTOPILOT: Tracked {len(preserved_non_aggregate_columns)} preserved columns for GROUP BY: {preserved_non_aggregate_columns}"
+                )
+
         query = (
             "SELECT "
             + ", ".join(columns) + "\n"
@@ -1051,7 +1094,10 @@ class CTEManager:
         # all non-aggregated columns must be in GROUP BY clause
         # SP-108-003: Check if order columns should be excluded from GROUP BY
         exclude_order = fragment.metadata.get("exclude_order_from_group_by", False)
-        if fragment.is_aggregate and (ordering_columns or source_table.startswith("cte_")):
+
+        # SP-110-AUTOPILOT: Build GROUP BY for all aggregate fragments, not just those with ordering
+        # This fixes "column must appear in GROUP BY" errors for count() operations
+        if fragment.is_aggregate:
             # Build GROUP BY with id, resource, and optionally ordering columns
             group_by_columns = [id_column]
 
@@ -1065,10 +1111,45 @@ class CTEManager:
 
             # SP-108-003: Include ordering columns in GROUP BY only if not excluded
             # Functions like all() aggregate across all elements per patient, not per row
-            if not exclude_order:
+            if not exclude_order and ordering_columns:
                 group_by_columns.extend(ordering_columns)
 
-            query += f"\nGROUP BY {', '.join(group_by_columns)}"
+            # SP-110-AUTOPILOT: Add preserved non-aggregate columns to GROUP BY
+            # These are columns that were in previous CTEs but aren't part of the aggregate
+            preserved_non_agg = fragment.metadata.get('_preserved_non_aggregate_columns', [])
+            for col_name in preserved_non_agg:
+                # Qualify column name if needed
+                if '.' not in col_name:
+                    qualified_col = f"{source_table}.{col_name}"
+                else:
+                    qualified_col = col_name
+                if qualified_col not in group_by_columns:
+                    group_by_columns.append(qualified_col)
+                    logger.info(
+                        f"SP-110-AUTOPILOT: Added preserved column '{qualified_col}' to GROUP BY"
+                    )
+
+            # SP-110-GROUP-BY-FIX: Add auto-preserved columns from previous CTE to GROUP BY
+            # When an aggregate like count() is called after where() on an unnested collection,
+            # the _item columns from the previous CTE (like name_item) must be in GROUP BY.
+            # The auto_preserve_columns set contains these columns from the previous CTE.
+            # SP-110-GROUP-BY-FIX: Skip if exclude_order_from_group_by is True (e.g., count() after where())
+            if auto_preserve_columns and not exclude_order:
+                for col_name in auto_preserve_columns:
+                    # Qualify column name if needed
+                    if '.' not in col_name:
+                        qualified_col = f"{source_table}.{col_name}"
+                    else:
+                        qualified_col = col_name
+                    if qualified_col not in group_by_columns:
+                        group_by_columns.append(qualified_col)
+                        logger.info(
+                            f"SP-110-GROUP-BY-FIX: Added auto-preserved column '{qualified_col}' to GROUP BY for aggregate"
+                        )
+
+            # Add GROUP BY clause if we have columns to group by
+            if group_by_columns:
+                query += f"\nGROUP BY {', '.join(group_by_columns)}"
 
         # SP-022-004: Add WHERE clause for row filtering (first/last/skip/take)
         if fragment.metadata.get("filter"):
