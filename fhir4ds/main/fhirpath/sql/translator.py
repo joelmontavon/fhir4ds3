@@ -15892,10 +15892,24 @@ END"""
 
         # Get the encoding type argument
         encoding_arg = node.arguments[0]
-        if not isinstance(encoding_arg, LiteralNode):
+
+        # Extract encoding type from various node types (LiteralNode or EnhancedASTNode)
+        encoding_type = None
+        if isinstance(encoding_arg, LiteralNode) and isinstance(encoding_arg.value, str):
+            encoding_type = encoding_arg.value
+        elif hasattr(encoding_arg, 'text'):
+            # EnhancedASTNode - extract from text attribute
+            text = encoding_arg.text.strip()
+            # Remove surrounding quotes
+            if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                encoding_type = text[1:-1]
+            else:
+                encoding_type = text
+
+        if not encoding_type:
             raise ValueError("encode() encoding type must be a string literal")
 
-        encoding_type = encoding_arg.value.lower()
+        encoding_type = encoding_type.lower()
         if encoding_type not in ("base64", "hex", "urlbase64"):
             raise ValueError(f"encode() unsupported encoding type: {encoding_type}. Supported: base64, hex, urlbase64")
 
@@ -15978,10 +15992,24 @@ END"""
 
         # Get the encoding type argument
         encoding_arg = node.arguments[0]
-        if not isinstance(encoding_arg, LiteralNode):
+
+        # Extract encoding type from various node types (LiteralNode or EnhancedASTNode)
+        encoding_type = None
+        if isinstance(encoding_arg, LiteralNode) and isinstance(encoding_arg.value, str):
+            encoding_type = encoding_arg.value
+        elif hasattr(encoding_arg, 'text'):
+            # EnhancedASTNode - extract from text attribute
+            text = encoding_arg.text.strip()
+            # Remove surrounding quotes
+            if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                encoding_type = text[1:-1]
+            else:
+                encoding_type = text
+
+        if not encoding_type:
             raise ValueError("decode() encoding type must be a string literal")
 
-        encoding_type = encoding_arg.value.lower()
+        encoding_type = encoding_type.lower()
         if encoding_type not in ("base64", "hex", "urlbase64"):
             raise ValueError(f"decode() unsupported encoding type: {encoding_type}. Supported: base64, hex, urlbase64")
 
@@ -16064,10 +16092,24 @@ END"""
 
         # Get the format type argument
         format_arg = node.arguments[0]
-        if not isinstance(format_arg, LiteralNode):
+
+        # Extract format type from various node types (LiteralNode or EnhancedASTNode)
+        format_type = None
+        if isinstance(format_arg, LiteralNode) and isinstance(format_arg.value, str):
+            format_type = format_arg.value
+        elif hasattr(format_arg, 'text'):
+            # EnhancedASTNode - extract from text attribute
+            text = format_arg.text.strip()
+            # Remove surrounding quotes
+            if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                format_type = text[1:-1]
+            else:
+                format_type = text
+
+        if not format_type:
             raise ValueError("escape() format type must be a string literal")
 
-        format_type = format_arg.value.lower()
+        format_type = format_type.lower()
         if format_type not in ("html", "json"):
             raise ValueError(f"escape() unsupported format type: {format_type}. Supported: html, json")
 
@@ -16148,10 +16190,24 @@ END"""
 
         # Get the format type argument
         format_arg = node.arguments[0]
-        if not isinstance(format_arg, LiteralNode):
+
+        # Extract format type from various node types (LiteralNode or EnhancedASTNode)
+        format_type = None
+        if isinstance(format_arg, LiteralNode) and isinstance(format_arg.value, str):
+            format_type = format_arg.value
+        elif hasattr(format_arg, 'text'):
+            # EnhancedASTNode - extract from text attribute
+            text = format_arg.text.strip()
+            # Remove surrounding quotes
+            if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                format_type = text[1:-1]
+            else:
+                format_type = text
+
+        if not format_type:
             raise ValueError("unescape() format type must be a string literal")
 
-        format_type = format_arg.value.lower()
+        format_type = format_type.lower()
         if format_type not in ("html", "json"):
             raise ValueError(f"unescape() unsupported format type: {format_type}. Supported: html, json")
 

@@ -1892,11 +1892,30 @@ class DuckDBDialect(DatabaseDialect):
 
         DuckDB's array_sort function sorts in ascending order by default.
         For descending, we reverse the sorted array.
+
+        Note: When array_expr is a JSON array (from union chains via aggregate_to_json_array),
+        we need to convert it to a typed list first. The union produces a flat JSON array
+        like '[1,2,3]' which we cast to VARCHAR (to get string representation) and then
+        to INTEGER[] for the typed list that array_sort() requires.
         """
-        if ascending:
-            return f"array_sort({array_expr})"
-        else:
-            return f"array_reverse(array_sort({array_expr}))"
+        # For JSON arrays from union chains, we need to:
+        # 1. Materialize the JSON array in a CTE (it's '[1,2,3]' from aggregate_to_json_array)
+        # 2. Cast JSON to VARCHAR (gets string '[1,2,3]')
+        # 3. Cast VARCHAR to INTEGER[] (gets typed list [1,2,3])
+        # 4. Apply array_sort and convert back to JSON
+
+        order_fn = "array_sort" if ascending else "array_reverse(array_sort"
+
+        return f"""
+            (WITH json_arr AS (
+                SELECT {array_expr} AS arr
+            ),
+            typed_arr AS (
+                SELECT arr::VARCHAR::INTEGER[] AS typed_list
+                FROM json_arr
+            )
+            SELECT to_json({order_fn}(typed_list){')' if not ascending else ''}) FROM typed_arr)
+        """.strip()
 
     def generate_json_descendants(self, json_expr: str) -> str:
         """Generate SQL for getting all descendant elements of a JSON node.
