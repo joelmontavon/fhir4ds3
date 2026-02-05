@@ -857,15 +857,32 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         target_ast = self._parse_function_target_ast(node)
 
-        # SP-106-003: Check for pending literal value FIRST, before checking target_ast
-        # This handles expressions like "10 'mg'.convertsToQuantity()" where the literal
-        # is visited as part of the target_ast, and we need to capture the pending_literal_value
-        # that was set during the visit.
-        # SP-022-015: Check for pending fragment result FIRST from invocation chain
+        # SP-110-002: Check if this is a literal conversion function that needs literal evaluation
+        # For to* and convertsTo* functions, we need to use pending_literal_value instead of
+        # pending_fragment_result because these functions evaluate literals at parse time.
+        # Get function name from node if available
+        needs_literal_value = False
+        if hasattr(node, 'function_name'):
+            func_name_lower = node.function_name.lower()
+            # These functions need literal value evaluation for proper type conversion
+            needs_literal_value = func_name_lower in (
+                'tointeger', 'todecimal', 'tostring', 'toquantity', 'todate', 'todatetime', 'totime',
+                'convertstointeger', 'convertstodecimal', 'convertstostring', 'convertstoquantity',
+                'convertstodate', 'convertstodatetime', 'convertstotime', 'convertstoboolean'
+            )
+
+        # SP-110-002: For literal conversion functions, check pending_literal_value first
+        if needs_literal_value and self.context.pending_literal_value is not None:
+            literal_value, target_expression = self.context.pending_literal_value
+            # Clear the pending value after consuming it
+            self.context.pending_literal_value = None
+            # Also clear pending_fragment_result if it exists (they're mutually exclusive)
+            self.context.pending_fragment_result = None
+        # SP-022-015: Check for pending fragment result from invocation chain
         # This handles expressions like (1|2|3).aggregate() where the union result
-        # is a complete expression that should take priority over pending_literal_value.
+        # is a complete expression that should use the SQL result, not literal evaluation.
         # SP-100-002: pending_fragment_result is now a tuple (expression, parent_path, is_multi_item)
-        if self.context.pending_fragment_result is not None:
+        elif self.context.pending_fragment_result is not None:
             target_expression, target_path, is_multi_item_collection = self.context.pending_fragment_result
             # If the pending fragment is from a multi-item collection, this is an error for iif()
             # We need to pass this information to the caller
@@ -873,7 +890,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             self._pending_target_is_multi_item = is_multi_item_collection
             # Clear both pending values after consuming (fragment result takes priority)
             self.context.pending_fragment_result = None
-            self.context.pending_literal_value = None
+            # SP-110-002: Don't clear pending_literal_value here - it might still be needed
+            # Only clear it if we actually used pending_fragment_result and the function doesn't need literal value
+            if not needs_literal_value:
+                self.context.pending_literal_value = None
         # SP-022-009: Check for pending literal value from invocation chain
         # This handles expressions like 1.convertsToInteger() where the literal
         # was visited in visit_generic before this function call
@@ -1005,11 +1025,81 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return None
 
     def _evaluate_literal_to_quantity(self, value: Any) -> Optional[str]:
-        """Evaluate toQuantity() for literal values."""
+        """Evaluate toQuantity() for literal values.
+
+        Converts a value to a FHIR Quantity JSON string representation.
+        Per FHIRPath spec:
+        - Integer/Decimal: Creates Quantity with that value and unit '1' (default unit)
+        - Boolean: Converts to 1.0 '1' (true) or 0.0 '1' (false)
+        - String: Parses as number with optional unit (e.g., '1 day' -> value:1, unit:'day')
+        - Quantity literal: Returns as-is (already in Quantity format)
+
+        Returns JSON string: '{"value": "1.0", "unit": "day", "system": "http://unitsofmeasure.org", "code": "day"}'
+        """
         if value is None:
             return None
-        # For now, return None - Quantity conversion is complex
-        # Will need full UCUM library support
+
+        # SP-110-002: Check if it's already a QuantityLiteralMarker (from quantity literals like "5 'mg'")
+        if hasattr(value, 'value') and hasattr(value, 'unit'):
+            # It's already a quantity literal marker
+            from ..types.quantity_builder import build_quantity_json_string
+            return build_quantity_json_string(value.value, value.unit)
+
+        # SP-110-002: Check for NegatedQuantityMarker (from negated quantity literals like "-5 'mg'")
+        if hasattr(value, 'is_negated_quantity') and value.is_negated_quantity:
+            from ..types.quantity_builder import build_quantity_json_string
+            return build_quantity_json_string(value.value, value.unit)
+
+        # Boolean -> Quantity: true -> 1.0 '1', false -> 0.0 '1'
+        if isinstance(value, bool):
+            from ..types.quantity_builder import build_quantity_json_string
+            quantity_value = 1.0 if value else 0.0
+            return build_quantity_json_string(quantity_value, '1')
+
+        # Integer/Decimal -> Quantity: value with unit '1' (default unit in FHIR)
+        if isinstance(value, (int, float)):
+            from ..types.quantity_builder import build_quantity_json_string
+            return build_quantity_json_string(float(value), '1')
+
+        # String -> Quantity: Parse "number unit" format
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+
+            # Try to parse as "number [unit]" format
+            # Supports: '1', '1.0', '1 day', '4 days', '1 'wk'', etc.
+            import re
+            # Pattern: optional sign, digits with decimal, optional space, optional unit (quoted or unquoted)
+            # The unit can be in single quotes, double quotes, or plain text
+            quantity_pattern = r'^[\+\-]?(\d+\.?\d*|\.\d+)(?:\s+(\'[^\']+\'|\"[^\"]+\"|[a-zA-Z]+))?$'
+            match = re.match(quantity_pattern, stripped)
+
+            if match:
+                number_str = match.group(1)
+                unit_part = match.group(2)
+
+                try:
+                    quantity_value = float(number_str)
+
+                    # Extract unit from quotes if present
+                    if unit_part:
+                        unit_part = unit_part.strip()
+                        if unit_part.startswith("'") and unit_part.endswith("'"):
+                            unit = unit_part[1:-1]
+                        elif unit_part.startswith('"') and unit_part.endswith('"'):
+                            unit = unit_part[1:-1]
+                        else:
+                            unit = unit_part
+                    else:
+                        # No unit specified, use '1' as default (FHIR convention)
+                        unit = '1'
+
+                    from ..types.quantity_builder import build_quantity_json_string
+                    return build_quantity_json_string(quantity_value, unit)
+                except ValueError:
+                    return None
+
         return None
 
     def _extract_preserved_columns(self, *fragments: SQLFragment) -> List[str]:
@@ -3298,11 +3388,141 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
             # Use dialect methods for operator-specific SQL generation
             if node.operator_type == "logical" and operator_lower in ["and", "or"]:
-                sql_expr = self.dialect.generate_logical_combine(
-                    left_fragment.expression,
-                    sql_operator,
-                    right_fragment.expression
-                )
+                # SP-110-001: Handle empty collection semantics for AND/OR operators
+                # According to FHIRPath spec:
+                # - AND: false and {} = false, {} and false = false, {} and true = {}, {} and {} = {}
+                # - OR: true or {} = true, {} or true = true, {} or false = {}, {} or {} = {}
+                # Empty collections propagate: false AND {} = false, true OR {} = true
+                # But: {} AND true = {} (empty), true AND {} = {} (empty)
+                #     {} OR false = {} (empty), false OR {} = {} (empty)
+
+                left_metadata = getattr(left_fragment, "metadata", {}) or {}
+                right_metadata = getattr(right_fragment, "metadata", {}) or {}
+                left_is_empty = left_metadata.get("is_empty_collection") is True
+                right_is_empty = right_metadata.get("is_empty_collection") is True
+
+                # Determine if operands are boolean literals for short-circuit evaluation
+                left_is_true_literal = (left_metadata.get("is_literal") is True and
+                                        left_metadata.get("literal_type") == "boolean" and
+                                        str(left_fragment.expression).upper() == "TRUE")
+                left_is_false_literal = (left_metadata.get("is_literal") is True and
+                                         left_metadata.get("literal_type") == "boolean" and
+                                         str(left_fragment.expression).upper() == "FALSE")
+                right_is_true_literal = (right_metadata.get("is_literal") is True and
+                                         right_metadata.get("literal_type") == "boolean" and
+                                         str(right_fragment.expression).upper() == "TRUE")
+                right_is_false_literal = (right_metadata.get("is_literal") is True and
+                                          right_metadata.get("literal_type") == "boolean" and
+                                          str(right_fragment.expression).upper() == "FALSE")
+
+                if operator_lower == "and":
+                    # AND operator: false AND anything = false
+                    # Empty collection propagation:
+                    # - false AND {} = false (left is false, result is false)
+                    # - {} AND false = false (right is false, result is false)
+                    # - true AND {} = {} (right is empty, result is empty)
+                    # - {} AND true = {} (left is empty, result is empty)
+                    # - {} AND {} = {} (both empty, result is empty)
+                    if left_is_false_literal:
+                        # Short-circuit: false AND anything = false
+                        sql_expr = "FALSE"
+                        # Clear is_empty_collection since result is a boolean literal
+                        left_metadata = dict(left_metadata)
+                        left_metadata.pop("is_empty_collection", None)
+                        left_fragment = SQLFragment(
+                            expression=left_fragment.expression,
+                            source_table=left_fragment.source_table,
+                            requires_unnest=left_fragment.requires_unnest,
+                            is_aggregate=left_fragment.is_aggregate,
+                            dependencies=left_fragment.dependencies,
+                            metadata=left_metadata
+                        )
+                    elif right_is_false_literal:
+                        # Short-circuit: anything AND false = false
+                        sql_expr = "FALSE"
+                        # Clear is_empty_collection since result is a boolean literal
+                        right_metadata = dict(right_metadata)
+                        right_metadata.pop("is_empty_collection", None)
+                        right_fragment = SQLFragment(
+                            expression=right_fragment.expression,
+                            source_table=right_fragment.source_table,
+                            requires_unnest=right_fragment.requires_unnest,
+                            is_aggregate=right_fragment.is_aggregate,
+                            dependencies=right_fragment.dependencies,
+                            metadata=right_metadata
+                        )
+                    elif left_is_empty and right_is_empty:
+                        # Both empty: result is empty
+                        sql_expr = "NULL"
+                    elif left_is_empty:
+                        # Left is empty, right is not false (must be true or non-literal)
+                        # {} AND true = {} (empty result)
+                        sql_expr = "NULL"
+                    elif right_is_empty:
+                        # Right is empty, left is not false (must be true or non-literal)
+                        # true AND {} = {} (empty result)
+                        sql_expr = "NULL"
+                    else:
+                        # Standard AND: use dialect method
+                        sql_expr = self.dialect.generate_logical_combine(
+                            left_fragment.expression,
+                            sql_operator,
+                            right_fragment.expression
+                        )
+                else:  # operator_lower == "or"
+                    # OR operator: true OR anything = true
+                    # Empty collection propagation:
+                    # - true OR {} = true (left is true, result is true)
+                    # - {} OR true = true (right is true, result is true)
+                    # - false OR {} = {} (right is empty, result is empty)
+                    # - {} OR false = {} (left is empty, result is empty)
+                    # - {} OR {} = {} (both empty, result is empty)
+                    if left_is_true_literal:
+                        # Short-circuit: true OR anything = true
+                        sql_expr = "TRUE"
+                        # Clear is_empty_collection since result is a boolean literal
+                        left_metadata = dict(left_metadata)
+                        left_metadata.pop("is_empty_collection", None)
+                        left_fragment = SQLFragment(
+                            expression=left_fragment.expression,
+                            source_table=left_fragment.source_table,
+                            requires_unnest=left_fragment.requires_unnest,
+                            is_aggregate=left_fragment.is_aggregate,
+                            dependencies=left_fragment.dependencies,
+                            metadata=left_metadata
+                        )
+                    elif right_is_true_literal:
+                        # Short-circuit: anything OR true = true
+                        sql_expr = "TRUE"
+                        # Clear is_empty_collection since result is a boolean literal
+                        right_metadata = dict(right_metadata)
+                        right_metadata.pop("is_empty_collection", None)
+                        right_fragment = SQLFragment(
+                            expression=right_fragment.expression,
+                            source_table=right_fragment.source_table,
+                            requires_unnest=right_fragment.requires_unnest,
+                            is_aggregate=right_fragment.is_aggregate,
+                            dependencies=right_fragment.dependencies,
+                            metadata=right_metadata
+                        )
+                    elif left_is_empty and right_is_empty:
+                        # Both empty: result is empty
+                        sql_expr = "NULL"
+                    elif left_is_empty:
+                        # Left is empty, right is not true (must be false or non-literal)
+                        # {} OR false = {} (empty result)
+                        sql_expr = "NULL"
+                    elif right_is_empty:
+                        # Right is empty, left is not true (must be false or non-literal)
+                        # false OR {} = {} (empty result)
+                        sql_expr = "NULL"
+                    else:
+                        # Standard OR: use dialect method
+                        sql_expr = self.dialect.generate_logical_combine(
+                            left_fragment.expression,
+                            sql_operator,
+                            right_fragment.expression
+                        )
             elif node.operator_type == "logical" and operator_lower == "xor":
                 # SP-100-009: XOR operator with empty collection semantics
                 # XOR returns true if operands have different boolean values
@@ -3559,12 +3779,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     function_name = meta["function"]
                     break
 
+            # SP-110-001: For logical operators (AND/OR), check if we short-circuited to a boolean literal
+            # If so, don't copy is_empty_collection from operands since the result is a definite boolean
+            did_short_circuit = False
+            if node.operator_type == "logical" and operator_lower in ["and", "or"]:
+                # Check if we short-circuited (result is TRUE or FALSE literal)
+                if sql_expr in ("TRUE", "FALSE"):
+                    did_short_circuit = True
+
             for key, value in left_meta.items():
                 if key not in array_keys:
-                    metadata[key] = value
+                    # SP-110-001: Don't copy is_empty_collection if we short-circuited
+                    if not (did_short_circuit and key == "is_empty_collection"):
+                        metadata[key] = value
             for key, value in right_meta.items():
                 if key not in array_keys and key not in metadata:
-                    metadata[key] = value
+                    # SP-110-001: Don't copy is_empty_collection if we short-circuited
+                    if not (did_short_circuit and key == "is_empty_collection"):
+                        metadata[key] = value
 
             # SP-108-001: Mark comparison operators with result_type boolean
             metadata["result_type"] = "boolean"
@@ -9215,6 +9447,59 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         child = node.children[0]
 
+        # SP-110-006: Special handling for polarity + invocation on numeric literal
+        # FHIRPath spec treats -1.convertsToInteger() as (-1).convertsToInteger()
+        # Even though the grammar parses it as -(1.convertsToInteger())
+        # We need to detect when the child is an invocation on a numeric literal
+        # and negate the literal BEFORE the function is called
+        if operator == '-' and hasattr(child, 'node_type') and child.node_type == 'InvocationExpression':
+            # Check if this is an invocation of a numeric literal
+            if hasattr(child, 'children') and len(child.children) >= 2:
+                # First child should be the target (the literal)
+                target = child.children[0]
+                # Walk down to find the actual literal node
+                literal_node = None
+                if hasattr(target, 'node_type') and target.node_type == 'TermExpression':
+                    if hasattr(target, 'children') and target.children:
+                        for grandchild in target.children:
+                            if hasattr(grandchild, 'node_type') and grandchild.node_type == 'literal':
+                                literal_node = grandchild
+                                break
+
+                if literal_node is not None:
+                    # Check if it's a numeric literal using text-based detection
+                    # The EnhancedASTNode may not have literal_type set, so we use text analysis
+                    literal_text = getattr(literal_node, 'text', None)
+                    if literal_text and self._is_numeric_literal(literal_text):
+                        # This is -1.convertsToInteger() pattern
+                        # We need to negate the literal value and re-translate the invocation
+                        logger.debug(f"SP-110-006: Detected polarity on invocation with numeric literal '{literal_text}', negating literal first")
+
+                        # Negate the literal value by updating text
+                        # Parse the numeric value
+                        try:
+                            if '.' in literal_text or 'e' in literal_text.lower():
+                                negated_value = -float(literal_text)
+                            else:
+                                negated_value = -int(literal_text)
+
+                            # Update text representation with negated value
+                            literal_node.text = str(negated_value)
+
+                            # Update pending_literal_value so the function uses the negated value
+                            if self.context.pending_literal_value is not None:
+                                old_value, old_expr = self.context.pending_literal_value
+                                self.context.pending_literal_value = (negated_value, str(negated_value))
+
+                            # Now visit the child (the invocation) with the negated literal
+                            child_fragment = self.visit(child)
+
+                            # The invocation result should be treated as if we called the function on a negative literal
+                            return child_fragment
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"SP-110-006: Failed to negate literal '{literal_text}': {e}")
+                            # Fall through to default handling
+
         # Visit the child expression to get the operand
         # CRITICAL: In FHIRPath grammar, -1.convertsToInteger() parses as -(1.convertsToInteger())
         # NOT as (-1).convertsToInteger()
@@ -11620,6 +11905,7 @@ GROUP BY {old_table}.id, {old_table}.resource"""
         self.context.current_table = cte_name
 
         # SP-109-004: Restore context from snapshot to maintain proper CTE chaining
+        # This is needed for proper CTE chain management
         self._restore_context(snapshot)
 
         # Return SQL fragment with metadata
@@ -11632,7 +11918,8 @@ GROUP BY {old_table}.id, {old_table}.resource"""
             source_table=cte_name,
             requires_unnest=False,  # Complete SELECT statement, no additional UNNEST needed
             is_aggregate=True,      # Flag that this involves aggregation
-            dependencies=[old_table]  # Track dependency on source table
+            dependencies=[old_table],  # Track dependency on source table
+            metadata={"function": "select"}  # SP-110-003: Mark as select result for allTrue()/anyTrue() detection
         )
 
     def _translate_first(self, node: FunctionCallNode) -> SQLFragment:
@@ -13947,9 +14234,11 @@ END"""
                     f"substring() requires 1-3 arguments, got {original_arg_count}"
                 )
 
-            # SP-025-002: Return empty string for out-of-bounds (not NULL)
-            # Per FHIRPath spec, substring with negative start or zero length returns empty string
-            empty_sql = "''"
+            # SP-110-005: Return NULL for out-of-bounds (not empty string)
+            # Per FHIRPath spec compliance, substring with negative start or start >= length
+            # should return NULL so that .empty() correctly returns TRUE.
+            # Returning empty string '' would make .empty() return FALSE (incorrect).
+            empty_sql = "NULL"
 
             if args:
                 start_fragment = self.visit(args[0])
@@ -15388,15 +15677,22 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-003: Also check if collection_expr itself is a SELECT statement
+        # This handles edge cases where metadata might not be set correctly
+        is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
+
         try:
             if not collection_expr:
                 raise ValueError("allTrue() requires a collection expression")
 
             # SP-110-002: If the collection comes from select(), it's already in 'result' column
             # as a JSON array. We need to enumerate it with json_each.
-            if has_select_result:
+            # SP-110-003: Also check if collection_expr is a SELECT statement directly
+            if has_select_result or is_select_statement:
+                # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
+                # with the correct CTE name that contains the result column
                 # The result column contains the aggregated JSON array from select()
-                all_true_sql = f"COALESCE((SELECT BOOL_AND(CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), TRUE)"
+                all_true_sql = f"COALESCE((SELECT BOOL_AND(CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
@@ -15438,15 +15734,19 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-003: Also check if collection_expr itself is a SELECT statement
+        is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
+
         try:
             if not collection_expr:
                 raise ValueError("anyTrue() requires a collection expression")
 
             # SP-110-002: If the collection comes from select(), it's already in 'result' column
             # as a JSON array. We need to enumerate it with json_each.
-            if has_select_result:
-                # The result column contains the aggregated JSON array from select()
-                any_true_sql = f"COALESCE((SELECT BOOL_OR(CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), FALSE)"
+            # SP-110-003: Also check if collection_expr is a SELECT statement directly
+            if has_select_result or is_select_statement:
+                # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
+                any_true_sql = f"COALESCE((SELECT BOOL_OR(CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), FALSE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
@@ -15488,15 +15788,19 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-003: Also check if collection_expr itself is a SELECT statement
+        is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
+
         try:
             if not collection_expr:
                 raise ValueError("allFalse() requires a collection expression")
 
             # SP-110-002: If the collection comes from select(), it's already in 'result' column
             # as a JSON array. We need to enumerate it with json_each.
-            if has_select_result:
-                # The result column contains the aggregated JSON array from select()
-                all_false_sql = f"COALESCE((SELECT BOOL_AND(NOT CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), TRUE)"
+            # SP-110-003: Also check if collection_expr is a SELECT statement directly
+            if has_select_result or is_select_statement:
+                # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
+                all_false_sql = f"COALESCE((SELECT BOOL_AND(NOT CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
@@ -15538,15 +15842,19 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-003: Also check if collection_expr itself is a SELECT statement
+        is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
+
         try:
             if not collection_expr:
                 raise ValueError("anyFalse() requires a collection expression")
 
             # SP-110-002: If the collection comes from select(), it's already in 'result' column
             # as a JSON array. We need to enumerate it with json_each.
-            if has_select_result:
-                # The result column contains the aggregated JSON array from select()
-                any_false_sql = f"COALESCE((SELECT BOOL_OR(NOT CAST(value AS BOOLEAN)) FROM json_each({source_table}.result)), FALSE)"
+            # SP-110-003: Also check if collection_expr is a SELECT statement directly
+            if has_select_result or is_select_statement:
+                # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
+                any_false_sql = f"COALESCE((SELECT BOOL_OR(NOT CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), FALSE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)

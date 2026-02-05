@@ -752,6 +752,18 @@ class CTEManager:
                     raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
             return expression
 
+        # SP-110-003: General substitution for <<SOURCE_TABLE>> in non-SELECT expressions
+        # This handles cases like allTrue() where the expression is COALESCE((SELECT...))
+        # but still contains <<SOURCE_TABLE>>.result references that need substitution.
+        if "<<SOURCE_TABLE>>" in expression:
+            import re
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', source_table):
+                raise ValueError(f"Invalid table name for substitution: {source_table}")
+            original_expression = expression
+            expression = expression.replace('<<SOURCE_TABLE>>', source_table)
+            if "<<SOURCE_TABLE>>" in expression:
+                raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
+
         result_alias = fragment.metadata.get("result_alias", "result")
 
         # SP-110-006: Check if this is a repeat() function result that needs special handling

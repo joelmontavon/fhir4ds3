@@ -2073,11 +2073,16 @@ class PostgreSQLDialect(DatabaseDialect):
         # Reverse of JSON escape: unescape quotes first, then backslashes
         return f"replace(replace({expression}, '\\\\\"', '\"'), '\\\\\\\\', '\\\\')"
 
-    def generate_array_sort(self, array_expr: str, ascending: bool = True) -> str:
+    def generate_array_sort(self, array_expr: str, ascending: bool = True, element_type: Optional[str] = None) -> str:
         """Generate SQL for sorting array elements in PostgreSQL.
 
         PostgreSQL doesn't have a native array_sort function, so we need to use
         array_agg with ORDER BY on unnested elements.
+
+        Args:
+            array_expr: SQL expression for the array to sort
+            ascending: True for ascending order, False for descending
+            element_type: Optional type hint (not used in PostgreSQL as unnest handles types)
         """
         if ascending:
             return f"(SELECT array_agg(x ORDER BY x) FROM unnest({array_expr}) AS x)"

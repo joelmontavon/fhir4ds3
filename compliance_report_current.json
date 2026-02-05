@@ -1,18 +1,13 @@
 {
   "total_tests": 934,
-  "passed_tests": 593,
-  "failed_tests": 341,
-  "compliance_percentage": 63.49036402569593,
+  "passed_tests": 653,
+  "failed_tests": 281,
+  "compliance_percentage": 69.91434689507494,
   "test_categories": {
     "comments_syntax": {
-      "total": 32,
-      "passed": 11,
-      "failed": 21
-    },
-    "arithmetic_operators": {
-      "total": 72,
-      "passed": 33,
-      "failed": 39
+      "total": 9,
+      "passed": 9,
+      "failed": 0
     },
     "basic_expressions": {
       "total": 2,
@@ -26,28 +21,33 @@
     },
     "error_handling": {
       "total": 5,
-      "passed": 5,
-      "failed": 0
+      "passed": 3,
+      "failed": 2
     },
     "type_functions": {
       "total": 116,
-      "passed": 63,
-      "failed": 53
+      "passed": 75,
+      "failed": 41
     },
     "collection_functions": {
       "total": 141,
-      "passed": 69,
-      "failed": 72
+      "passed": 81,
+      "failed": 60
     },
     "function_calls": {
       "total": 113,
-      "passed": 63,
-      "failed": 50
+      "passed": 66,
+      "failed": 47
+    },
+    "arithmetic_operators": {
+      "total": 71,
+      "passed": 33,
+      "failed": 38
     },
     "comparison_operators": {
       "total": 338,
-      "passed": 253,
-      "failed": 85
+      "passed": 268,
+      "failed": 70
     },
     "datetime_functions": {
       "total": 6,
@@ -60,19 +60,19 @@
       "failed": 2
     },
     "string_functions": {
-      "total": 65,
-      "passed": 49,
-      "failed": 16
+      "total": 89,
+      "passed": 70,
+      "failed": 19
     },
     "math_functions": {
       "total": 28,
-      "passed": 27,
-      "failed": 1
+      "passed": 28,
+      "failed": 0
     }
   },
-  "timestamp": "2026-01-29T21:39:26.132561",
-  "execution_time_total_ms": 300051.0456562042,
-  "execution_time_average_ms": 321.2233802235867,
+  "timestamp": "2026-02-04T23:31:03.345204",
+  "execution_time_total_ms": 312399.31988716125,
+  "execution_time_average_ms": 334.4409672555372,
   "parser_type": "FHIRPathParser",
   "database_type": "duckdb"
 }
