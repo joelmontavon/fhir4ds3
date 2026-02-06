@@ -1565,7 +1565,21 @@ class CTEManager:
         """
         self._validate_cte_collection(ctes)
 
-        ordered_ctes = self._order_ctes_by_dependencies(ctes)
+        # SP-110 Round 8: Detect lambda iteration tables for nested lambdas
+        # Tables like exists_0_item, where_0_item are created as table aliases in
+        # EXISTS/UNNEST subqueries and should be treated as external tables
+        external_tables = {"resource"}
+        for cte in ctes:
+            for dep in cte.depends_on:
+                # Detect lambda iteration table patterns: *_item with a number
+                # Examples: exists_0_item, where_1_item, select_2_item
+                if (dep.endswith("_item") and
+                    any(c.isdigit() for c in dep) and
+                    ("exists" in dep.lower() or "where" in dep.lower() or
+                     "select" in dep.lower() or "forall" in dep.lower())):
+                    external_tables.add(dep)
+
+        ordered_ctes = self._order_ctes_by_dependencies(ctes, external_tables)
 
         # SP-020-DEBUG: Collect ordering columns from CTEs for ORDER BY
         ordering_columns = []

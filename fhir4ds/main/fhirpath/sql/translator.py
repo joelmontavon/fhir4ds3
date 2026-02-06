@@ -1934,6 +1934,61 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         logger.debug(f"Translating identifier: {identifier_value}")
         logger.debug(f"SP-103-005: visit_identifier: identifier_value='{identifier_value}', parent_path={self.context.parent_path}")
 
+        # SP-110 FIX: Special handling for identifier navigation after repeat() results
+        # When the previous fragment is a repeat() result, we need to UNNEST the result array
+        # and then extract the property from each element. The result column contains a JSON array.
+
+        # Check ALL fragments for a repeat_result, not just the last one
+        # This handles cases where fragments might be in a different order
+        repeat_result_fragment = None
+        for i in range(len(self.fragments) - 1, -1, -1):  # Search from the end
+            if hasattr(self.fragments[i], 'metadata') and self.fragments[i].metadata:
+                if self.fragments[i].metadata.get('repeat_result'):
+                    repeat_result_fragment = self.fragments[i]
+                    break
+
+        if repeat_result_fragment:
+            result_column = repeat_result_fragment.metadata.get('result_column', 'result')
+            # Use the source_table from the repeat result fragment
+            repeat_source_table = repeat_result_fragment.source_table
+            logger.info(
+                f"SP-110: Detected identifier navigation after repeat() result. "
+                f"Source table: {repeat_source_table}, Result column: {result_column}, Property: {identifier_value}"
+            )
+            # Clear the parent path since we're starting fresh from the repeat() result
+            self.context.parent_path = []
+            # Build UNNEST operation for the result array
+            # The result column contains a JSON array, we need to UNNEST it and extract the property
+            array_column = self.dialect.extract_json_object(
+                column=f"{repeat_source_table}.{result_column}",
+                path=f"$.{identifier_value}"
+            )
+            logger.info(f"SP-110: Created array_column={array_column}")
+            # Return a fragment that extracts the property from the UNNESTed array
+            fragment = SQLFragment(
+                expression=array_column,
+                source_table=repeat_source_table,
+                requires_unnest=True,  # This requires UNNEST to access array elements
+                is_aggregate=False,
+                metadata={
+                    "from_repeat_result": True,
+                    "array_column": array_column,
+                    "result_alias": "item"  # Explicitly set result_alias for UNNEST wrapper
+                }
+            )
+            logger.info(f"SP-110: Returning fragment with metadata array_column={fragment.metadata.get('array_column')}")
+            return fragment
+            if self.fragments:
+                logger.debug(
+                    f"SP-110-DEBUG: Special handling NOT triggered. "
+                    f"Fragments count: {len(self.fragments)}, "
+                    f"Searched all fragments, no repeat_result found"
+                )
+                for i, frag in enumerate(self.fragments):
+                    meta_keys = list(frag.metadata.keys()) if hasattr(frag, 'metadata') and frag.metadata else 'None'
+                    has_repeat = frag.metadata.get('repeat_result') if hasattr(frag, 'metadata') and frag.metadata else 'N/A'
+                    logger.debug(f"SP-110-DEBUG: Fragment {i}: metadata keys={meta_keys}, has repeat_result={has_repeat}")
+
         # SP-103-005: Skip empty identifiers and structural nodes (parentheses, etc.)
         # These are part of the AST structure but not actual path components
         if not identifier_value or identifier_value in ['( )', 'ofType', 'as', 'is']:
@@ -4045,7 +4100,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Check if left is JSON numeric value and right is string literal
                     if (left_is_json and right_is_literal and
                         right_literal_type == "string" and
-                        left_metadata.get("source_path", "").endswith(".value") and
+                        self._is_numeric_value_field(left_metadata.get("source_path", "")) and
                         not is_in_lambda_context):
                         # Try strict cast to DECIMAL - will error if right is not numeric
                         left_expr = self.dialect.strict_cast_to_decimal(left_expr)
@@ -4053,7 +4108,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Check if right is JSON numeric value and left is string literal
                     elif (right_is_json and left_is_literal and
                           left_literal_type == "string" and
-                          right_metadata.get("source_path", "").endswith(".value") and
+                          self._is_numeric_value_field(right_metadata.get("source_path", "")) and
                           not is_in_lambda_context):
                         # Try strict cast to DECIMAL - will error if left is not numeric
                         right_expr = self.dialect.strict_cast_to_decimal(right_expr)
@@ -4680,6 +4735,59 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             elif fhir_type == "Time":
                 return "time"
         return None
+
+    def _is_numeric_value_field(self, source_path: str) -> bool:
+        """Check if .value field is on a numeric primitive type.
+
+        FHIR uses .value for many primitive types, but only numeric types
+        (valueQuantity, valueInteger, valueDecimal) should be cast to DECIMAL.
+        Non-numeric types (valueString, valuePeriod, etc.) should not be cast.
+
+        Args:
+            source_path: FHIRPath source path (e.g., "Observation.value.value")
+
+        Returns:
+            True if .value is on a numeric primitive, False otherwise.
+        """
+        if not source_path or not source_path.endswith(".value"):
+            return False
+
+        # Use string slicing to correctly remove the trailing ".value" suffix.
+        # rstrip() would remove characters, not the suffix string.
+        # Slicing approach: source_path[:-6] removes the last 6 characters (".value")
+        if source_path.endswith(".value"):
+            parent_path = source_path[:-6]  # Remove ".value" (6 characters)
+        else:
+            return False
+
+        # Get the parent field name (the field before the last .value)
+        path_parts = parent_path.split(".")
+        if not path_parts:
+            return False
+
+        parent_field = path_parts[-1]
+
+        # List of non-numeric value fields that should NOT be cast to DECIMAL
+        # Includes specific valueX fields and the generic 'value' field itself
+        non_numeric_primitives = {
+            "valuePeriod", "valueString", "valueUri", "valueBoolean",
+            "valueBase64Binary", "valueCode", "valueDate", "valueDateTime",
+            "valueTime", "valueId", "valueOid", "valueUuid", "valueCanonical",
+            "valueUrl", "valueMarkdown", "valueXhtml", "valueAttachment",
+            "valueCodeableConcept", "valueCoding", "valueQuantity",  # Quantity has its own unit/value structure
+            "valueRange", "valueRatio", "valueSampledData", "valueSignature",
+            "valueTiming", "valueHumanName", "valueAddress", "valueContactPoint",
+            "valueReference", "valueAnnotation",
+            "value"  # Generic value field - when used as a standalone field, it's a choice type
+        }
+
+        # If parent is in non-numeric list, don't cast
+        if parent_field in non_numeric_primitives:
+            return False
+
+        # Default to True for ambiguous cases (conservative approach)
+        # This handles numeric-specific fields like valueQuantity, valueInteger, etc.
+        return True
 
     def _is_json_extraction(self, fragment: SQLFragment) -> bool:
         """Detect if a fragment represents a JSON extraction that yields VARCHAR.
@@ -9735,6 +9843,13 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Use DOUBLE for numeric operations, can be extended for other types later
         element_cast = self.dialect.cast_to_double(element_alias)
 
+        # SP-110 FIX: Save fragments length to prevent iteration expression fragments
+        # from being added to self.fragments. These fragments reference internal CTE
+        # variables (repeat_elem_N) that are only available inside the RECURSIVE CTE,
+        # not in the wrapping CTE. By restoring the fragments length, we ensure these
+        # fragments are only used for their SQL expressions in the template.
+        fragments_before_iter = len(self.fragments)
+
         # Translate the iteration expression with $this binding
         with self._variable_scope({
             "$this": VariableBinding(
@@ -9744,12 +9859,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         }):
             iter_fragment = self.visit(node.arguments[0])
 
+        # Remove any fragments created during iteration expression visit
+        # These fragments reference internal CTE variables and should not be processed as separate CTEs
+        del self.fragments[fragments_before_iter:]
+
         logger.debug(f"Iteration expression SQL: {iter_fragment.expression}")
 
         # For recursive case, we need to apply same expression to results
         # $this will be bound to r.element (the element from previous iteration)
         # Cast for recursive case as well
         recursive_element_cast = self.dialect.cast_to_double(f"r.{element_alias}")
+
+        fragments_before_recursive = len(self.fragments)
 
         with self._variable_scope({
             "$this": VariableBinding(
@@ -9759,11 +9880,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         }):
             recursive_iter_fragment = self.visit(node.arguments[0])
 
+        # Remove any fragments created during recursive iteration expression visit
+        del self.fragments[fragments_before_recursive:]
+
         logger.debug(f"Recursive iteration expression SQL: {recursive_iter_fragment.expression}")
 
         # Restore context
         self.context.current_table = old_table
-        self.context.parent_path = old_path
+        # SP-110 FIX: Clear parent_path after repeat() since it returns a complete new collection
+        # Subsequent path navigation (like .code) should start from the result array,
+        # not continue the path that was used inside the repeat() iteration.
+        self.context.parent_path = []
 
         # Build RECURSIVE CTE SQL with cycle detection
         # Base case: initial collection (depth = 0)
@@ -9831,16 +9958,35 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         logger.debug(f"Complete repeat() SQL generated with RECURSIVE CTE and $this binding")
 
-        # SP-110-002: No preserved columns needed - repeat() returns a complete SQL expression
-        # that wraps everything. The result is available as a JSON array in the 'result' column
-        # of the outer CTE.
-        return SQLFragment(
+        # SP-110 FIX: Use a marker for the source table instead of a hardcoded CTE name.
+        # The CTE manager's counter is separate from the translator's counter, so we can't
+        # predict the exact CTE name. Instead, we use a marker that the CTE manager will
+        # resolve to the actual previous CTE name during query generation.
+        # Marker format: :marker: to distinguish from actual table names
+        REPEAT_RESULT_MARKER = ":repeat_result_cte:"
+
+        # SP-110 FIX: Update the current table to point to the marker
+        # This ensures that subsequent operations like .code use the correct source
+        self.context.current_table = REPEAT_RESULT_MARKER
+
+        fragment = SQLFragment(
             expression=sql,
-            source_table=old_table,
-            requires_unnest=False,
+            source_table=REPEAT_RESULT_MARKER,  # Marker that CTE manager will resolve
+            requires_unnest=False,   # The expression is self-contained
             is_aggregate=False,
-            dependencies=iter_fragment.dependencies if hasattr(iter_fragment, 'dependencies') else []
+            dependencies=iter_fragment.dependencies if hasattr(iter_fragment, 'dependencies') else [],
+            metadata={
+                "repeat_result": True,      # Mark this as a repeat() result
+                "result_column": "result",  # The result column contains the array
+                "clear_path_on_next": True, # Signal to clear path context for next operation
+                "use_previous_cte": True    # Signal to use previous CTE as source
+            }
         )
+        # SP-110 FIX: Add fragment to self.fragments so subsequent identifier processing
+        # can detect the repeat() result and handle it properly
+        self.fragments.append(fragment)
+        logger.info(f"SP-110: Added repeat_result fragment to self.fragments. Total fragments: {len(self.fragments)}, metadata keys={list(fragment.metadata.keys())}")
+        return fragment
 
     def _translate_combine(self, node: FunctionCallNode) -> SQLFragment:
         """Translate combine() function for quick win scenarios."""
@@ -12849,13 +12995,30 @@ END"""
 
             logger.debug(f"Generated exists() SQL (with criteria): {sql_expr}")
 
-            # SP-110-XXX: Merge dependencies from condition fragment to handle nested functions
-            # If condition contains nested function calls (e.g., coding.exists(...)),
-            # those CTEs must be included in dependencies
+            # SP-110 FIX: Use the actual underlying table for dependencies, not the temporary array_alias
+            # The array_alias (e.g., exists_0_item) is only used as a table alias in the EXISTS subquery,
+            # not as a CTE. We should only depend on the old_table (the actual data source).
             dependencies = [old_table]
+
+            # Filter dependencies from condition_fragment
+            # SP-110 Round 8 FIX: Handle nested exists() dependencies correctly
+            # When we have nested exists() like: category.exists(coding.exists(...))
+            # - The inner exists() will have dependencies like ['exists_0_item'] (the outer lambda's table)
+            # - We should NOT include exists_0_item in our dependencies because it's a table alias
+            #   within the EXISTS subquery, not a CTE
+            # - Only include dependencies that are real CTEs or the base resource table
             if hasattr(condition_fragment, "dependencies") and condition_fragment.dependencies:
                 for dep in condition_fragment.dependencies:
-                    if dep and dep not in dependencies:
+                    # Skip if this is the current array_alias (exists_1_item) - it's our own temp alias
+                    # Skip if this is any exists_N_item pattern - these are table aliases in EXISTS subqueries,
+                    #   not CTEs. The EXISTS subquery will reference them directly in the SQL.
+                    # Only include the dep if it's the old_table (actual data source) or a real CTE
+                    is_temp_exists_alias = (
+                        dep.endswith("_item") and
+                        "exists" in dep.lower() and
+                        any(c.isdigit() for c in dep)
+                    )
+                    if dep and dep != old_table and not is_temp_exists_alias and dep not in dependencies:
                         dependencies.append(dep)
 
             return SQLFragment(
@@ -17390,13 +17553,16 @@ END"""
 
         logger.debug(f"Generated sort() SQL: {sort_sql}")
 
+        # SP-110 FIX: sort() returns a complete SQL expression that doesn't require additional UNNESTing
+        # The generate_array_sort() method returns a self-contained array expression
+        # Even if the target collection required UNNEST, the sorted result is a complete array
         return SQLFragment(
             expression=sort_sql,
             source_table=source_table or self.context.current_table,
-            requires_unnest=requires_unnest,
+            requires_unnest=False,  # sort() returns a complete array expression, not requiring UNNEST
             is_aggregate=is_aggregate,
             dependencies=list(dict.fromkeys(dependencies)),
-            metadata={"function": "sort", "ascending": ascending}
+            metadata={"function": "sort", "ascending": ascending, "element_type": element_type}
         )
 
     def _translate_descendants(self, node: FunctionCallNode) -> SQLFragment:
