@@ -36,7 +36,12 @@ from ..ast.nodes import (
 )
 from ..parser_core.ast_extensions import EnhancedASTNode
 from ..parser_core.metadata_types import SQLDataType
-from ..exceptions import FHIRPathTranslationError, FHIRPathValidationError, FHIRPathEvaluationError
+from ..exceptions import (
+    FHIRPathTranslationError,
+    FHIRPathValidationError,
+    FHIRPathEvaluationError,
+    FHIRPathTypeError
+)
 from ..types.type_registry import TypeRegistry, get_type_registry
 from ..types import (
     get_element_type_resolver,
@@ -3135,7 +3140,34 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             >>> self._convert_to_boolean("TRUE", "boolean")
             "TRUE"
         """
-        if literal_type == "boolean":
+        expr_stripped = str(expr).strip()
+        expr_upper = expr_stripped.upper()
+
+        # CRITICAL: Check if expression is already a boolean expression FIRST
+        # This must happen BEFORE checking literal_type, because expressions like
+        # (CAST(x AS VARCHAR) = 'P') are boolean but might have literal_type='string'
+        # from their operands.
+        #
+        # Boolean expressions include:
+        # 1. TRUE/FALSE literals
+        # 2. CASE/COALESCE/EXISTS expressions
+        # 3. Comparison operators (=, !=, <, >, <=, >=, ~)
+        # 4. Logical operators (AND, OR, XOR, NOT)
+        # 5. IS [NOT] NULL/TRUE/FALSE expressions
+        is_boolean_expr = (
+            expr_upper in ("TRUE", "FALSE") or
+            expr_upper.startswith(("CASE WHEN ", "COALESCE(", "NOT ", "EXISTS(")) or
+            " IS NULL" in expr_upper or " IS NOT NULL" in expr_upper or
+            " IS TRUE" in expr_upper or " IS FALSE" in expr_upper or
+            # Check for comparison operators (=, !=, <, >, <=, >=, ~) and logical operators (AND, OR, XOR)
+            any(op in expr_stripped for op in (" = ", " != ", " < ", " > ", " <= ", " >= ", " AND ", " OR ", " XOR "))
+        )
+
+        if is_boolean_expr:
+            # Expression is already boolean - return as-is to avoid TRIM(BOOLEAN) error
+            # This fixes the bug where comparison results were incorrectly wrapped in LENGTH(TRIM(...))
+            return expr
+        elif literal_type == "boolean":
             # Boolean expressions are already boolean
             return expr
         elif literal_type == "integer" or literal_type == "decimal":
@@ -3146,15 +3178,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN LENGTH(TRIM({expr})) > 0 THEN TRUE ELSE FALSE END"
         else:
             # Unknown type - try to infer from expression
-            # If it's already TRUE/FALSE, use as-is
-            expr_upper = str(expr).strip().upper()
-            if expr_upper in ("TRUE", "FALSE"):
-                return expr
             # If it's a string literal (single-quoted), check length
-            if expr.startswith("'") and expr.endswith("'"):
+            if expr_stripped.startswith("'") and expr_stripped.endswith("'"):
                 return f"CASE WHEN LENGTH(TRIM({expr})) > 0 THEN TRUE ELSE FALSE END"
             # If it's a number literal (no quotes, all digits or decimal)
-            if expr.replace(".", "", 1).replace("-", "", 1).isdigit():
+            if expr_stripped.replace(".", "", 1).replace("-", "", 1).isdigit():
                 return f"CASE WHEN CAST({expr} AS DOUBLE) <> 0 THEN TRUE ELSE FALSE END"
             # Default: try to cast and check non-zero
             return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN COALESCE(CAST({expr} AS BOOLEAN), FALSE) THEN TRUE ELSE FALSE END"
@@ -7462,27 +7490,28 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     validation_rule="iif_criterion_must_be_boolean"
                 )
 
-            # SP-110-004: Validate criterion is not a multi-item collection (testCollectionBoolean1)
-            # Multi-item collections like (1 | 2 | 3) are not valid for iif() criterion
-            # The criterion must evaluate to a single boolean value
-            # Exception: unions with empty collections like {} | true are valid (reduce to single value)
-            if self._is_multi_item_collection_excluding_empty_unions(criterion_node):
-                raise FHIRPathValidationError(
-                    message=f"iif() criterion must be a single-value boolean expression, got multi-item collection",
-                    validation_rule="iif_criterion_must_be_single_value"
+            # FHIRPath iif() criterion semantics per specification:
+            # 1. Empty collection → return alternative result (evaluates to FALSE)
+            # 2. Single boolean → use it directly
+            # 3. Multi-item collection → error (single-value boolean required)
+            criterion_is_multi_item = self._is_multi_item_collection_excluding_empty_unions(criterion_node)
+
+            # SP-110: Check if criterion is a multi-item collection before evaluation
+            # Per FHIRPath spec, iif() criterion must be a single-value boolean expression
+            # Multi-item collections like (1 | 2 | 3) are not valid
+            if criterion_is_multi_item:
+                raise FHIRPathTypeError(
+                    message="iif() criterion must be a single-value boolean expression, got multi-item collection"
                 )
 
             # Translate criterion to SQL
             criterion_fragment = self.visit(criterion_node)
             criterion_sql = criterion_fragment.expression
 
-            # SP-100-002-Enhanced: Handle empty collections and union expressions in criterion
-            # Empty collections {} should evaluate to FALSE in boolean context
-            # Union expressions like {} | true should reduce to the first non-empty value
+            # Handle empty collections: {} should evaluate to FALSE
             criterion_is_empty_collection = (
                 criterion_fragment.metadata.get('literal_type') == 'empty_collection'
             )
-            criterion_is_union = criterion_fragment.metadata.get('operator') == 'union'
 
             if criterion_is_empty_collection:
                 # Empty collection {} evaluates to FALSE in boolean context
@@ -7507,14 +7536,6 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         dependencies=[],
                         metadata={"function": "iif", "optimized": "empty_collection_null"}
                     )
-            elif criterion_is_union:
-                # SP-100-002-Enhanced: Union expression in criterion
-                # Extract the first element from the union for boolean evaluation
-                # This handles cases like: iif({} | true, true, false) -> iif(true, true, false)
-                # Wrap the union expression and extract the first element
-                normalized_criterion = self._normalize_collection_expression(criterion_sql)
-                # Use dialect's extract_json_field with [0] to get first element
-                criterion_sql = f"({self.dialect.extract_json_field(normalized_criterion, '$[0]')})"
 
             # Translate true-result to SQL
             true_result_fragment = self.visit(true_result_node)
@@ -7670,12 +7691,25 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 case_expression = f"CAST({case_expression} AS BOOLEAN)"
                 logger.debug("iif() result cast to BOOLEAN to preserve semantics")
 
-            # If iif is called on a collection (e.g., collection.iif(...)), validate cardinality
-            # The collection must have 0 or 1 items (execution validation - testIif10)
-            if target_is_multi_item:
-                raise FHIRPathEvaluationError(
-                    "iif() cannot be called on a collection with multiple items"
-                )
+            # FHIRPath iif() on multi-item collections:
+            # When iif() is called ON a multi-item collection (e.g., (1 | 2 | 3).iif(true, 'a', 'b')),
+            # the collection is checked for existence (non-empty = TRUE, empty = FALSE)
+            # This aligns with FHIRPath semantics where collections in boolean context use exists()
+            if target_is_multi_item and target_expr:
+                # Wrap the CASE expression to check if target collection is non-empty
+                # If target has items (exists() = TRUE), use the CASE expression
+                # If target is empty, return false-result (or NULL if no false-result)
+                if false_result_node:
+                    case_expression = f"""CASE
+                        WHEN EXISTS({target_expr}) THEN {case_expression}
+                        ELSE {false_result_sql}
+                    END"""
+                else:
+                    case_expression = f"""CASE
+                        WHEN EXISTS({target_expr}) THEN {case_expression}
+                        ELSE NULL
+                    END"""
+                logger.debug(f"iif() called on multi-item collection - wrapped with EXISTS check")
 
             # For dynamic collections, add runtime validation
             if target_path:
@@ -9379,12 +9413,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 f"got {len(node.arguments)}"
             )
 
-        # Optimization: if the iteration expression is a literal (doesn't reference $this),
-        # just return that literal directly
-        from fhir4ds.fhirpath.ast.nodes import LiteralNode
-        if isinstance(node.arguments[0], LiteralNode):
-            logger.debug("Repeat argument is a literal - returning literal directly")
-            return self.visit(node.arguments[0])
+        # SP-110-XXX: Check if the iteration expression is a simple literal that doesn't use $this.
+        # If the iteration expression is a literal (e.g., 'test', 1, true), then repeat()
+        # should return just that literal. This is a degenerate case where the expression
+        # doesn't reference $this, so no recursion is needed.
+        # Example: Patient.name.repeat('test') returns 'test' (not an array)
+        iter_arg = node.arguments[0]
+
+        # Check if the argument is a literal (either direct node_type or contains a literal child)
+        is_simple_literal = False
+        if hasattr(iter_arg, 'node_type'):
+            if iter_arg.node_type == 'Literal':
+                is_simple_literal = True
+            elif iter_arg.node_type == 'TermExpression' and hasattr(iter_arg, 'children'):
+                # TermExpression wraps the actual literal node
+                for child in iter_arg.children:
+                    if hasattr(child, 'node_type') and child.node_type == 'literal':
+                        is_simple_literal = True
+                        break
+
+        if is_simple_literal:
+            logger.debug("repeat() with simple literal - returning literal directly")
+            # Translate the literal and return it directly
+            iter_fragment = self.visit(iter_arg)
+            return iter_fragment
 
         # Get the collection to iterate over
         self._prefill_path_from_function(node)
@@ -9460,6 +9512,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Continue until no new elements, max depth (100), or cycle detected
         path_alias = f"{element_alias}_path"
 
+        # SP-110-XXX: Check if the iteration expression is a string literal
+        # If so, we need to wrap it in to_json() to convert SQL string literal to JSON
+        is_string_literal = (
+            hasattr(iter_fragment, 'metadata') and
+            iter_fragment.metadata.get('literal_type') == 'string'
+        )
+
+        # Wrap the iteration expression in to_json() if it's a string literal
+        # This converts SQL string literal 'test' to JSON string "test"
+        if is_string_literal:
+            iter_expr_wrapped = f"to_json({iter_fragment.expression})"
+            recursive_iter_expr_wrapped = f"to_json({recursive_iter_fragment.expression})"
+        else:
+            iter_expr_wrapped = iter_fragment.expression
+            recursive_iter_expr_wrapped = recursive_iter_fragment.expression
+
         # Use aggregate_to_json_array to convert results to JSON array
         aggregate_expr = self.dialect.aggregate_to_json_array(f"{element_alias}")
         empty_array = self.dialect.empty_json_array()
@@ -9492,7 +9560,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             array_append(r.{path_alias}, {result_alias}) as {path_alias}
         FROM {recursive_cte} r
         CROSS JOIN LATERAL (
-            SELECT {recursive_iter_fragment.expression} as {result_alias}
+            SELECT {recursive_iter_expr_wrapped} as {result_alias}
         ) iteration
         WHERE r.{depth_alias} < 100
         AND iteration.{result_alias} IS NOT NULL
@@ -11631,6 +11699,14 @@ END
 
         logger.debug(f"Complete where() subquery fragment generated")
 
+        # SP-110-XXX: Merge dependencies from condition fragment to handle nested functions
+        # If condition contains nested function calls, those CTEs must be included in dependencies
+        dependencies = [old_table]
+        if hasattr(condition_fragment, "dependencies") and condition_fragment.dependencies:
+            for dep in condition_fragment.dependencies:
+                if dep and dep not in dependencies:
+                    dependencies.append(dep)
+
         # Return SQL fragment with metadata
         # Note: Does NOT update context.current_table since this returns a collection expression
         return SQLFragment(
@@ -11638,7 +11714,7 @@ END
             source_table=old_table,  # Still depends on source table
             requires_unnest=False,  # Subquery is self-contained
             is_aggregate=False,
-            dependencies=[old_table]  # Track dependency on source table
+            dependencies=dependencies  # Track dependency on source table and nested CTEs
         )
 
     def _translate_where_on_unnested(
@@ -12514,12 +12590,21 @@ END"""
 
             logger.debug(f"Generated exists() SQL (with criteria): {sql_expr}")
 
+            # SP-110-XXX: Merge dependencies from condition fragment to handle nested functions
+            # If condition contains nested function calls (e.g., coding.exists(...)),
+            # those CTEs must be included in dependencies
+            dependencies = [old_table]
+            if hasattr(condition_fragment, "dependencies") and condition_fragment.dependencies:
+                for dep in condition_fragment.dependencies:
+                    if dep and dep not in dependencies:
+                        dependencies.append(dep)
+
             return SQLFragment(
                 expression=sql_expr,
                 source_table=self.context.current_table,
                 requires_unnest=False,  # EXISTS subquery is self-contained
                 is_aggregate=False,
-                dependencies=[old_table],
+                dependencies=dependencies,
                 metadata={"function": "exists", "result_type": "boolean"}
             )
 
@@ -13668,10 +13753,15 @@ END"""
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
 
+                # Build JSON path string from target_path list for length check
+                json_path = None
+                if target_path and target_path != "$":
+                    json_path = self._build_json_path(target_path)
+
                 # Get array length using dialect-specific function
                 length_expr = self.dialect.get_json_array_length(
                     column=source_table,
-                    path=target_path if target_path and target_path != "$" else None
+                    path=json_path
                 )
 
             # Generate conditional: return collection if length == 1, else NULL (empty)
