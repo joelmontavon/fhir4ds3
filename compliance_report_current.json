@@ -1,78 +1,11 @@
 {
   "total_tests": 934,
-  "passed_tests": 653,
-  "failed_tests": 281,
-  "compliance_percentage": 69.91434689507494,
-  "test_categories": {
-    "comments_syntax": {
-      "total": 9,
-      "passed": 9,
-      "failed": 0
-    },
-    "basic_expressions": {
-      "total": 2,
-      "passed": 2,
-      "failed": 0
-    },
-    "path_navigation": {
-      "total": 10,
-      "passed": 9,
-      "failed": 1
-    },
-    "error_handling": {
-      "total": 5,
-      "passed": 3,
-      "failed": 2
-    },
-    "type_functions": {
-      "total": 116,
-      "passed": 75,
-      "failed": 41
-    },
-    "collection_functions": {
-      "total": 141,
-      "passed": 81,
-      "failed": 60
-    },
-    "function_calls": {
-      "total": 113,
-      "passed": 66,
-      "failed": 47
-    },
-    "arithmetic_operators": {
-      "total": 71,
-      "passed": 33,
-      "failed": 38
-    },
-    "comparison_operators": {
-      "total": 338,
-      "passed": 268,
-      "failed": 70
-    },
-    "datetime_functions": {
-      "total": 6,
-      "passed": 5,
-      "failed": 1
-    },
-    "boolean_logic": {
-      "total": 6,
-      "passed": 4,
-      "failed": 2
-    },
-    "string_functions": {
-      "total": 89,
-      "passed": 70,
-      "failed": 19
-    },
-    "math_functions": {
-      "total": 28,
-      "passed": 28,
-      "failed": 0
-    }
-  },
-  "timestamp": "2026-02-04T23:31:03.345204",
-  "execution_time_total_ms": 312399.31988716125,
-  "execution_time_average_ms": 334.4409672555372,
-  "parser_type": "FHIRPathParser",
-  "database_type": "duckdb"
+  "passed_tests": 672,
+  "failed_tests": 262,
+  "compliance_percentage": 71.95,
+  "timestamp": "2026-02-06T09:20:15.898068",
+  "round": "SP-110 Round 7",
+  "baseline": "71.52% (668/934)",
+  "improvement": "+4 tests (+0.43%)",
+  "fix": "empty()/exists() LEFT JOIN fix in cte.py"
 }

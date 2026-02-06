@@ -565,6 +565,18 @@ class CTEManager:
         cte_name = self._generate_cte_name(fragment)
         source_table = previous_cte or fragment.source_table
 
+        # SP-110: Resolve marker for repeat() result CTE
+        # The :repeat_result_cte: marker should be resolved to the previous CTE
+        MARKER_REPEAT_RESULT = ":repeat_result_cte:"
+        if source_table == MARKER_REPEAT_RESULT:
+            if previous_cte:
+                source_table = previous_cte
+                logger.info(f"SP-110: Resolved marker {MARKER_REPEAT_RESULT} to {previous_cte}")
+            else:
+                raise ValueError(
+                    f"Marker {MARKER_REPEAT_RESULT} found but no previous CTE available to resolve it"
+                )
+
         if not source_table:
             raise ValueError(
                 "CTEManager requires a source table to wrap fragments; "
@@ -586,6 +598,68 @@ class CTEManager:
                     f"SP-110-006: Auto-preserving columns from {previous_cte}: {item_cols}"
                 )
                 auto_preserve_columns = item_cols
+
+        # SP-110 FIX: Check if this fragment is navigating from a repeat() result
+        # If so, ensure the array_column uses the correct source table and column
+
+        # SP-110 FIX: Check if the previous CTE was a repeat() result
+        # If so, we need to adjust the array_column to extract from the result column
+        is_repeat_navigation = False
+        if previous_cte and fragment.requires_unnest:
+            # Check if this fragment's array_column references an internal repeat variable
+            # (like repeat_elem_N) which should not be used outside the repeat() CTE
+            array_col_raw = fragment.metadata.get("array_column", "") if fragment.metadata else ""
+
+            if "repeat_elem_" in array_col_raw or ("repeat_elem_" in (fragment.expression or "")):
+                # This fragment is trying to use an internal repeat variable
+                # We need to fix it to use the result column from the repeat CTE
+                import re
+
+                # Try to extract the path from array_column first
+                path_match = re.search(r"'(\$\.\\[^']+)'", array_col_raw) if array_col_raw else None
+
+                # If not found in array_column, try the expression
+                if not path_match and fragment.expression:
+                    # Check for json_extract pattern
+                    expr_match = re.search(r'json_extract_\w+\(([^,]+),\s*[\'"](\$\.\\[^\'"]+)[\'"]', fragment.expression)
+                    if expr_match:
+                        # Found the path in the expression
+                        path_part = expr_match.group(2)
+                        # Create new extraction using the repeat CTE's result column
+                        fixed_array_column = f"json_extract({previous_cte}.result, '{path_part}')"
+                        # Update the fragment metadata
+                        if not fragment.metadata:
+                            fragment.metadata = {}
+                        fragment.metadata["array_column"] = fixed_array_column
+                        # Also update the expression
+                        fragment.expression = fixed_array_column
+                        is_repeat_navigation = True
+
+        if fragment.requires_unnest and fragment.metadata.get('from_repeat_result'):
+            # The fragment should already have the correct array_column from visit_identifier
+            # But we need to resolve any markers in the array_column or expression
+            MARKER_REPEAT_RESULT = ":repeat_result_cte:"
+
+            if not fragment.metadata:
+                fragment.metadata = {}
+
+            array_col = fragment.metadata.get("array_column", "")
+            if MARKER_REPEAT_RESULT in array_col:
+                # Replace marker with actual source_table (which is now resolved to previous_cte)
+                fixed_array_col = array_col.replace(MARKER_REPEAT_RESULT, source_table)
+                fragment.metadata["array_column"] = fixed_array_col
+                logger.info(f"SP-110-CTE: Resolved marker in array_column: {array_col} -> {fixed_array_col}")
+
+            if fragment.expression and MARKER_REPEAT_RESULT in fragment.expression:
+                fixed_expr = fragment.expression.replace(MARKER_REPEAT_RESULT, source_table)
+                fragment.expression = fixed_expr
+                logger.info(f"SP-110-CTE: Resolved marker in expression")
+
+            logger.info(
+                f"SP-110-CTE: Wrapping repeat_result fragment. "
+                f"array_column={fragment.metadata.get('array_column')}, source_table={source_table}"
+            )
+            is_repeat_navigation = True
 
         if fragment.requires_unnest:
             query, order_column = self._wrap_unnest_query(
@@ -1079,12 +1153,16 @@ class CTEManager:
                 # The expression is a complete RECURSIVE CTE, use it as a subquery
                 # Extract the repeat_elem_N column for subsequent operations
                 columns.append(f"{expression} AS {result_alias}")
-                # Also add the repeat_elem_N column directly if this is the first time
-                # This allows subsequent UNNEST operations to access the elements
-                # The subquery returns a JSON array, so we need to extract elements
-                # For now, just add the result column - the UNNEST will handle the array
+                # SP-110 FIX: For repeat() results, we also need to expose the array elements
+                # for subsequent UNNEST operations. The result column contains a JSON array,
+                # and subsequent operations like .code need to UNNEST this array first.
+                # We add a marker in metadata to indicate this is a repeat() result.
+                if not fragment.metadata:
+                    fragment.metadata = {}
+                fragment.metadata['is_repeat_result'] = True
+                fragment.metadata['repeat_result_column'] = result_alias
                 logger.info(
-                    f"SP-110-006: Wrapped repeat() expression as subquery with result alias '{result_alias}'"
+                    f"SP-110-006: Wrapped repeat() expression as subquery with result alias '{result_alias}', marked as repeat_result"
                 )
             else:
                 columns.append(f"{expression} AS {result_alias}")
@@ -1323,6 +1401,13 @@ class CTEManager:
 
         array_column = array_column_raw.strip()
         result_alias = (metadata.get("result_alias") or "item").strip()
+
+        # SP-110 DEBUG: Log array_column for debugging repeat() issues
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"SP-110-CTE: _wrap_unnest_query array_column={array_column}, source={source}, result_alias={result_alias}")
+        if metadata.get('from_repeat_result'):
+            logger.info(f"SP-110-CTE: This is a repeat_result fragment, array_column from metadata={array_column}")
         if not result_alias:
             raise ValueError("result_alias metadata cannot be empty when provided")
 
@@ -1680,15 +1765,38 @@ class CTEManager:
         else:
             source_cte = final_cte
 
-        # Create aggregation CTE
+        # SP-110-Round7: Fix empty()/exists() to return correct result for empty collections
+        # When the source CTE has 0 rows (empty collection), regular aggregation produces 0 rows.
+        # Use LEFT JOIN from resource table to ensure we always get 1 row per resource.
+        # For empty()/exists(): COUNT(source_cte.id) on empty LEFT JOIN is 0 (all columns from source_cte are NULL)
         agg_cte_name = f"cte_{len(ctes) + 1}_agg"
-        agg_query = (
-            f"SELECT {source_cte.name}.id, "
-            f"{source_cte.name}.resource, "
-            f"{agg_expr} AS result\n"
-            f"FROM {source_cte.name}\n"
-            f"GROUP BY {source_cte.name}.id, {source_cte.name}.resource"
-        )
+
+        # Check if function_name is empty() or exists() to determine if we need LEFT JOIN
+        # Both functions need to return a boolean result even when the collection is empty
+        if function_name in ("empty", "exists"):
+            # Use LEFT JOIN to handle empty collections (0 rows in source_cte)
+            # When source_cte is empty, LEFT JOIN produces 1 row with NULL values for all source_cte columns
+            # COUNT(source_cte.id) only counts non-null values, so it returns 0 correctly
+            # Note: We use COUNT({source_cte.name}.id) instead of COUNT(*) because COUNT(*) counts rows
+            # For empty(): agg_expr is "(COUNT(*) = 0)", for exists(): "(COUNT(*) > 0)"
+            # We replace COUNT(*) with COUNT(source_cte.id) to count only non-null values
+            count_expr = agg_expr.replace("COUNT(*)", f"COUNT({source_cte.name}.id)")
+            agg_query = (
+                f"SELECT resource.id, resource.resource, "
+                f"{count_expr} AS result\n"
+                f"FROM resource\n"
+                f"LEFT JOIN {source_cte.name} ON resource.id = {source_cte.name}.id\n"
+                f"GROUP BY resource.id, resource.resource"
+            )
+        else:
+            # Original behavior for other aggregate functions
+            agg_query = (
+                f"SELECT {source_cte.name}.id, "
+                f"{source_cte.name}.resource, "
+                f"{agg_expr} AS result\n"
+                f"FROM {source_cte.name}\n"
+                f"GROUP BY {source_cte.name}.id, {source_cte.name}.resource"
+            )
 
         # Determine result type
         result_type = "boolean" if comparison_op else final_cte.metadata.get("result_type", "integer")
