@@ -920,8 +920,14 @@ class DuckDBDialect(DatabaseDialect):
         return f"json_array(to_json({expression}))"
 
     def serialize_json_value(self, expression: str) -> str:
-        """Serialize JSON value to canonical text preserving type semantics."""
-        return f"CAST({expression} AS VARCHAR)"
+        """Serialize JSON value to canonical text preserving type semantics.
+
+        SP-110-001: Use ->> operator for proper JSON text extraction instead of CAST.
+        CAST(... AS VARCHAR) doesn't properly handle JSON values - it can create invalid
+        JSON when the value is already a JSON string. The ->> operator extracts the
+        text content from JSON values properly, ensuring comparisons work correctly.
+        """
+        return f"({expression} ->> '$')"
 
     def empty_json_array(self) -> str:
         """Return DuckDB empty JSON array literal."""

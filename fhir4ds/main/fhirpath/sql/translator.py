@@ -1846,6 +1846,38 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 is_aggregate=False
             )
 
+        # SP-110-001: Handle FHIRPath terminology system prefixes (e.g., %sct, %loinc, %ucum)
+        # These prefixes expand to their corresponding terminology system URLs
+        if identifier_value.startswith('%'):
+            system_name = identifier_value[1:].strip()  # Remove the % prefix
+            # Map common terminology system prefixes to their URLs
+            terminology_urls = {
+                'sct': 'http://snomed.info/sct',
+                'snomed': 'http://snomed.info/sct',
+                'loinc': 'http://loinc.org',
+                'ucum': 'http://unitsofmeasure.org',
+            }
+            # Check for known system
+            if system_name in terminology_urls:
+                url = terminology_urls[system_name]
+                logger.debug(f"Terminology prefix {identifier_value} -> {url}")
+                return SQLFragment(
+                    expression=f"'{url}'",
+                    source_table=self.context.current_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    metadata={"literal_type": "string", "is_literal": True}
+                )
+            # For unknown prefixes, keep them as-is (they might be custom systems)
+            # The identifier_value itself (e.g., %sct) will be used as a literal
+            return SQLFragment(
+                expression=f"'{identifier_value}'",
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                metadata={"literal_type": "string", "is_literal": True}
+            )
+
         # Split compound identifiers (e.g., "Patient.name.family", "$this.given") into components
         components = [part.strip().strip('`') for part in identifier_value.split('.') if part.strip()]
 
@@ -2275,6 +2307,47 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         Overrides ASTVisitor.visit_generic.
         """
         logger.debug(f"Visiting generic node: {type(node).__name__}")
+
+        # SP-110-001: Handle terminology system prefixes (e.g., %sct, %loinc)
+        # These appear as TermExpression with text like '%sct'
+        if hasattr(node, 'node_type') and node.node_type == 'TermExpression':
+            text = getattr(node, 'text', '')
+            if text and text.startswith('%'):
+                system_name = text[1:].strip()  # Remove the % prefix
+                # Map common terminology system prefixes to their URLs
+                terminology_urls = {
+                    'sct': 'http://snomed.info/sct',
+                    'snomed': 'http://snomed.info/sct',
+                    'loinc': 'http://loinc.org',
+                    'ucum': 'http://unitsofmeasure.org',
+                }
+                # Check for known system
+                if system_name in terminology_urls:
+                    url = terminology_urls[system_name]
+                    logger.debug(f"Terminology prefix {text} -> {url}")
+                    return SQLFragment(
+                        expression=f"'{url}'",
+                        source_table=self.context.current_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        metadata={"literal_type": "string", "is_literal": True}
+                    )
+                # For unknown prefixes, keep them as-is (they might be custom systems)
+                return SQLFragment(
+                    expression=f"'{text}'",
+                    source_table=self.context.current_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    metadata={"literal_type": "string", "is_literal": True}
+                )
+
+        # SP-110-001: Handle MembershipExpression for 'in' operator
+        # The expression 'a in (b|c)' is parsed as MembershipExpression with two children:
+        # - Child 0: the value to check (e.g., 'a')
+        # - Child 1: the collection to check in (e.g., 'b'|'c')
+        # This should be translated as: collection contains value
+        if hasattr(node, 'node_type') and node.node_type == 'MembershipExpression':
+            return self._translate_membership_expression(node)
 
         # If it's an EnhancedASTNode (or similar), visit children
         if hasattr(node, 'children'):
@@ -3039,6 +3112,53 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             metadata=fragment_metadata
         )
 
+    def _convert_to_boolean(self, expr: str, literal_type: Optional[str] = None) -> str:
+        """Convert any expression to boolean using FHIRPath truthiness rules.
+
+        FHIRPath ToBoolean() semantics:
+        - Boolean: the value itself
+        - Integer/Decimal: false if 0, true otherwise
+        - String: false if empty, true otherwise
+        - NULL (empty collection): false
+
+        Args:
+            expr: SQL expression to convert to boolean
+            literal_type: The literal type if known (boolean, integer, decimal, string)
+
+        Returns:
+            SQL expression that evaluates to TRUE/FALSE based on truthiness
+
+        Example:
+            >>> self._convert_to_boolean("'foo'", "string")
+            "CASE WHEN 'foo' IS NULL THEN FALSE WHEN LENGTH('foo') > 0 THEN TRUE ELSE FALSE END"
+
+            >>> self._convert_to_boolean("TRUE", "boolean")
+            "TRUE"
+        """
+        if literal_type == "boolean":
+            # Boolean expressions are already boolean
+            return expr
+        elif literal_type == "integer" or literal_type == "decimal":
+            # Numbers: 0 is false, non-zero is true
+            return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN CAST({expr} AS DOUBLE) <> 0 THEN TRUE ELSE FALSE END"
+        elif literal_type == "string":
+            # Strings: empty is false, non-empty is true
+            return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN LENGTH(TRIM({expr})) > 0 THEN TRUE ELSE FALSE END"
+        else:
+            # Unknown type - try to infer from expression
+            # If it's already TRUE/FALSE, use as-is
+            expr_upper = str(expr).strip().upper()
+            if expr_upper in ("TRUE", "FALSE"):
+                return expr
+            # If it's a string literal (single-quoted), check length
+            if expr.startswith("'") and expr.endswith("'"):
+                return f"CASE WHEN LENGTH(TRIM({expr})) > 0 THEN TRUE ELSE FALSE END"
+            # If it's a number literal (no quotes, all digits or decimal)
+            if expr.replace(".", "", 1).replace("-", "", 1).isdigit():
+                return f"CASE WHEN CAST({expr} AS DOUBLE) <> 0 THEN TRUE ELSE FALSE END"
+            # Default: try to cast and check non-zero
+            return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN COALESCE(CAST({expr} AS BOOLEAN), FALSE) THEN TRUE ELSE FALSE END"
+
     def _build_implies_sql(
         self,
         left_sql: str,
@@ -3463,11 +3583,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         # true AND {} = {} (empty result)
                         sql_expr = "NULL"
                     else:
-                        # Standard AND: use dialect method
+                        # Standard AND: convert operands to boolean and combine
+                        # FHIRPath truthiness: strings, numbers, etc. must be converted to boolean
+                        left_literal_type = left_metadata.get("literal_type")
+                        right_literal_type = right_metadata.get("literal_type")
+
+                        # Only convert non-boolean literals to boolean
+                        left_bool = left_fragment.expression
+                        right_bool = right_fragment.expression
+
+                        if left_literal_type and left_literal_type != "boolean":
+                            left_bool = self._convert_to_boolean(left_fragment.expression, left_literal_type)
+                        if right_literal_type and right_literal_type != "boolean":
+                            right_bool = self._convert_to_boolean(right_fragment.expression, right_literal_type)
+
                         sql_expr = self.dialect.generate_logical_combine(
-                            left_fragment.expression,
+                            left_bool,
                             sql_operator,
-                            right_fragment.expression
+                            right_bool
                         )
                 else:  # operator_lower == "or"
                     # OR operator: true OR anything = true
@@ -3517,11 +3650,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         # false OR {} = {} (empty result)
                         sql_expr = "NULL"
                     else:
-                        # Standard OR: use dialect method
+                        # Standard OR: convert operands to boolean and combine
+                        # FHIRPath truthiness: strings, numbers, etc. must be converted to boolean
+                        left_literal_type = left_metadata.get("literal_type")
+                        right_literal_type = right_metadata.get("literal_type")
+
+                        # Only convert non-boolean literals to boolean
+                        left_bool = left_fragment.expression
+                        right_bool = right_fragment.expression
+
+                        if left_literal_type and left_literal_type != "boolean":
+                            left_bool = self._convert_to_boolean(left_fragment.expression, left_literal_type)
+                        if right_literal_type and right_literal_type != "boolean":
+                            right_bool = self._convert_to_boolean(right_fragment.expression, right_literal_type)
+
                         sql_expr = self.dialect.generate_logical_combine(
-                            left_fragment.expression,
+                            left_bool,
                             sql_operator,
-                            right_fragment.expression
+                            right_bool
                         )
             elif node.operator_type == "logical" and operator_lower == "xor":
                 # SP-100-009: XOR operator with empty collection semantics
@@ -3666,18 +3812,29 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # string literal, we need to cast to numeric type first to ensure proper
                     # type validation. If the string literal is not a valid number, this will
                     # cause a SQL execution error as expected by FHIRPath semantics.
+                    #
+                    # SP-110-011: Don't apply numeric cast when in lambda context (select(), where(), etc.)
+                    # When inside a lambda, the current_table points to enum_table.value which contains
+                    # the actual JSON element, and we should determine the type from the content,
+                    # not from the field name pattern. For example, telecom.value is a string,
+                    # not a numeric type.
+
+                    # Check if we're in a lambda context (current_table starts with "enum_table")
+                    is_in_lambda_context = self.context.current_table.startswith("enum_table")
 
                     # Check if left is JSON numeric value and right is string literal
                     if (left_is_json and right_is_literal and
                         right_literal_type == "string" and
-                        left_metadata.get("source_path", "").endswith(".value")):
+                        left_metadata.get("source_path", "").endswith(".value") and
+                        not is_in_lambda_context):
                         # Try strict cast to DECIMAL - will error if right is not numeric
                         left_expr = self.dialect.strict_cast_to_decimal(left_expr)
 
                     # Check if right is JSON numeric value and left is string literal
                     elif (right_is_json and left_is_literal and
                           left_literal_type == "string" and
-                          right_metadata.get("source_path", "").endswith(".value")):
+                          right_metadata.get("source_path", "").endswith(".value") and
+                          not is_in_lambda_context):
                         # Try strict cast to DECIMAL - will error if left is not numeric
                         right_expr = self.dialect.strict_cast_to_decimal(right_expr)
 
@@ -8441,13 +8598,39 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         try:
             if literal_value is not None:
                 result = self._evaluate_literal_to_quantity(literal_value)
-                sql_expr = self._to_sql_literal(result, "string") if result else "NULL"
-                return SQLFragment(
-                    expression=sql_expr,
-                    source_table=source_table,
-                    requires_unnest=False,
-                    is_aggregate=False
-                )
+                if result:
+                    sql_expr = self._to_sql_literal(result, "string")
+                    # SP-110-XXX: Parse the quantity JSON to extract value and unit for metadata
+                    # This enables proper quantity comparisons (e.g., '1 day'.toQuantity() = 1 day)
+                    metadata = {'is_literal': True}
+                    try:
+                        import json
+                        quantity_data = json.loads(result)
+                        quantity_value = quantity_data.get('value')
+                        quantity_unit = quantity_data.get('unit')
+                        if quantity_value is not None:
+                            metadata['literal_type'] = 'quantity'
+                            metadata['quantity_value'] = str(quantity_value)
+                            if quantity_unit:
+                                normalized_unit = self._normalize_quantity_unit(quantity_unit)
+                                metadata['quantity_unit'] = normalized_unit if normalized_unit else quantity_unit
+                    except (json.JSONDecodeError, TypeError):
+                        # If we can't parse as JSON, just return without quantity metadata
+                        pass
+                    return SQLFragment(
+                        expression=sql_expr,
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        metadata=metadata
+                    )
+                else:
+                    return SQLFragment(
+                        expression="NULL",
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False
+                    )
 
             if not value_expr:
                 raise ValueError("toQuantity() requires a resolvable target expression")
@@ -9447,64 +9630,45 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         child = node.children[0]
 
-        # SP-110-006: Special handling for polarity + invocation on numeric literal
-        # FHIRPath spec treats -1.convertsToInteger() as (-1).convertsToInteger()
-        # Even though the grammar parses it as -(1.convertsToInteger())
-        # We need to detect when the child is an invocation on a numeric literal
-        # and negate the literal BEFORE the function is called
-        if operator == '-' and hasattr(child, 'node_type') and child.node_type == 'InvocationExpression':
-            # Check if this is an invocation of a numeric literal
-            if hasattr(child, 'children') and len(child.children) >= 2:
-                # First child should be the target (the literal)
-                target = child.children[0]
-                # Walk down to find the actual literal node
-                literal_node = None
-                if hasattr(target, 'node_type') and target.node_type == 'TermExpression':
-                    if hasattr(target, 'children') and target.children:
-                        for grandchild in target.children:
-                            if hasattr(grandchild, 'node_type') and grandchild.node_type == 'literal':
-                                literal_node = grandchild
-                                break
+        # SP-110-R3: Special handling for polarity before invocation on literal
+        # In FHIRPath, -1.convertsToInteger() should return -1, not error
+        # But the grammar parses it as -(1.convertsToInteger()) which would try to negate the boolean result
+        # Solution: Detect when child is invocation on a literal, modify the literal text, then visit normally
+        if (operator == '-' and
+            hasattr(child, 'node_type') and
+            child.node_type == 'InvocationExpression' and
+            len(child.children) > 0):
+            # Check if the invocation target is a TermExpression with a literal
+            target = child.children[0]
+            if (hasattr(target, 'node_type') and
+                target.node_type == 'TermExpression' and
+                len(target.children) > 0):
+                term_child = target.children[0]
+                # Handle both 'literal' and 'LiteralExpression' node types
+                if (hasattr(term_child, 'node_type') and
+                    term_child.node_type in ('literal', 'LiteralExpression') and
+                    hasattr(term_child, 'text')):
+                    # Check if this is a numeric literal (starts with digit)
+                    literal_text = term_child.text
+                    if literal_text and literal_text[0].isdigit():
+                        # Modify the literal text to include the minus sign
+                        # This way when the invocation is visited, it sees -1 instead of 1
+                        original_text = term_child.text
+                        term_child.text = f"-{literal_text}"
 
-                if literal_node is not None:
-                    # Check if it's a numeric literal using text-based detection
-                    # The EnhancedASTNode may not have literal_type set, so we use text analysis
-                    literal_text = getattr(literal_node, 'text', None)
-                    if literal_text and self._is_numeric_literal(literal_text):
-                        # This is -1.convertsToInteger() pattern
-                        # We need to negate the literal value and re-translate the invocation
-                        logger.debug(f"SP-110-006: Detected polarity on invocation with numeric literal '{literal_text}', negating literal first")
+                        # Also need to update the invocation's text for consistency
+                        if hasattr(child, 'text'):
+                            child.text = f"-{child.text}"
 
-                        # Negate the literal value by updating text
-                        # Parse the numeric value
-                        try:
-                            if '.' in literal_text or 'e' in literal_text.lower():
-                                negated_value = -float(literal_text)
-                            else:
-                                negated_value = -int(literal_text)
+                        # Now visit the child - it will see the negated literal
+                        result = self.visit(child)
 
-                            # Update text representation with negated value
-                            literal_node.text = str(negated_value)
+                        # Restore original text (optional, since node is discarded)
+                        term_child.text = original_text
 
-                            # Update pending_literal_value so the function uses the negated value
-                            if self.context.pending_literal_value is not None:
-                                old_value, old_expr = self.context.pending_literal_value
-                                self.context.pending_literal_value = (negated_value, str(negated_value))
-
-                            # Now visit the child (the invocation) with the negated literal
-                            child_fragment = self.visit(child)
-
-                            # The invocation result should be treated as if we called the function on a negative literal
-                            return child_fragment
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"SP-110-006: Failed to negate literal '{literal_text}': {e}")
-                            # Fall through to default handling
+                        return result
 
         # Visit the child expression to get the operand
-        # CRITICAL: In FHIRPath grammar, -1.convertsToInteger() parses as -(1.convertsToInteger())
-        # NOT as (-1).convertsToInteger()
-        # The InvocationExpression has LOWER precedence than PolarityExpression in the grammar
-        # So we must visit the child first, then apply the polarity operator
         child_fragment = self.visit(child)
 
         if operator == '-':
@@ -11741,15 +11905,20 @@ END
         # for the target expression. If so, we should use the last fragment's source_table.
         # If not, we use the current context's table.
 
+        # SP-110-010: Check if there are UNNEST fragments that need special handling
+        # When there's a previous UNNEST, we need to enumerate from the _item column
+        unnest_fragments = [f for f in self.fragments if f.requires_unnest]
+        has_unnest_fragments = len(unnest_fragments) > 0
+
         # Check the current context AFTER _resolve_function_target has processed the target
         current_table_after_target = self.context.current_table
 
-        # Also check if there are fragments with a non-resource source_table
-        non_resource_fragments = [f for f in self.fragments if f.source_table and f.source_table not in ("resource", "patient_resources")]
-
-        if non_resource_fragments:
-            # Use the most recent fragment's source_table (likely a CTE)
-            source_table = non_resource_fragments[-1].source_table
+        # SP-110-010: If there are UNNEST fragments, the source_table should be the CTE marker
+        # because we'll be enumerating from the _item column of the previous UNNEST CTE
+        if has_unnest_fragments:
+            # Use <<SOURCE_TABLE>> marker - the CTE builder will substitute it with the actual CTE name
+            # and we'll enumerate from the _item column in the LATERAL clause
+            source_table = "<<SOURCE_TABLE>>"
         elif current_table_after_target and current_table_after_target not in ("resource", "patient_resources"):
             # Context has been updated to a CTE
             source_table = current_table_after_target
@@ -11770,6 +11939,64 @@ END
         old_table = source_table
         old_path = self.context.parent_path.copy()
 
+        # SP-109-004: Determine what to enumerate for select()
+        # If there's a subset_filter (take/first/last/skip/where), the data is in the 'result' column
+        # Otherwise, extract from JSON path or use the table directly
+
+        # Also check if there's a subset_filter in recent fragments (indicating take/first/last/where)
+        has_subset_filter = any(
+            f.metadata.get("subset_filter") or f.metadata.get("function") in ["take", "first", "last", "skip", "where"]
+            for f in self.fragments
+        )
+
+        # Get the array source expression for enumeration
+        # SP-110-010: Use <<SOURCE_TABLE>> marker consistently for proper CTE substitution
+        # This must be calculated BEFORE lateral_clause is generated
+
+        # SP-110-FUNCTION: Check if there's a pending UNNEST fragment that will create a CTE
+        # If so, select() should enumerate from that CTE's result column after unnesting
+        pending_unnest_fragment = None
+        if self.fragments and self.fragments[-1].requires_unnest:
+            pending_unnest_fragment = self.fragments[-1]
+
+        # SP-110-FUNCTION: Check if source is a CTE with a result column to enumerate
+        # This happens when select() is called after an aggregation like take(), first(), etc.
+        # We only enumerate from items if the source is a CTE that was already built
+        has_cte_result = source_table.startswith("cte_") and any(
+            f.source_table == source_table and f.metadata.get("function") in ["take", "first", "last", "skip", "where"]
+            for f in self.fragments
+        )
+        enumerate_from_items = has_subset_filter or has_cte_result
+
+        if has_subset_filter:
+            # After a subset filter, data is in the 'result' column
+            array_source_expr = "<<SOURCE_TABLE>>.result"
+        elif pending_unnest_fragment:
+            # There's a pending UNNEST fragment that will create a CTE with unnested rows
+            # select() needs to enumerate from the array column before UNNEST
+            # Use the array_column from the fragment metadata
+            array_column = pending_unnest_fragment.metadata.get("array_column", "")
+            if array_column:
+                # Extract the array from the source table using the array_column expression
+                # The array_column is like "json_extract(resource, '$.telecom[*]')"
+                # We need to replace the table name with <<SOURCE_TABLE>>
+                array_source_expr = array_column.replace(source_table, "<<SOURCE_TABLE>>", 1)
+            else:
+                # Fallback to JSON path extraction
+                array_source_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
+        elif source_table.startswith("cte_"):
+            # Source is a CTE from aggregate - check if we have a result column to enumerate
+            # The result column contains the aggregated JSON array from select()
+            array_source_expr = "<<SOURCE_TABLE>>.result"
+        elif array_path and array_path != "$":
+            # Original resource table - extract from JSON path
+            array_source_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
+        else:
+            # Root level table - use table directly
+            array_source_expr = "<<SOURCE_TABLE>>"
+
+        logger.debug(f"Array source expression for select(): {array_source_expr}, enumerate_from_items: {enumerate_from_items}")
+
         # SP-110 Phase 2: Update context to reference array elements for projection expression translation
         # Use 'value' as the element alias (from json_each/jsonb_array_elements)
         # This matches what the LATERAL clause actually produces
@@ -11785,9 +12012,36 @@ END
             path=array_path if array_path and array_path != "$" else None
         )
 
-        # For $index support, we need to use enumerate_json_array instead of simple unnest
-        # Define aliases for index and value
-        index_binding_alias = f"{array_alias}_idx"
+        # SP-110-FUNCTION: When enumerating from CTE result (subset filter),
+        # we need to handle the case where the result is already an array
+        if enumerate_from_items:
+            # The source is a CTE with a result column that's already an array
+            # We still need LATERAL json_each to enumerate it
+            lateral_clause = self.dialect.generate_lateral_json_enumeration(array_source_expr, "enum_table", "value", "key")
+
+            # Set index column and binding expression based on dialect
+            if self.dialect.name == "POSTGRESQL":
+                # PostgreSQL uses ordinality (1-based), need to convert to 0-based
+                index_col = "(enum_table.ordinality - 1)"
+                index_binding_expr = "(enum_table.ordinality - 1)"
+            else:
+                # DuckDB and others use key column directly (0-based)
+                index_col = "enum_table.key"
+                index_binding_expr = "enum_table.key"
+        else:
+            # Build LATERAL UNNEST clause for array enumeration
+            # SP-110-010: Keep <<SOURCE_TABLE>> marker in lateral clause for CTE builder substitution
+            lateral_clause = self.dialect.generate_lateral_json_enumeration(array_source_expr, "enum_table", "value", "key")
+
+            # Set index column and binding expression based on dialect
+            if self.dialect.name == "POSTGRESQL":
+                # PostgreSQL uses ordinality (1-based), need to convert to 0-based
+                index_col = "(enum_table.ordinality - 1)"
+                index_binding_expr = "(enum_table.ordinality - 1)"
+            else:
+                # DuckDB and others use key column directly (0-based)
+                index_col = "enum_table.key"
+                index_binding_expr = "enum_table.key"
 
         with self._variable_scope({
             "$this": VariableBinding(
@@ -11795,8 +12049,8 @@ END
                 source_table=element_alias
             ),
             "$index": VariableBinding(
-                expression=index_binding_alias,
-                source_table=element_alias
+                expression=index_binding_expr,
+                source_table="enum_table"
             ),
             "$total": VariableBinding(
                 expression=total_expr,
@@ -11804,7 +12058,18 @@ END
                 dependencies=[old_table]
             )
         }):
+            # SP-110-010: Save fragments count to prevent intermediate fragments from projection
+            # from becoming separate CTEs. The projection expression should be inlined in the select().
+            fragments_before_projection = len(self.fragments)
             projection_fragment = self.visit(node.arguments[0])
+            # Remove any fragments added during projection translation - they should be inlined
+            fragments_after_projection = len(self.fragments)
+            if fragments_after_projection > fragments_before_projection:
+                # Pop the intermediate fragments that were added during projection
+                # These will be inlined in the select() SQL instead
+                intermediate_fragments = self.fragments[fragments_before_projection:]
+                self.fragments = self.fragments[:fragments_before_projection]
+                logger.debug(f"SP-110-010: Removed {len(intermediate_fragments)} intermediate fragments from projection")
 
         logger.debug(f"Projection expression SQL: {projection_fragment.expression}")
 
@@ -11813,91 +12078,21 @@ END
         # Clear parent_path so count() won't try to extract from a JSON path.
         self.context.parent_path.clear()
 
-        # SP-109-004: Determine what to enumerate for select()
-        # If there's a subset_filter (take/first/last/skip/where), the data is in the 'result' column
-        # Otherwise, extract from JSON path or use the table directly
-
-        # Also check if there's a subset_filter in recent fragments (indicating take/first/last/where)
-        has_subset_filter = any(
-            f.metadata.get("subset_filter") or f.metadata.get("function") in ["take", "first", "last", "skip", "where"]
-            for f in self.fragments
-        )
-
-        if has_subset_filter:
-            # After a subset filter, data is in the 'result' column
-            array_expr = "<<SOURCE_TABLE>>.result"
-        elif array_path and array_path != "$":
-            # Original resource table - extract from JSON path
-            array_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
-        else:
-            # Root level table - use table directly
-            array_expr = "<<SOURCE_TABLE>>"
-
-        # SP-110 Phase 2: Fix select() to use proper LATERAL UNNEST syntax
-        # The enumerate_json_array returns a SELECT, but we need to use it as a table function
-        # Instead of LATERAL (SELECT...), we need LATERAL ... AS alias
-        # For DuckDB: LATERAL json_each(...) AS enum(key, value)
-        # For PostgreSQL: LATERAL jsonb_array_elements(...) WITH ORDINALITY AS enum(value, ordinality)
-
-        # Get the array source expression for enumeration
-        # SP-110 Phase 2: If the source_table is a CTE (not 'resource'), we should enumerate
-        # from the result column if it contains JSON array data, or from the _item column
-        if has_subset_filter:
-            # After a subset filter, data is in the 'result' column
-            array_source_expr = "<<SOURCE_TABLE>>.result"
-        elif source_table.startswith("cte_"):
-            # Source is a CTE - check if we have an _item column to enumerate
-            # The _item column contains the JSON element from the previous UNNEST
-            # For select(), we need to enumerate from that column
-            array_source_expr = "<<SOURCE_TABLE>>.result"
-        elif array_path and array_path != "$":
-            # Original resource table - extract from JSON path
-            array_source_expr = self.dialect.extract_json_object("<<SOURCE_TABLE>>", array_path)
-        else:
-            # Root level table - use table directly
-            array_source_expr = "<<SOURCE_TABLE>>"
-
-        logger.debug(f"Array source expression for select(): {array_source_expr}")
-
         # SP-110 Phase 2: Generate database-specific JSON array aggregation
         # Need to order by index to preserve array order
         # SP-108-003: Wrap projection in to_json() to handle scalar values correctly
         # When projection extracts strings (via json_extract_string), they're VARCHAR type
         # to_json() converts them to JSON format (e.g., "Chalmers" -> "\"Chalmers\"")
 
-        # Build LATERAL UNNEST clause using dialect polymorphic method
-        # CRITICAL FIX: Use old_table directly in the lateral clause, not <<SOURCE_TABLE>>
-        # This prevents circular reference where select() returns source_table=cte_name
-        # but the SQL uses <<SOURCE_TABLE>> which gets replaced with cte_name
-        lateral_clause_source = array_source_expr.replace("<<SOURCE_TABLE>>", old_table)
-        lateral_clause = self.dialect.generate_lateral_json_enumeration(lateral_clause_source, "enum_table", "value", "key")
-
-        # Set index column and binding expression based on dialect
-        if self.dialect.name == "POSTGRESQL":
-            # PostgreSQL uses ordinality (1-based), need to convert to 0-based
-            index_col = "(enum_table.ordinality - 1)"
-            index_binding_expr = "(enum_table.ordinality - 1)"
-        else:
-            # DuckDB and others use key column directly (0-based)
-            index_col = "enum_table.key"
-            index_binding_expr = "enum_table.key"
-
-        # Update the $index binding to reference the correct column
-        self.context.bind_variable("$index", VariableBinding(
-            expression=index_binding_expr,
-            source_table="enum_table"
-        ))
-
         aggregate_expr = self.dialect.aggregate_to_json_array(f"to_json({projection_fragment.expression}) ORDER BY {index_col}")
 
-        # Construct complete SQL fragment with SELECT, FROM, LATERAL enumeration, GROUP BY
-        # CRITICAL FIX: Use old_table directly, not <<SOURCE_TABLE>>, to avoid circular reference
-        # When select() returns source_table=cte_name, using <<SOURCE_TABLE>> would cause
-        # CTEManager to substitute it with cte_name, creating "FROM cte_1, ... cte_1" (self-reference)
-        sql = f"""SELECT {old_table}.id, {old_table}.resource,
+        # SP-110-010: Use <<SOURCE_TABLE>> marker for proper CTE substitution
+        # The CTE builder will replace <<SOURCE_TABLE>> with the actual source CTE name
+        # This fixes the issue where select() was using 'resource' instead of the proper CTE
+        sql = f"""SELECT <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource,
        {aggregate_expr} as result
-FROM {old_table}, {lateral_clause}
-GROUP BY {old_table}.id, {old_table}.resource"""
+FROM <<SOURCE_TABLE>>, {lateral_clause}
+GROUP BY <<SOURCE_TABLE>>.id, <<SOURCE_TABLE>>.resource"""
 
         logger.debug(f"Complete select() SQL fragment generated: {sql}")
 
@@ -11907,6 +12102,14 @@ GROUP BY {old_table}.id, {old_table}.resource"""
         # SP-109-004: Restore context from snapshot to maintain proper CTE chaining
         # This is needed for proper CTE chain management
         self._restore_context(snapshot)
+
+        # SP-110-010: Determine correct dependencies for select()
+        # If old_table is a CTE (starts with cte_), depend on it
+        # Otherwise, depend on the original source from context
+        if old_table.startswith("cte_"):
+            select_dependencies = [old_table]
+        else:
+            select_dependencies = list(dict.fromkeys(dependencies))
 
         # Return SQL fragment with metadata
         # SP-022-019: Set requires_unnest=False since select() generates a complete
@@ -11918,7 +12121,7 @@ GROUP BY {old_table}.id, {old_table}.resource"""
             source_table=cte_name,
             requires_unnest=False,  # Complete SELECT statement, no additional UNNEST needed
             is_aggregate=True,      # Flag that this involves aggregation
-            dependencies=[old_table],  # Track dependency on source table
+            dependencies=select_dependencies,  # SP-110-010: Proper dependency tracking
             metadata={"function": "select"}  # SP-110-003: Mark as select result for allTrue()/anyTrue() detection
         )
 
@@ -12506,7 +12709,10 @@ END"""
         According to FHIRPath spec, not() on collections:
         - Empty collection → Empty collection (NULL)
         - Single boolean → Negated boolean
-        - Multiple values → Raises error (per official test suite)
+        - Multiple values → Implicitly apply exists() first, then negate (SP-110-011)
+
+        SP-110-011: Multi-item collections use implicit exists() semantics.
+        For example, (1|2).not() is equivalent to (1|2).exists().not().
 
         Args:
             prev_fragment: The previous SQLFragment to check
@@ -12514,10 +12720,7 @@ END"""
             dependencies: List of dependencies for the SQL fragment
 
         Returns:
-            SQLFragment with NULL expression if input is empty collection, None otherwise
-
-        Raises:
-            FHIRPathTranslationError: If input is a multi-item collection (e.g., union)
+            SQLFragment with appropriate expression, None if not a collection case
         """
         prev_metadata = prev_fragment.metadata or {}
         is_collection = prev_metadata.get('is_collection') is True
@@ -12537,13 +12740,23 @@ END"""
             )
 
         if is_collection:
-            # Check if this is a multi-item collection (union operation)
-            # According to official FHIRPath tests, not() on multi-item collections should fail
+            # SP-110-011: Multi-item collections use implicit exists() semantics
             if operator == 'union':
-                raise FHIRPathTranslationError(
-                    f"Cannot apply not() function to a multi-item collection. "
-                    f"The not() function requires a single boolean value or empty collection, "
-                    f"but got a collection with multiple values (e.g., from a union operation)."
+                logger.debug("SP-110-011: not() on multi-item collection using implicit exists()")
+                # Apply implicit exists() check: if collection has items, it's true
+                # Then negate: true -> false, false -> true
+                # For (1|2).not(): collection is non-empty -> exists() = true -> not() = false
+                value_expr = prev_fragment.expression
+                exists_sql = f"CASE WHEN {value_expr} IS NOT NULL THEN TRUE ELSE FALSE END"
+                not_sql = self.dialect.generate_boolean_not(exists_sql)
+
+                return SQLFragment(
+                    expression=not_sql,
+                    source_table=source_table,
+                    requires_unnest=prev_fragment.requires_unnest,
+                    is_aggregate=False,
+                    dependencies=list(dict.fromkeys(dependencies)),
+                    metadata={"function": "not", "result_type": "boolean"}
                 )
 
             # Empty or single-item collection returns NULL
@@ -12569,7 +12782,11 @@ END"""
             - Input true → Returns false
             - Input false → Returns true
             - Input {} (empty) → Returns {} (empty/NULL)
-            - Input collection with multiple values → Returns {} (empty/NULL)
+            - Input collection with multiple values → Implicitly apply exists() first, then negate (SP-110-011)
+
+        SP-110-011: Multi-item collections (e.g., from union operations) use implicit exists()
+        semantics. For example, (1|2).not() is equivalent to (1|2).exists().not(), which evaluates
+        to false (since the collection has items, exists() returns true, then not() negates to false).
 
         Population-First Design:
             Uses standard SQL NOT operator to negate boolean expressions.
@@ -12600,6 +12817,11 @@ END"""
 
             Output SQL:
                 NOT (json_array_length(json_extract(resource, '$.name')) = 0)
+
+            Input: (1|2).not()  (SP-110-011)
+
+            Output SQL:
+                NOT (CASE WHEN <union_expr> IS NOT NULL THEN TRUE ELSE FALSE END)
         """
         logger.debug(f"Translating not() function with {len(node.arguments)} arguments")
 
@@ -13322,38 +13544,43 @@ END"""
                 f"got {len(node.arguments)}"
             )
 
-        # Get the target collection/value to trace
-        (
-            collection_expr,
-            dependencies,
-            _,
-            snapshot,
-            _,
-            target_path,
-        ) = self._resolve_function_target(node)
-
-        source_table = snapshot["current_table"]
+        # SP-110-010: trace() needs to visit the target directly to get the full fragment
+        # including preserved_columns. We cannot use _resolve_function_target because it
+        # doesn't return the full fragment with metadata.
+        snapshot = self._snapshot_context()
 
         try:
-            if not collection_expr:
-                raise ValueError("trace() requires a target expression to operate on")
+            if node.target is not None:
+                # Visit the target directly to get the full fragment
+                target_fragment = self.visit(node.target)
 
-            # trace() is a pass-through in SQL execution
-            # The target expression is returned unchanged
-            # Note: In a full implementation with logging, we could inject
-            # logging SQL here, but for compliance testing, pass-through is sufficient
+                # Add trace-specific metadata
+                metadata = dict(getattr(target_fragment, "metadata", {}) or {})
+                metadata["function"] = "trace"
+                metadata["pass_through"] = True
 
-            logger.info(f"trace() pass-through for expression: {collection_expr}")
-
-            # Simply return the target expression unchanged
-            return SQLFragment(
-                expression=collection_expr,
-                source_table=source_table,
-                requires_unnest=False,
-                is_aggregate=False,
-                dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "trace", "pass_through": True}
-            )
+                # Return the target fragment unchanged (pass-through)
+                # This preserves all properties including preserved_columns
+                return SQLFragment(
+                    expression=target_fragment.expression,
+                    source_table=target_fragment.source_table,
+                    requires_unnest=getattr(target_fragment, "requires_unnest", False),
+                    is_aggregate=getattr(target_fragment, "is_aggregate", False),
+                    dependencies=list(dict.fromkeys(getattr(target_fragment, "dependencies", []))),
+                    metadata=metadata,
+                    preserved_columns=getattr(target_fragment, "preserved_columns", None)
+                )
+            else:
+                # No explicit target - this shouldn't happen for trace()
+                # but handle it gracefully
+                source_table = snapshot["current_table"]
+                return SQLFragment(
+                    expression=source_table,
+                    source_table=source_table,
+                    requires_unnest=False,
+                    is_aggregate=False,
+                    metadata={"function": "trace", "pass_through": True}
+                )
         finally:
             self._restore_context(snapshot)
 
@@ -14619,6 +14846,59 @@ END"""
             if restore_snapshot is not None:
                 self._restore_context(restore_snapshot)
 
+    def _translate_membership_expression(self, node: Any) -> SQLFragment:
+        """Translate membership 'in' expression to SQL.
+
+        FHIRPath: value in collection
+        SQL: collection contains value (reversed)
+
+        The 'in' operator tests if a value is a member of a collection.
+        In FHIRPath, this is semantically equivalent to: collection contains value
+        Note the reversal of operands compared to SQL IN clause.
+
+        Args:
+            node: MembershipExpression node with two children (value, collection)
+
+        Returns:
+            SQLFragment containing the membership test SQL
+        """
+        logger.debug(f"Translating membership 'in' expression")
+
+        if not hasattr(node, 'children') or len(node.children) != 2:
+            raise ValueError(
+                f"MembershipExpression requires exactly 2 children (value, collection), "
+                f"got {len(getattr(node, 'children', []))}"
+            )
+
+        # Child 0: value to check (left side of 'in')
+        value_fragment = self.visit(node.children[0])
+
+        # Child 1: collection to check in (right side of 'in')
+        collection_fragment = self.visit(node.children[1])
+
+        # Combine dependencies
+        dependencies = list(collection_fragment.dependencies or [])
+        if value_fragment.dependencies:
+            dependencies.extend(value_fragment.dependencies)
+
+        # Use dialect to generate membership test
+        # For 'in' operator, we need: collection contains value
+        contains_sql = self.dialect.generate_membership_test(
+            collection_fragment.expression,
+            value_fragment.expression
+        )
+
+        logger.debug(f"Generated membership 'in' SQL: {contains_sql}")
+
+        return SQLFragment(
+            expression=contains_sql,
+            source_table=collection_fragment.source_table,
+            requires_unnest=False,
+            is_aggregate=False,
+            dependencies=list(dict.fromkeys(dependencies)),
+            metadata={"function": "contains", "result_type": "boolean"}
+        )
+
     def _translate_contains_membership(self, node: FunctionCallNode) -> SQLFragment:
         """Translate membership contains operator to SQL.
 
@@ -15469,6 +15749,7 @@ END"""
             - Returns collection of child elements
             - For FHIR resources, returns direct child fields/elements
             - NULL handling: null input → empty collection
+            - SP-110-XXX: Use current_element_column when operating on UNNEST results
         """
         logger.debug(f"Translating children() function")
 
@@ -15478,9 +15759,21 @@ END"""
                 f"children() function requires no arguments, got {len(node.arguments)}"
             )
 
-        # Get the current resource/element expression
-        current_expr = self.context.current_table
+        # SP-110-XXX: Check if we're operating on an UNNEST result
+        # If current_element_column is set, we need to use that column instead of resource
+        element_column = self.context.current_element_column
         source_table = self.context.current_table
+
+        # Determine the source expression for children()
+        # If we have an element_column (e.g., name_item from UNNEST), use it
+        # Otherwise use the current table (resource or CTE)
+        if element_column and element_column != source_table:
+            # We're operating on an UNNEST result (e.g., Patient.name.children())
+            current_expr = element_column
+            logger.debug(f"SP-110-XXX: children() using element_column '{element_column}'")
+        else:
+            # We're at the resource level
+            current_expr = source_table
 
         # For FHIR resources stored as JSON, children() returns all keys
         # We need to extract all child elements from the JSON structure
@@ -15496,7 +15789,7 @@ END"""
         if current_path and current_path != "$":
             # We're navigating within a resource, extract children from the current path
             parent_json = self.dialect.extract_json_field(
-                column=source_table,
+                column=current_expr,
                 path=current_path
             )
 
@@ -15504,7 +15797,7 @@ END"""
             # DuckDB: json_keys(json), PostgreSQL: SELECT jsonb_object_keys(json)
             children_sql = self.dialect.generate_json_children(parent_json)
         else:
-            # We're at the resource level, get all children from the resource JSON
+            # We're at the resource level or element level, get all children directly
             children_sql = self.dialect.generate_json_children(current_expr)
 
         logger.debug(f"Generated children() SQL: {children_sql}")
@@ -15677,6 +15970,18 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-010: If there's a select result, use its source_table for dependencies
+        # This fixes the issue where allTrue() was using 'resource' instead of the select() CTE
+        if has_select_result and self.fragments:
+            # Find the last select fragment and use its source_table
+            for frag in reversed(self.fragments):
+                if frag.metadata.get("function") == "select":
+                    source_table = frag.source_table
+                    # Also update dependencies to include the select fragment's dependencies
+                    if frag.dependencies:
+                        dependencies.extend(frag.dependencies)
+                    break
+
         # SP-110-003: Also check if collection_expr itself is a SELECT statement
         # This handles edge cases where metadata might not be set correctly
         is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
@@ -15704,7 +16009,7 @@ END"""
                 requires_unnest=False,
                 is_aggregate=True,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "allTrue", "result_type": "boolean"}
+                metadata={"function": "allTrue", "result_type": "boolean", "skip_group_by": True}
             )
         finally:
             self._restore_context(snapshot)
@@ -15734,6 +16039,15 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-010: If there's a select result, use its source_table for dependencies
+        if has_select_result and self.fragments:
+            for frag in reversed(self.fragments):
+                if frag.metadata.get("function") == "select":
+                    source_table = frag.source_table
+                    if frag.dependencies:
+                        dependencies.extend(frag.dependencies)
+                    break
+
         # SP-110-003: Also check if collection_expr itself is a SELECT statement
         is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
 
@@ -15758,7 +16072,7 @@ END"""
                 requires_unnest=False,
                 is_aggregate=True,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "anyTrue", "result_type": "boolean"}
+                metadata={"function": "anyTrue", "result_type": "boolean", "skip_group_by": True}
             )
         finally:
             self._restore_context(snapshot)
@@ -15788,6 +16102,15 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-010: If there's a select result, use its source_table for dependencies
+        if has_select_result and self.fragments:
+            for frag in reversed(self.fragments):
+                if frag.metadata.get("function") == "select":
+                    source_table = frag.source_table
+                    if frag.dependencies:
+                        dependencies.extend(frag.dependencies)
+                    break
+
         # SP-110-003: Also check if collection_expr itself is a SELECT statement
         is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
 
@@ -15812,7 +16135,7 @@ END"""
                 requires_unnest=False,
                 is_aggregate=True,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "allFalse", "result_type": "boolean"}
+                metadata={"function": "allFalse", "result_type": "boolean", "skip_group_by": True}
             )
         finally:
             self._restore_context(snapshot)
@@ -15842,6 +16165,15 @@ END"""
             f.metadata.get("function") == "select" for f in self.fragments
         )
 
+        # SP-110-010: If there's a select result, use its source_table for dependencies
+        if has_select_result and self.fragments:
+            for frag in reversed(self.fragments):
+                if frag.metadata.get("function") == "select":
+                    source_table = frag.source_table
+                    if frag.dependencies:
+                        dependencies.extend(frag.dependencies)
+                    break
+
         # SP-110-003: Also check if collection_expr itself is a SELECT statement
         is_select_statement = collection_expr and collection_expr.strip().upper().startswith("SELECT")
 
@@ -15866,7 +16198,7 @@ END"""
                 requires_unnest=False,
                 is_aggregate=True,
                 dependencies=list(dict.fromkeys(dependencies)),
-                metadata={"function": "anyFalse", "result_type": "boolean"}
+                metadata={"function": "anyFalse", "result_type": "boolean", "skip_group_by": True}
             )
         finally:
             self._restore_context(snapshot)

@@ -1109,9 +1109,13 @@ class CTEManager:
         # SP-108-003: Check if order columns should be excluded from GROUP BY
         exclude_order = fragment.metadata.get("exclude_order_from_group_by", False)
 
+        # SP-110-010: Check if GROUP BY should be skipped for this fragment
+        # Some aggregate functions like allTrue()/anyTrue() are self-contained and don't need GROUP BY
+        skip_group_by = fragment.metadata.get("skip_group_by", False)
+
         # SP-110-AUTOPILOT: Build GROUP BY for all aggregate fragments, not just those with ordering
         # This fixes "column must appear in GROUP BY" errors for count() operations
-        if fragment.is_aggregate:
+        if fragment.is_aggregate and not skip_group_by:
             # Build GROUP BY with id, resource, and optionally ordering columns
             group_by_columns = [id_column]
 

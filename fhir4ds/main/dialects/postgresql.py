@@ -1131,8 +1131,13 @@ class PostgreSQLDialect(DatabaseDialect):
         return f"jsonb_build_array({expression})"
 
     def serialize_json_value(self, expression: str) -> str:
-        """Serialize JSON value to canonical text preserving type semantics."""
-        return f"({expression})::text"
+        """Serialize JSON value to canonical text preserving type semantics.
+
+        SP-110-001: Use ->> operator for proper JSON text extraction instead of ::text cast.
+        Casting to ::text can create invalid JSON when the value is already a JSON string.
+        The ->> operator extracts the text content from JSONB values properly.
+        """
+        return f"({expression} ->> 0)"
 
     def empty_json_array(self) -> str:
         """Return PostgreSQL empty JSON array literal."""

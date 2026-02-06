@@ -168,6 +168,43 @@ class EnhancedASTNode:
                 # Multiple children - visit last child
                 return self.children[-1].accept(visitor)
 
+        # SP-110-001: Handle terminology system prefixes (e.g., %sct, %loinc, %ucum)
+        # These appear as TermExpression with text like '%sct' and should be
+        # translated to their corresponding URLs before unwrapping
+        if self.node_type == "TermExpression" and hasattr(self, 'text') and self.text and self.text.startswith('%'):
+            # Map common terminology system prefixes to their URLs
+            terminology_urls = {
+                'sct': 'http://snomed.info/sct',
+                'snomed': 'http://snomed.info/sct',
+                'loinc': 'http://loinc.org',
+                'ucum': 'http://unitsofmeasure.org',
+            }
+            system_name = self.text[1:].strip()  # Remove the % prefix
+            if system_name in terminology_urls:
+                # Create a literal node adapter for the URL
+                url = terminology_urls[system_name]
+                class TerminologyLiteralAdapter:
+                    def __init__(self, url):
+                        self.text = url
+                        self.node_type = "literal"
+                        self.literal_type = "string"
+                        self.value = url
+                        self.metadata = None
+                    def accept(self, v):
+                        return v.visit_literal(self)
+                return TerminologyLiteralAdapter(url).accept(visitor)
+            # For unknown prefixes, treat as string literal
+            class UnknownTerminologyLiteralAdapter:
+                def __init__(self, text):
+                    self.text = text
+                    self.node_type = "literal"
+                    self.literal_type = "string"
+                    self.value = text
+                    self.metadata = None
+                def accept(self, v):
+                    return v.visit_literal(self)
+            return UnknownTerminologyLiteralAdapter(self.text).accept(visitor)
+
         # SP-023-006: TermExpression unwrapping - check if it wraps a single child
         if self.node_type == "TermExpression" and self.children and len(self.children) == 1:
             return self.children[0].accept(visitor)
@@ -817,10 +854,28 @@ class EnhancedASTNode:
                             left = node.children[0]
                             right = node.children[1]
 
-                            # Infer operator from text
+                            # SP-110-001: Infer operator from text
+                            # The MembershipExpression has text='in' for 'x in collection'
+                            # and text='contains' for 'collection contains x'
+                            # We need to check both the text and the original_expression
                             text = node.text or ""
-                            if ' in ' in text:
+                            original_expr = ""
+                            if hasattr(node, 'metadata') and node.metadata:
+                                custom_attrs = getattr(node.metadata, 'custom_attributes', None)
+                                if custom_attrs:
+                                    original_expr = custom_attrs.get('original_expression', '')
+
+                            # Check if this is 'in' operator (value in collection)
+                            # The text is just 'in', but we can detect from custom_attributes
+                            is_in_operator = (
+                                text == 'in' or
+                                ' in ' in original_expr or
+                                (hasattr(node, 'text') and ' in ' in str(node.text))
+                            )
+
+                            if is_in_operator:
                                 # "x in collection" → contains(collection, x)
+                                # Swap arguments because contains expects (collection, value)
                                 return [right, left]
                             else:
                                 # "collection contains x" → contains(collection, x)
