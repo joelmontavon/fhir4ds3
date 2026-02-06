@@ -1922,37 +1922,75 @@ class PostgreSQLDialect(DatabaseDialect):
             FROM jsonb_array_elements(COALESCE({array_expr}, '[]'::jsonb)) AS elem
         )"""
 
+    def generate_truthiness_type_check(self, value_var: str, elem_var: str) -> str:
+        """Generate SQL for FHIRPath truthiness evaluation - PostgreSQL syntax.
+
+        PostgreSQL-specific implementation using jsonb_typeof() for type detection.
+        The FHIRPath truthiness rules are part of the specification and are
+        identical across all dialects.
+
+        Args:
+            value_var: Not used in PostgreSQL (kept for interface compatibility)
+            elem_var: Variable name for jsonb_array_elements() context (default: "elem")
+
+        Returns:
+            SQL CASE expression implementing FHIRPath truthiness rules
+        """
+        # FHIRPath truthiness rules (from specification):
+        # - Strings: empty=false, non-empty=true
+        # - Numbers (integer, number): 0=false, non-zero=true
+        # - Booleans: actual value
+        # - null: false
+        # - Arrays/Objects (array, object): true (non-empty)
+        return (f"CASE WHEN jsonb_typeof({elem_var}) = 'string' THEN LENGTH({elem_var}) > 0 "
+                f"WHEN jsonb_typeof({elem_var}) = 'integer' OR jsonb_typeof({elem_var}) = 'number' THEN CAST({elem_var} AS DOUBLE PRECISION) <> 0 "
+                f"WHEN jsonb_typeof({elem_var}) = 'boolean' THEN ({elem_var}::text)::boolean "
+                f"WHEN jsonb_typeof({elem_var}) = 'null' THEN FALSE "
+                f"ELSE TRUE END")
+
     def generate_all_true(self, collection_expr: str) -> str:
         """Generate SQL for allTrue() using BOOL_AND aggregate.
 
         Returns TRUE if all elements are TRUE. Empty collections return TRUE (vacuous truth).
         Uses COALESCE to handle empty collections and NULL values are ignored by BOOL_AND.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_AND((elem::text)::boolean) FROM jsonb_array_elements({collection_expr}) AS elem), TRUE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_AND({truthiness}) FROM jsonb_array_elements({collection_expr}) AS elem), TRUE)"
 
     def generate_any_true(self, collection_expr: str) -> str:
         """Generate SQL for anyTrue() using BOOL_OR aggregate.
 
         Returns TRUE if any element is TRUE. Empty collections return FALSE.
         Uses COALESCE to handle empty collections and NULL values are ignored by BOOL_OR.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_OR((elem::text)::boolean) FROM jsonb_array_elements({collection_expr}) AS elem), FALSE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_OR({truthiness}) FROM jsonb_array_elements({collection_expr}) AS elem), FALSE)"
 
     def generate_all_false(self, collection_expr: str) -> str:
         """Generate SQL for allFalse() using BOOL_AND(NOT value).
 
         Returns TRUE if all elements are FALSE. Empty collections return TRUE (vacuous truth).
         Implemented as BOOL_AND on negated values.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_AND(NOT (elem::text)::boolean) FROM jsonb_array_elements({collection_expr}) AS elem), TRUE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_AND(NOT {truthiness}) FROM jsonb_array_elements({collection_expr}) AS elem), TRUE)"
 
     def generate_any_false(self, collection_expr: str) -> str:
         """Generate SQL for anyFalse() using BOOL_OR(NOT value).
 
         Returns TRUE if any element is FALSE. Empty collections return FALSE.
         Implemented as BOOL_OR on negated values.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_OR(NOT (elem::text)::boolean) FROM jsonb_array_elements({collection_expr}) AS elem), FALSE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_OR(NOT {truthiness}) FROM jsonb_array_elements({collection_expr}) AS elem), FALSE)"
 
     def generate_array_to_string(self, array_expr: str, separator: str) -> str:
         """Generate SQL for combine() using array_to_string.

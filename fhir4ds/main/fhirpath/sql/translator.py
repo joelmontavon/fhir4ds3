@@ -240,6 +240,51 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return current_type
 
+    def _get_sort_element_type(self, fhir_type: Optional[str]) -> Optional[str]:
+        """Map FHIR data type to sort element type.
+
+        Maps FHIR primitive types to the element_type values used by
+        generate_array_sort for proper type-aware sorting.
+
+        Args:
+            fhir_type: FHIR type name (e.g., 'string', 'integer', 'dateTime')
+
+        Returns:
+            Element type string ('string', 'integer', 'decimal') or None
+        """
+        if not fhir_type:
+            return None
+
+        # Map FHIR types to sort element types
+        # String-based types that sort lexicographically
+        string_types = {
+            'string', 'code', 'uri', 'url', 'canonical', 'id',
+            'oid', 'uuid', 'idString', 'markdown', 'base64Binary',
+            'boolean',  # Booleans sort as strings in FHIRPath
+            'date', 'dateTime', 'time', 'instant',  # Temporal types sort as strings
+        }
+
+        # Integer types
+        integer_types = {
+            'integer', 'unsignedInt', 'positiveInt', 'integer64',
+        }
+
+        # Decimal types
+        decimal_types = {
+            'decimal', 'unsignedLong', 'negativeInt',
+        }
+
+        fhir_type_lower = fhir_type.lower()
+
+        if fhir_type_lower in string_types:
+            return 'string'
+        elif fhir_type_lower in integer_types:
+            return 'integer'
+        elif fhir_type_lower in decimal_types:
+            return 'decimal'
+
+        return None
+
     def translate(self, ast_root: FHIRPathASTNode) -> List[SQLFragment]:
         """Translate FHIRPath AST to SQL fragments.
 
@@ -1680,6 +1725,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     unnest_level=len(processed_components),
                 )
 
+                # SP-110-SORT: Add element_type for array fragments
+                # Determine the type of elements in this array for type-aware sorting
+                try:
+                    # Resolve the type of elements in this array using type_registry
+                    # (element_type_resolver doesn't work for all cases)
+                    element_fhir_type = self.type_registry.get_element_type(
+                        current_type,
+                        component
+                    )
+                    if element_fhir_type:
+                        # For primitive arrays (e.g., HumanName.given is string[]),
+                        # set element_type to the primitive type
+                        element_sort_type = self._get_sort_element_type(element_fhir_type)
+                        if element_sort_type:
+                            metadata["element_type"] = element_sort_type
+                            logger.debug(
+                                f"SP-110-SORT: Array '{component}' in '{current_type}' has elements "
+                                f"of type '{element_fhir_type}', element_type '{element_sort_type}'"
+                            )
+                except Exception as exc:
+                    logger.debug(
+                        f"SP-110-SORT: Could not resolve element type for array '{component}': {exc}"
+                    )
+
                 fragment = SQLFragment(
                     expression=array_column,
                     source_table=self.context.current_table,
@@ -1770,12 +1839,38 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     path=relative_path,
                 )
 
+            # SP-110-SORT: Determine element type for type-aware sorting
+            # When extracting a primitive field from an UNNEST result, we need to set
+            # element_type so sort() knows what type to cast to
+            sort_element_type = None
+            if is_primitive:
+                parent_components = processed_components[:-1] if len(processed_components) > 1 else []
+                final_component = processed_components[-1]
+
+                if parent_components:
+                    parent_type = self._get_element_type_for_path(parent_components)
+                    if parent_type:
+                        try:
+                            fhir_type = self.type_registry.get_element_type(parent_type, final_component)
+                            if fhir_type:
+                                sort_element_type = self._get_sort_element_type(fhir_type)
+                                logger.debug(
+                                    f"SP-110-SORT: Array context field '{final_component}' in '{parent_type}' "
+                                    f"has FHIR type '{fhir_type}', element_type '{sort_element_type}'"
+                                )
+                        except Exception as e:
+                            logger.debug(f"SP-110-SORT: Could not resolve element type: {e}")
+
+            metadata = {"source_path": self._build_json_path(processed_components)}
+            if sort_element_type:
+                metadata["element_type"] = sort_element_type
+
             final_fragment = SQLFragment(
                 expression=sql_expr,
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                metadata={"source_path": self._build_json_path(processed_components)},
+                metadata=metadata,
             )
 
             self.fragments.append(final_fragment)
@@ -2092,6 +2187,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             # Check if this field is a primitive type
             is_primitive = self._is_primitive_field_access(field_name, element_type)
 
+            # SP-110-SORT: Determine element type for type-aware sorting
+            # When accessing a field from an element column (e.g., after [0] or first()),
+            # we need to set element_type metadata so sort() knows what type to cast to
+            sort_element_type = None
+            if is_primitive:
+                try:
+                    fhir_type = self.type_registry.get_element_type(element_type, field_name)
+                    if fhir_type:
+                        sort_element_type = self._get_sort_element_type(fhir_type)
+                        logger.debug(
+                            f"SP-110-SORT: Element column field '{field_name}' in '{element_type}' "
+                            f"has FHIR type '{fhir_type}', element_type '{sort_element_type}'"
+                        )
+                except Exception as e:
+                    logger.debug(f"SP-110-SORT: Could not resolve element type for '{field_name}': {e}")
+
             # Generate JSON extraction from the element column
             if is_primitive:
                 sql_expr = self.dialect.extract_primitive_value(
@@ -2113,12 +2224,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             for component in components:
                 self.context.push_path(component)
 
+            # SP-110-SORT: Include element_type in metadata for sort()
+            metadata = {"from_element_column": True}
+            if sort_element_type:
+                metadata["element_type"] = sort_element_type
+
             fragment = SQLFragment(
                 expression=sql_expr,
                 source_table=self.context.current_table,
                 requires_unnest=False,
                 is_aggregate=False,
-                metadata={"from_element_column": True}
+                metadata=metadata
             )
             self.fragments.append(fragment)
             return fragment
@@ -2292,17 +2408,65 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         logger.debug(f"Generated SQL expression: {sql_expr}")
 
+        # SP-110-SORT: Determine element type for type-aware sorting
+        # Resolve the FHIR type for this field and map to sort element type
+        element_type = None
+        if field_path:
+            try:
+                # SP-110-SORT: For paths with indexers (e.g., name[0].given), we need to
+                # clean the indexer suffixes and resolve the type from the correct parent.
+                # Extract the final field name and resolve parent type from the path.
+
+                # Split field_path into components and remove indexers
+                path_components = field_path.split('.')
+                clean_components = []
+                for component in path_components:
+                    match = re.match(r'([^\[]+)', component)
+                    if match:
+                        clean_components.append(match.group(1))
+
+                if len(clean_components) >= 1:
+                    # Get the final field name
+                    final_field = clean_components[-1]
+
+                    # Get parent components (all except final)
+                    parent_components = clean_components[:-1]
+
+                    # Resolve parent type from parent components
+                    parent_type = None
+                    if parent_components:
+                        parent_type = self._get_element_type_for_path(parent_components)
+                    else:
+                        parent_type = self.resource_type
+
+                    # Get field type from parent type
+                    if parent_type and final_field:
+                        fhir_type = self.type_registry.get_element_type(parent_type, final_field)
+                        if fhir_type:
+                            element_type = self._get_sort_element_type(fhir_type)
+                            logger.debug(
+                                f"SP-110-SORT: Field '{final_field}' in parent '{parent_type}' "
+                                f"has FHIR type '{fhir_type}', element_type '{element_type}'"
+                            )
+            except Exception as e:
+                logger.debug(f"SP-110-SORT: Could not resolve element type for '{field_path}': {e}")
+
         # Return SQL fragment with JSON extraction expression
         # This is not an unnest operation and not an aggregate
         # Mark as JSON-extracted string for type-aware comparison casting
         # SP-103-004: Include source_path in metadata for type validation
+        # SP-110-SORT: Include element_type for type-aware sorting
         source_path = "$." + field_path if field_path else json_path
+        metadata = {"is_json_string": True, "source_path": source_path}
+        if element_type:
+            metadata["element_type"] = element_type
+
         return SQLFragment(
             expression=sql_expr,
             source_table=self.context.current_table,
             requires_unnest=False,
             is_aggregate=False,
-            metadata={"is_json_string": True, "source_path": source_path}
+            metadata=metadata
         )
 
     def visit_generic(self, node: Any) -> SQLFragment:
@@ -3186,6 +3350,34 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 return f"CASE WHEN CAST({expr} AS DOUBLE) <> 0 THEN TRUE ELSE FALSE END"
             # Default: try to cast and check non-zero
             return f"CASE WHEN {expr} IS NULL THEN FALSE WHEN COALESCE(CAST({expr} AS BOOLEAN), FALSE) THEN TRUE ELSE FALSE END"
+
+    def _get_fhirpath_truthiness_sql(self, value_var: str = "value", elem_var: str = "elem") -> str:
+        """Generate SQL for FHIRPath truthiness check on collection elements.
+
+        FHIRPath truthiness rules (from specification):
+        - Strings: empty string = false, non-empty = true
+        - Numbers: 0 = false, non-zero = true
+        - Booleans: actual value (true/false)
+        - Arrays/Objects: non-empty = true, empty = false
+        - null/missing: false
+
+        This is BUSINESS LOGIC (FHIRPath specification), not database syntax.
+        Dialects provide only the type detection primitives (json_type/jsonb_typeof).
+
+        Args:
+            value_var: Variable name for json_each() context (default: "value" for DuckDB)
+            elem_var: Variable name for jsonb_array_elements() context (default: "elem" for PostgreSQL)
+
+        Returns:
+            SQL CASE expression implementing FHIRPath truthiness rules
+
+        Example:
+            DuckDB: CASE WHEN json_type(value) = 'VARCHAR' THEN LENGTH(json_extract_string(value, '$')) > 0 ...
+            PostgreSQL: CASE WHEN jsonb_typeof(elem) = 'string' THEN LENGTH(elem) > 0 ...
+        """
+        # Get type detection SQL from dialect (syntax-only: json_type() vs jsonb_typeof())
+        type_check_sql = self.dialect.generate_truthiness_type_check(value_var, elem_var)
+        return type_check_sql
 
     def _build_implies_sql(
         self,
@@ -7351,12 +7543,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             self._restore_context(snapshot)
 
     def _translate_conforms_to(self, node: FunctionCallNode) -> SQLFragment:
-        """Translate conformsTo() profile membership function."""
+        """Translate conformsTo() profile membership function.
+
+        FHIRPath SP-110-011: conformsTo() supports two URL patterns:
+        1. StructureDefinition URLs: http://hl7.org/fhir/StructureDefinition/{ResourceType}
+           - Extract resource type from URL
+           - Compare against resourceType field
+        2. Profile URLs: Any other URL
+           - Check if URL exists in meta.profile array
+
+        Handles EnhancedASTNode arguments that haven't been converted to LiteralNode yet.
+        The parser creates a nested structure: TermExpression > literal > literal for
+        string arguments.
+        """
         if not node.arguments or len(node.arguments) != 1:
             raise ValueError("conformsTo() requires exactly one argument (profile URL)")
-
-        profile_fragment = self.visit(node.arguments[0])
-        profile_dependencies = getattr(profile_fragment, "dependencies", []) or []
 
         (
             resource_expr,
@@ -7368,9 +7569,71 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         ) = self._resolve_function_target(node)
 
         source_table = snapshot["current_table"]
-        combined_dependencies = list(dependencies or []) + list(profile_dependencies)
 
         try:
+            metadata = {"function": "conformsTo"}
+
+            # SP-110-011: Try to extract URL from various node types
+            url_value = None
+            url_arg = node.arguments[0]
+
+            # Case 1: Already converted LiteralNode
+            if isinstance(url_arg, LiteralNode) and isinstance(url_arg.value, str):
+                url_value = url_arg.value
+            # Case 2: EnhancedASTNode - extract from text attribute
+            elif hasattr(url_arg, 'text'):
+                # The text contains the URL with quotes, e.g., "'http://hl7.org/fhir/StructureDefinition/Patient'"
+                text = url_arg.text.strip()
+                # Remove surrounding quotes
+                if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+                    url_value = text[1:-1]
+                else:
+                    url_value = text
+
+            if url_value:
+                metadata["profile_url"] = url_value
+
+                # SP-110-011: Detect StructureDefinition URLs
+                # Pattern: http://hl7.org/fhir/StructureDefinition/{ResourceType}
+                if '/StructureDefinition/' in url_value:
+                    # Extract resource type from URL
+                    # e.g., "http://hl7.org/fhir/StructureDefinition/Patient" -> "Patient"
+                    parts = url_value.split('/StructureDefinition/')
+                    if len(parts) == 2:
+                        resource_type = parts[1].split('/')[0]  # Get last segment, ignore trailing paths
+
+                        # Compare resourceType field with extracted type
+                        resource_type_expr = self.dialect.extract_json_field(
+                            resource_expr,
+                            "resourceType"
+                        )
+
+                        # Properly escape the resource type string for SQL comparison
+                        escaped_type = resource_type.replace("'", "''")
+
+                        result_sql = (
+                            "CASE "
+                            f"WHEN {resource_expr} IS NULL THEN false "
+                            f"WHEN {resource_type_expr} IS NULL THEN false "
+                            f"ELSE {resource_type_expr} = '{escaped_type}' "
+                            "END"
+                        )
+
+                        return SQLFragment(
+                            expression=result_sql,
+                            source_table=source_table,
+                            requires_unnest=False,
+                            is_aggregate=False,
+                            dependencies=list(dependencies or []),
+                            metadata=metadata,
+                        )
+
+            # For non-literal arguments or non-StructureDefinition URLs,
+            # check against meta.profile array (original behavior)
+            profile_fragment = self.visit(url_arg)
+            profile_dependencies = getattr(profile_fragment, "dependencies", []) or []
+            combined_dependencies = list(dependencies or []) + list(profile_dependencies)
+
             profiles_expr = self.dialect.extract_json_object(
                 resource_expr,
                 "$.meta.profile",
@@ -7387,10 +7650,6 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 f"ELSE {membership_check} "
                 "END"
             )
-
-            metadata = {"function": "conformsTo"}
-            if isinstance(node.arguments[0], LiteralNode):
-                metadata["profile_url"] = node.arguments[0].value
 
             return SQLFragment(
                 expression=result_sql,
@@ -16087,7 +16346,9 @@ END"""
                 # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
                 # with the correct CTE name that contains the result column
                 # The result column contains the aggregated JSON array from select()
-                all_true_sql = f"COALESCE((SELECT BOOL_AND(CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
+                # Use centralized FHIRPath truthiness rules via dialect
+                truthiness = self.dialect.generate_truthiness_type_check("value", "elem")
+                all_true_sql = f"COALESCE((SELECT BOOL_AND({truthiness}) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
@@ -16213,7 +16474,9 @@ END"""
             # SP-110-003: Also check if collection_expr is a SELECT statement directly
             if has_select_result or is_select_statement:
                 # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
-                all_false_sql = f"COALESCE((SELECT BOOL_AND(NOT CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
+                # Use centralized FHIRPath truthiness rules via dialect
+                truthiness = self.dialect.generate_truthiness_type_check("value", "elem")
+                all_false_sql = f"COALESCE((SELECT BOOL_AND(NOT {truthiness}) FROM json_each(<<SOURCE_TABLE>>.result)), TRUE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)
@@ -16276,7 +16539,9 @@ END"""
             # SP-110-003: Also check if collection_expr is a SELECT statement directly
             if has_select_result or is_select_statement:
                 # SP-110-003: Use <<SOURCE_TABLE>> marker which CTE builder will substitute
-                any_false_sql = f"COALESCE((SELECT BOOL_OR(NOT CAST(value AS BOOLEAN)) FROM json_each(<<SOURCE_TABLE>>.result)), FALSE)"
+                # Use centralized FHIRPath truthiness rules via dialect
+                truthiness = self.dialect.generate_truthiness_type_check("value", "elem")
+                any_false_sql = f"COALESCE((SELECT BOOL_OR(NOT {truthiness}) FROM json_each(<<SOURCE_TABLE>>.result)), FALSE)"
             else:
                 base_expr = self._extract_collection_source(collection_expr, target_path, snapshot)
                 normalized_expr = self._normalize_collection_expression(base_expr)

@@ -1259,6 +1259,43 @@ class DatabaseDialect(ABC):
         pass
 
     @abstractmethod
+    def generate_truthiness_type_check(self, value_var: str, elem_var: str) -> str:
+        """Generate SQL for FHIRPath truthiness type checking - syntax only.
+
+        This method generates ONLY the database-specific syntax for type detection
+        in JSON collections. The FHIRPath truthiness business logic (what rules
+        apply to each type) is defined in the FHIRPath specification and belongs
+        in the translator layer.
+
+        This method returns the complete CASE expression for truthiness evaluation,
+        using database-specific type detection functions (json_type() vs jsonb_typeof()).
+
+        Args:
+            value_var: Variable name for json_each() context (DuckDB uses "value")
+            elem_var: Variable name for jsonb_array_elements() context (PostgreSQL uses "elem")
+
+        Returns:
+            SQL CASE expression implementing FHIRPath truthiness rules
+
+        Example:
+            DuckDB:
+                CASE WHEN json_type(value) = 'VARCHAR' THEN LENGTH(json_extract_string(value, '$')) > 0
+                     WHEN json_type(value) IN ('UBIGINT', 'BIGINT', ...) THEN CAST(value AS DOUBLE) <> 0
+                     ...
+
+            PostgreSQL:
+                CASE WHEN jsonb_typeof(elem) = 'string' THEN LENGTH(elem) > 0
+                     WHEN jsonb_typeof(elem) = 'integer' OR jsonb_typeof(elem) = 'number' THEN ...
+                     ...
+
+        Note:
+            This is a thin dialect method - contains ONLY database syntax differences.
+            The FHIRPath truthiness rules (empty string = false, non-zero number = true, etc.)
+            are part of the FHIRPath specification and are the same across all dialects.
+        """
+        pass
+
+    @abstractmethod
     def generate_array_to_string(self, array_expr: str, separator: str) -> str:
         """Generate SQL for combine() - joins array elements with a separator.
 

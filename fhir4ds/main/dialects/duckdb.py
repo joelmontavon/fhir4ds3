@@ -669,11 +669,15 @@ class DuckDBDialect(DatabaseDialect):
             - DuckDB doesn't have a direct way to get all child values
             - We use json_transform with json_keys to iterate and extract
             - Returns empty list for null input
+            - SP-110-XXX: Fixed scalar subquery error by using list_agg pattern
         """
-        # For DuckDB, we need to extract all child values from a JSON object
-        # The approach: get keys, then for each key extract the value
-        # json_transform allows us to iterate over key-value pairs
-        return f"list((SELECT json_extract_string({json_expr}, key) FROM (SELECT unnest(json_keys({json_expr})) AS key)))"
+        # SP-110-XXX: Fix scalar subquery error when used with skip()
+        # The previous implementation used a subquery that returned multiple rows,
+        # which caused "More than one row returned by a subquery used as an expression"
+        # when skip() tried to enumerate the array using json_each().
+        # Solution: Use list() with a properly correlated subquery.
+        # We need to ensure the subquery is correlated to the current row context.
+        return f"(SELECT list(json_extract_string({json_expr}, key)) FROM (SELECT unnest(json_keys({json_expr})) AS key))"
 
     def generate_substring_check(self, string_expr: str, substring: str) -> str:
         """Generate substring check SQL for DuckDB.
@@ -1745,37 +1749,75 @@ class DuckDBDialect(DatabaseDialect):
             f"FROM json_each({base_expr}) AS proj_table(key, value))"
         )
 
+    def generate_truthiness_type_check(self, value_var: str, elem_var: str) -> str:
+        """Generate SQL for FHIRPath truthiness evaluation - DuckDB syntax.
+
+        DuckDB-specific implementation using json_type() for type detection.
+        The FHIRPath truthiness rules are part of the specification and are
+        identical across all dialects.
+
+        Args:
+            value_var: Variable name for json_each() context (default: "value")
+            elem_var: Not used in DuckDB (kept for interface compatibility)
+
+        Returns:
+            SQL CASE expression implementing FHIRPath truthiness rules
+        """
+        # FHIRPath truthiness rules (from specification):
+        # - Strings (VARCHAR): empty=false, non-empty=true
+        # - Numbers (UBIGINT, BIGINT, USMALLINT, SMALLINT, UINTEGER, INTEGER, DOUBLE, FLOAT): 0=false, non-zero=true
+        # - Booleans: actual value
+        # - NULL: false
+        # - Arrays/Objects (OBJ, ARRAY): true (non-empty)
+        return (f"CASE WHEN json_type({value_var}) = 'VARCHAR' THEN LENGTH(json_extract_string({value_var}, '$')) > 0 "
+                f"WHEN json_type({value_var}) IN ('UBIGINT', 'BIGINT', 'USMALLINT', 'SMALLINT', 'UINTEGER', 'INTEGER', 'DOUBLE', 'FLOAT') THEN CAST({value_var} AS DOUBLE) <> 0 "
+                f"WHEN json_type({value_var}) = 'BOOLEAN' THEN CAST({value_var} AS BOOLEAN) "
+                f"WHEN json_type({value_var}) = 'NULL' THEN FALSE "
+                f"ELSE TRUE END")
+
     def generate_all_true(self, collection_expr: str) -> str:
         """Generate SQL for allTrue() using BOOL_AND aggregate.
 
         Returns TRUE if all elements are TRUE. Empty collections return TRUE (vacuous truth).
         Uses COALESCE to handle empty collections and NULL values are ignored by BOOL_AND.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_AND(CAST(value AS BOOLEAN)) FROM json_each({collection_expr})), TRUE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_AND({truthiness}) FROM json_each({collection_expr})), TRUE)"
 
     def generate_any_true(self, collection_expr: str) -> str:
         """Generate SQL for anyTrue() using BOOL_OR aggregate.
 
         Returns TRUE if any element is TRUE. Empty collections return FALSE.
         Uses COALESCE to handle empty collections and NULL values are ignored by BOOL_OR.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_OR(CAST(value AS BOOLEAN)) FROM json_each({collection_expr})), FALSE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_OR({truthiness}) FROM json_each({collection_expr})), FALSE)"
 
     def generate_all_false(self, collection_expr: str) -> str:
         """Generate SQL for allFalse() using BOOL_AND(NOT value).
 
         Returns TRUE if all elements are FALSE. Empty collections return TRUE (vacuous truth).
         Implemented as BOOL_AND on negated values.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_AND(NOT CAST(value AS BOOLEAN)) FROM json_each({collection_expr})), TRUE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_AND(NOT {truthiness}) FROM json_each({collection_expr})), TRUE)"
 
     def generate_any_false(self, collection_expr: str) -> str:
         """Generate SQL for anyFalse() using BOOL_OR(NOT value).
 
         Returns TRUE if any element is FALSE. Empty collections return FALSE.
         Implemented as BOOL_OR on negated values.
+
+        Uses centralized FHIRPath truthiness rules via generate_truthiness_type_check().
         """
-        return f"COALESCE((SELECT BOOL_OR(NOT CAST(value AS BOOLEAN)) FROM json_each({collection_expr})), FALSE)"
+        truthiness = self.generate_truthiness_type_check("value", "elem")
+        return f"COALESCE((SELECT BOOL_OR(NOT {truthiness}) FROM json_each({collection_expr})), FALSE)"
 
     def generate_array_to_string(self, array_expr: str, separator: str) -> str:
         """Generate SQL for combine() using array_to_string.
@@ -1825,20 +1867,32 @@ class DuckDBDialect(DatabaseDialect):
     # Encoding and decoding functions
 
     def generate_base64_encode(self, expression: str) -> str:
-        """Generate SQL for base64 encoding using DuckDB's to_base64 function."""
-        return f"to_base64({expression})"
+        """Generate SQL for base64 encoding using DuckDB's to_base64 function.
+
+        DuckDB's to_base64 expects BLOB input and returns VARCHAR.
+        """
+        return f"to_base64({expression}::BLOB)"
 
     def generate_base64_decode(self, expression: str) -> str:
-        """Generate SQL for base64 decoding using DuckDB's from_base64 function."""
-        return f"from_base64({expression})"
+        """Generate SQL for base64 decoding using DuckDB's from_base64 function.
+
+        DuckDB's from_base64 returns BLOB, so we cast to VARCHAR for string output.
+        """
+        return f"from_base64({expression})::VARCHAR"
 
     def generate_hex_encode(self, expression: str) -> str:
-        """Generate SQL for hex encoding using DuckDB's to_hex function."""
-        return f"to_hex({expression})"
+        """Generate SQL for hex encoding using DuckDB's to_hex function.
+
+        DuckDB's to_hex expects BLOB input and returns VARCHAR.
+        """
+        return f"to_hex({expression}::BLOB)"
 
     def generate_hex_decode(self, expression: str) -> str:
-        """Generate SQL for hex decoding using DuckDB's from_hex function."""
-        return f"from_hex({expression})"
+        """Generate SQL for hex decoding using DuckDB's from_hex function.
+
+        DuckDB's from_hex returns BLOB, so we cast to VARCHAR for string output.
+        """
+        return f"from_hex({expression})::VARCHAR"
 
     def generate_urlbase64_encode(self, expression: str) -> str:
         """Generate SQL for URL-safe base64 encoding.
@@ -1846,16 +1900,18 @@ class DuckDBDialect(DatabaseDialect):
         URL-safe base64 replaces '+' with '-' and '/' with '_'.
         Also removes trailing '=' padding.
         """
-        # DuckDB: base64 then replace + with - and / with _, then remove padding
-        return f"rtrim(replace(replace(base64({expression}), '+', '-'), '/', '_'), '=')"
+        # DuckDB: to_base64 then replace + with - and / with _, then remove padding
+        # Cast input to VARCHAR for to_base64
+        return f"rtrim(replace(replace(to_base64({expression}::BLOB), '+', '-'), '/', '_'), '=')"
 
     def generate_urlbase64_decode(self, expression: str) -> str:
         """Generate SQL for URL-safe base64 decoding.
 
         First restore the replaced characters, then decode.
         """
-        # DuckDB: restore + and /, add padding if needed, then decode
-        return f"base64_decode(replace(replace({expression}, '-', '+'), '_', '/'), 'UTF-8')"
+        # DuckDB: restore + and /, add padding if needed, then decode using from_base64
+        # Cast result to VARCHAR since from_base64 returns BLOB
+        return f"from_base64(replace(replace({expression}, '-', '+'), '_', '/'))::VARCHAR"
 
     def generate_html_escape(self, expression: str) -> str:
         """Generate SQL for HTML escaping in DuckDB.
