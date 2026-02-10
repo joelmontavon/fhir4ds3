@@ -514,6 +514,28 @@ class CTEManager:
         available_columns: Dict[str, Set[str]] = {}  # Track columns available in each CTE
 
         for fragment in fragments:
+            # Skip fragments with skip_cte marker (e.g., simple literals in repeat())
+            if fragment.metadata.get("skip_cte"):
+                # Create a special CTE that just returns the literal value
+                # Also handle the case where this is the final result
+                if len(ctes) == 0:
+                    # This is the first and only fragment - create a simple query
+                    cte = CTE(
+                        name="final_result",
+                        query=f"SELECT {fragment.expression} as result",
+                        depends_on=[]
+                    )
+                    ctes.append(cte)
+                else:
+                    # This follows other fragments - join with them
+                    cte = CTE(
+                        name=f"literal_{len(ctes)}",
+                        query=f"SELECT {fragment.expression} as result",
+                        depends_on=[previous_cte_name]
+                    )
+                    ctes.append(cte)
+                previous_cte_name = cte.name
+                continue
             cte = self._fragment_to_cte(fragment, previous_cte_name, ordering_columns, available_columns)
             ctes.append(cte)
             previous_cte_name = cte.name
@@ -563,7 +585,28 @@ class CTEManager:
                 example when no source table can be resolved).
         """
         cte_name = self._generate_cte_name(fragment)
-        source_table = previous_cte or fragment.source_table
+
+        # SP-110-fix-003: Check if fragment is self-contained (e.g., EXISTS subquery)
+        # Self-contained fragments should use their own source_table, not the previous CTE
+        is_self_contained = fragment.metadata.get("self_contained", False)
+        if is_self_contained:
+            logger.debug(f"SP-110-fix-003: Fragment {cte_name} is self-contained, skipping previous CTE")
+            source_table = fragment.source_table
+            # Clear ordering_columns from previous CTEs for self-contained fragments
+            # since they don't have access to those columns
+            if ordering_columns:
+                logger.debug(f"SP-110-fix-003: Clearing ordering_columns for self-contained fragment: {ordering_columns}")
+                ordering_columns = []
+        else:
+            # SP-110 FIX: Check if fragment.source_table is a marker BEFORE using previous_cte
+            # Markers should be preserved for later resolution, not replaced with previous_cte
+            fragment_source = fragment.source_table if fragment.source_table else ""
+            if fragment_source.startswith(":") and fragment_source.endswith(":"):
+                # This is a marker (e.g., :repeat_result_cte:, :collection_result_cte:)
+                # Use the marker as source_table for later resolution
+                source_table = fragment_source
+            else:
+                source_table = previous_cte or fragment.source_table
 
         # SP-110: Resolve marker for repeat() result CTE
         # The :repeat_result_cte: marker should be resolved to the previous CTE
@@ -575,6 +618,30 @@ class CTEManager:
             else:
                 raise ValueError(
                     f"Marker {MARKER_REPEAT_RESULT} found but no previous CTE available to resolve it"
+                )
+
+        # SP-110: Resolve marker for children/descendants collection result CTE
+        # The :collection_result_cte: marker should be resolved to the previous CTE
+        MARKER_COLLECTION_RESULT = ":collection_result_cte:"
+        if source_table == MARKER_COLLECTION_RESULT:
+            if previous_cte:
+                source_table = previous_cte
+                logger.info(f"SP-110: Resolved marker {MARKER_COLLECTION_RESULT} to {previous_cte}")
+            else:
+                raise ValueError(
+                    f"Marker {MARKER_COLLECTION_RESULT} found but no previous CTE available to resolve it"
+                )
+
+        # SP-110: Resolve marker for filtered descendants result CTE
+        # The :descendants_filtered_cte: marker should be resolved to the previous CTE
+        MARKER_DESCENDANTS_FILTERED = ":descendants_filtered_cte:"
+        if source_table == MARKER_DESCENDANTS_FILTERED:
+            if previous_cte:
+                source_table = previous_cte
+                logger.info(f"SP-110: Resolved marker {MARKER_DESCENDANTS_FILTERED} to {previous_cte}")
+            else:
+                raise ValueError(
+                    f"Marker {MARKER_DESCENDANTS_FILTERED} found but no previous CTE available to resolve it"
                 )
 
         if not source_table:
@@ -661,18 +728,51 @@ class CTEManager:
             )
             is_repeat_navigation = True
 
+        # SP-110: Handle navigation from children() or descendants() results
+        # Similar to repeat_result, we need to fix array_column references to use previous_cte
+        if fragment.requires_unnest and fragment.metadata.get('from_collection_result'):
+            if not fragment.metadata:
+                fragment.metadata = {}
+
+            array_col = fragment.metadata.get("array_column", "")
+            collection_function = fragment.metadata.get("collection_function", "")
+
+            # Resolve the :collection_result_cte: marker in array_column and expression
+            MARKER_COLLECTION_RESULT = ":collection_result_cte:"
+            if MARKER_COLLECTION_RESULT in array_col:
+                # Replace marker with actual source_table (which is now resolved to previous_cte)
+                fixed_array_col = array_col.replace(MARKER_COLLECTION_RESULT, source_table)
+                fragment.metadata["array_column"] = fixed_array_col
+                fragment.expression = fixed_array_col
+                logger.info(
+                    f"SP-110-CTE: Resolved collection marker in array_column: {array_col} -> {fixed_array_col}"
+                )
+
+            # Also check expression for the marker
+            if fragment.expression and MARKER_COLLECTION_RESULT in fragment.expression:
+                fixed_expr = fragment.expression.replace(MARKER_COLLECTION_RESULT, source_table)
+                fragment.expression = fixed_expr
+                logger.info(f"SP-110-CTE: Resolved collection marker in expression")
+
+            logger.info(
+                f"SP-110-CTE: Wrapping {collection_function} result fragment. "
+                f"array_column={fragment.metadata.get('array_column')}, source_table={source_table}"
+            )
+
         if fragment.requires_unnest:
             query, order_column = self._wrap_unnest_query(
                 fragment, source_table, cte_name, ordering_columns or []
             )
         else:
-            query = self._wrap_simple_query(
-                fragment, source_table, ordering_columns or [], auto_preserve_columns
+            # SP-110-FIX-011: Pass cte_name to _wrap_simple_query so it can create
+            # ordering columns for skip/take/first/last operations
+            query, order_column = self._wrap_simple_query(
+                fragment, source_table, cte_name, ordering_columns or [], auto_preserve_columns
             )
-            order_column = None
 
         dependencies: List[str] = []
-        if previous_cte:
+        # SP-110-fix-003: For self-contained fragments, don't add previous_cte as a dependency
+        if previous_cte and not is_self_contained:
             dependencies.append(previous_cte)
         dependencies.extend(fragment.dependencies)
 
@@ -770,9 +870,10 @@ class CTEManager:
         return columns
 
     def _wrap_simple_query(
-        self, fragment: SQLFragment, source_table: str, ordering_columns: List[str],
+        self, fragment: SQLFragment, source_table: str, cte_name: str,
+        ordering_columns: List[str],
         auto_preserve_columns: Optional[Set[str]] = None
-    ) -> str:
+    ) -> tuple[str, Optional[str]]:
         """Wrap a non-UNNEST fragment in a population-first SELECT statement.
 
         For fragments that produce scalar expressions (e.g., JSON extraction,
@@ -795,18 +896,50 @@ class CTEManager:
         complete RECURSIVE CTE expression, and we need to extract the element column
         from it so subsequent operations (like UNNEST) can access it.
 
+        SP-110-FIX-011: For skip/take/first/last operations, create a new ROW_NUMBER()
+        column to reset the ordering sequence. This fixes chained operations like
+        skip(n).take(m) where the take should operate on the skipped results, not
+        the original ordering.
+
         Args:
             fragment: SQL fragment to wrap.
             source_table: Table or CTE providing input rows for this fragment.
+            cte_name: Name of the CTE being created (used for generating order column names).
             ordering_columns: Ordering columns from previous UNNESTs to preserve.
 
         Returns:
-            SQL SELECT statement representing the fragment as a CTE query.
+            Tuple of (SELECT query string, order_column_name or None).
+            For skip/take/first/last operations, returns a new order column name.
         """
+        # SP-110-fix-006: Check if fragment is self-contained (e.g., exists(criteria))
+        # Self-contained fragments should NOT propagate columns from previous CTEs
+        # because they only reference the base resource table
+        is_self_contained = fragment.metadata.get("self_contained", False)
+
         expression = fragment.expression.strip()
 
         if not expression:
             raise ValueError("SQLFragment expression cannot be empty when wrapping CTE")
+
+        # SP-110-FIX: For nested exists() calls, use the parent's table alias for <<SOURCE_TABLE>> substitution
+        # When we have nested exists() like: category.exists(coding.exists(...))
+        # - The inner exists() has dependencies = ['exists_0_item'] (parent's table alias)
+        # - We should substitute <<SOURCE_TABLE>> with 'exists_0_item', not with the CTE's source_table
+        # This allows the inner exists() to correctly reference the outer exists()'s table
+        actual_source_table = source_table
+        if hasattr(fragment, "dependencies") and fragment.dependencies:
+            import re
+            for dep in fragment.dependencies:
+                # Check if this dependency is an exists_N_item pattern (parent exists() table alias)
+                if (dep.endswith("_item") and "exists" in dep.lower() and
+                    any(c.isdigit() for c in dep)):
+                    # Use the parent's table alias for substitution
+                    actual_source_table = dep
+                    logger.debug(
+                        f"SP-110-FIX: Substituting <<SOURCE_TABLE>> with parent exists table '{dep}' "
+                        f"instead of CTE source_table '{source_table}'"
+                    )
+                    break
 
         # If the translator already provided a full SELECT statement, respect it.
         # SP-109-004: If it contains <<SOURCE_TABLE>>, substitute the actual source_table
@@ -815,12 +948,12 @@ class CTEManager:
                 # Validate source_table is a safe SQL identifier before substitution
                 # This prevents SQL injection by ensuring only valid table names are used
                 import re
-                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', source_table):
-                    raise ValueError(f"Invalid table name for substitution: {source_table}")
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', actual_source_table):
+                    raise ValueError(f"Invalid table name for substitution: {actual_source_table}")
                 # Substitute <<SOURCE_TABLE>> with the actual source_table
                 # This handles both "<<SOURCE_TABLE>>" and "<<SOURCE_TABLE>>.result"
                 original_expression = expression
-                expression = expression.replace('<<SOURCE_TABLE>>', source_table)
+                expression = expression.replace('<<SOURCE_TABLE>>', actual_source_table)
                 # Verify substitution was successful
                 if "<<SOURCE_TABLE>>" in expression:
                     raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
@@ -831,10 +964,10 @@ class CTEManager:
         # but still contains <<SOURCE_TABLE>>.result references that need substitution.
         if "<<SOURCE_TABLE>>" in expression:
             import re
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', source_table):
-                raise ValueError(f"Invalid table name for substitution: {source_table}")
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', actual_source_table):
+                raise ValueError(f"Invalid table name for substitution: {actual_source_table}")
             original_expression = expression
-            expression = expression.replace('<<SOURCE_TABLE>>', source_table)
+            expression = expression.replace('<<SOURCE_TABLE>>', actual_source_table)
             if "<<SOURCE_TABLE>>" in expression:
                 raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
 
@@ -1021,10 +1154,12 @@ class CTEManager:
 
         # SP-110-006: Auto-preserve columns from previous CTEs
         # SP-110-AUTOPILOT: Skip for aggregate functions to avoid GROUP BY errors
+        # SP-110-fix-006: Skip for self-contained fragments (exists(criteria)) to avoid
+        # propagating columns from previous CTEs that aren't accessible
         # When the fragment expression doesn't explicitly reference columns from a previous
         # CTE but those columns should be propagated (e.g., when the translator incorrectly
         # sets source_table to "resource" instead of the previous CTE), add them here.
-        if auto_preserve_columns and not fragment.is_aggregate:
+        if auto_preserve_columns and not fragment.is_aggregate and not is_self_contained:
             for col_name in auto_preserve_columns:
                 # Skip if already added via propagated_item_columns or qualified_item_columns
                 if col_name in propagated_item_columns or any(q.endswith(f".{col_name}") for q in qualified_item_columns):
@@ -1165,7 +1300,13 @@ class CTEManager:
                     f"SP-110-006: Wrapped repeat() expression as subquery with result alias '{result_alias}', marked as repeat_result"
                 )
             else:
-                columns.append(f"{expression} AS {result_alias}")
+                # SP-110-FIX-009: Always add BOTH the result_alias column AND the result column
+                # This matches the UNNEST behavior and ensures the final SELECT can reference 'result'
+                # Format: "{expression} AS {result_alias}, {expression} AS result"
+                columns.append(f"{expression} AS {result_alias}, {expression} AS result")
+                logger.debug(
+                    f"SP-110-FIX-009: Added both '{result_alias}' and 'result' columns for simple query"
+                )
 
             # SP-110-AUTOPILOT: Store preserved columns for GROUP BY handling
             if preserved_non_aggregate_columns:
@@ -1175,10 +1316,75 @@ class CTEManager:
                     f"SP-110-AUTOPILOT: Tracked {len(preserved_non_aggregate_columns)} preserved columns for GROUP BY: {preserved_non_aggregate_columns}"
                 )
 
-        query = (
+        # SP-110-FIX: For nested exists() calls, include parent exists tables in FROM clause
+        # When we have category.exists(coding.exists(...)), the inner exists() needs to reference
+        # the outer exists()'s table (exists_0_item) in its FROM clause.
+        # Check if fragment has dependencies on parent exists tables AND parse the expression
+        # for exists_N_item references that may not be in dependencies.
+        from_clause_parts = [source_table]
+        import re
+
+        # Track which exists_N_item tables we've already added to avoid duplicates
+        added_tables = set()
+
+        # First, check dependencies for exists_N_item patterns
+        if hasattr(fragment, "dependencies") and fragment.dependencies:
+            for dep in fragment.dependencies:
+                # Check if this dependency is an exists_N_item pattern (parent exists() table alias)
+                # that is different from the current source_table
+                if (dep.endswith("_item") and "exists" in dep.lower() and
+                    any(c.isdigit() for c in dep) and dep != source_table):
+                    # Add the parent exists table to the FROM clause
+                    from_clause_parts.append(dep)
+                    added_tables.add(dep)
+                    logger.debug(
+                        f"SP-110-FIX: Added parent exists table '{dep}' to FROM clause "
+                        f"from dependencies for nested exists() expression"
+                    )
+
+        # Second, parse the expression for exists_N_item references that may not be in dependencies
+        # This handles cases like 'json_extract_string(exists_0_item, '$.coding')' where exists_0_item
+        # is used in the expression but not listed in dependencies.
+        exists_refs = re.findall(r'\b(exists_\d+_item)\b', expression)
+        for ref in exists_refs:
+            if ref != source_table and ref not in added_tables:
+                # Add this parent exists table to the FROM clause
+                from_clause_parts.append(ref)
+                added_tables.add(ref)
+                logger.debug(
+                    f"SP-110-FIX: Added parent exists table '{ref}' to FROM clause "
+                    f"from expression parsing for nested exists() expression"
+                )
+
+        # SP-110-FIX-011: For skip/take/first/last operations, create a new ROW_NUMBER() column
+        # to reset the ordering sequence. This fixes chained operations like skip(n).take(m)
+        # where the take should operate on the skipped results (with new ordering 1,2,3...),
+        # not the original ordering.
+        #
+        # IMPORTANT: Window functions cannot be used in WHERE clauses, so we need to wrap
+        # the query in a subquery when we have a subset_filter.
+        subset_filter = fragment.metadata.get("subset_filter")
+        new_order_column = None
+        if subset_filter and ordering_columns:
+            # Create a new ROW_NUMBER() column for the filtered results
+            new_order_column = f"{cte_name}_order"
+            # Use the LAST ordering column for ORDER BY (innermost collection level)
+            last_order_col = ordering_columns[-1]
+            # Create ROW_NUMBER() partitioned by id ONLY, ordered by the last ordering column
+            # This ensures we restart ordering at 1 for each patient
+            # The ORDER BY uses the last ordering column to preserve the original order
+            row_number_clause = f"ROW_NUMBER() OVER (PARTITION BY {id_column} ORDER BY {last_order_col}) AS {new_order_column}"
+            columns.append(row_number_clause)
+            logger.info(
+                f"SP-110-FIX-011: Created new order column '{new_order_column}' for subset_filter '{subset_filter}' "
+                f"partitioned by {id_column}, ordered by {last_order_col}"
+            )
+
+        # Build the base query
+        base_query = (
             "SELECT "
             + ", ".join(columns) + "\n"
-            f"FROM {source_table}"
+            f"FROM {', '.join(from_clause_parts)}"
         )
 
         # SP-025-003: Add GROUP BY clause for aggregate functions
@@ -1245,20 +1451,43 @@ class CTEManager:
 
             # Add GROUP BY clause if we have columns to group by
             if group_by_columns:
-                query += f"\nGROUP BY {', '.join(group_by_columns)}"
+                base_query += f"\nGROUP BY {', '.join(group_by_columns)}"
 
         # SP-022-004: Add WHERE clause for row filtering (first/last/skip/take)
         if fragment.metadata.get("filter"):
-            query += f"\nWHERE {fragment.metadata['filter']}"
+            base_query += f"\nWHERE {fragment.metadata['filter']}"
 
         # SP-022-012: Add WHERE clause for where() function filtering on unnested collections
         where_filter = fragment.metadata.get("where_filter")
         if where_filter:
-            query += f"\nWHERE {where_filter}"
+            base_query += f"\nWHERE {where_filter}"
 
-        # SP-022-004: Handle subset filters (first/last/skip/take on unnested collections)
+        # SP-110-FIX-011: For subset filters (skip/take/first/last), we need to wrap the query
+        # in a subquery because window functions cannot be used in WHERE clauses.
+        # The subquery creates the ROW_NUMBER() column, and the outer query filters on it.
         subset_filter = fragment.metadata.get("subset_filter")
-        if subset_filter and ordering_columns:
+        if subset_filter and new_order_column:
+            # Build the filter clause using the new order column
+            filter_clause = self._build_subset_filter(
+                subset_filter,
+                [new_order_column],  # Use NEW order column
+                fragment.metadata.get("subset_count"),
+                cte_name,  # Use cte_name as the source_table for the subquery
+            )
+
+            if filter_clause:
+                # Wrap the base query in a subquery and filter on the new order column
+                # Select all columns from the subquery, preserving the result column as last
+                query = f"SELECT * FROM ({base_query}) AS {cte_name}_inner WHERE {filter_clause}"
+                logger.info(
+                    f"SP-110-FIX-011: Wrapped query in subquery for subset_filter '{subset_filter}', "
+                    f"filtering on new order column '{new_order_column}'"
+                )
+            else:
+                # No filter needed, use base query as-is
+                query = base_query
+        elif subset_filter and ordering_columns:
+            # Fallback to old behavior for non-subset operations
             filter_clause = self._build_subset_filter(
                 subset_filter,
                 ordering_columns,
@@ -1266,9 +1495,15 @@ class CTEManager:
                 source_table,  # Pass source_table for subquery-based filters
             )
             if filter_clause:
-                query += f"\nWHERE {filter_clause}"
+                base_query += f"\nWHERE {filter_clause}"
+            query = base_query
+        else:
+            # No subset filter, use base query as-is
+            query = base_query
 
-        return query
+        # SP-110-FIX-011: Return the new order column name for skip/take/first/last operations
+        # This ensures subsequent CTEs can use the new ordering sequence
+        return query, new_order_column
 
     def _build_subset_filter(
         self,
@@ -1329,15 +1564,21 @@ class CTEManager:
                 return " AND ".join(conditions)
 
         elif filter_type == "skip" and count is not None:
-            # For skip(n), the first ordering column must be > n
+            # SP-110-FIX-010: For skip(n), use the LAST ordering column (represents current collection level)
+            # For multi-level collections like name.given, we need to use the innermost ordering column
+            # that represents the current collection, not the first one (which represents the outer collection).
             if ordering_columns:
-                return f"{ordering_columns[0]} > {count}"
+                order_column = ordering_columns[-1]  # Use LAST ordering column, not first
+                return f"{order_column} > {count}"
             return ""
 
         elif filter_type == "take" and count is not None:
-            # For take(n), the first ordering column must be <= n
+            # SP-110-FIX-010: For take(n), use the LAST ordering column (represents current collection level)
+            # For multi-level collections like name.given, we need to use the innermost ordering column
+            # that represents the current collection, not the first one (which represents the outer collection).
             if ordering_columns:
-                return f"{ordering_columns[0]} <= {count}"
+                order_column = ordering_columns[-1]  # Use LAST ordering column, not first
+                return f"{order_column} <= {count}"
             return ""
 
         return ""
@@ -1462,21 +1703,37 @@ class CTEManager:
                 array_column
             )
 
-        generate_lateral_unnest = getattr(self.dialect, "generate_lateral_unnest", None)
-        if generate_lateral_unnest is None:
-            raise AttributeError(
-                f"{self.dialect.__class__.__name__} must implement "
-                "'generate_lateral_unnest' for UNNEST operations"
-            )
+        # SP-110 FIX: Special handling for repeat() results
+        # Use json_each() instead of LATERAL UNNEST() for repeat() results
+        # because repeat() returns a JSON array that needs element-wise iteration
+        if metadata.get('from_repeat_result'):
+            # For repeat() results, use json_each() to iterate over the JSON array
+            # Syntax: FROM source, json_each(source.result_column) AS json_table
+            # Then extract property from json_table.value in the expression
+            unnest_clause = f"json_each({array_column}) AS json_table"
+            logger.info(f"SP-110-CTE: Using json_each() for repeat() result: {unnest_clause}")
+        else:
+            # Standard UNNEST handling for other cases
+            generate_lateral_unnest = getattr(self.dialect, "generate_lateral_unnest", None)
+            if generate_lateral_unnest is None:
+                raise AttributeError(
+                    f"{self.dialect.__class__.__name__} must implement "
+                    "'generate_lateral_unnest' for UNNEST operations"
+                )
 
-        prepared_array = self.dialect.prepare_unnest_source(array_column)
-        unnest_clause = generate_lateral_unnest(source, prepared_array, result_alias)
+            prepared_array = self.dialect.prepare_unnest_source(array_column)
+            unnest_clause = generate_lateral_unnest(source, prepared_array, result_alias)
 
         projection_expression_raw = metadata.get("projection_expression")
         if projection_expression_raw:
             projected_column = projection_expression_raw.strip()
         else:
-            projected_column = result_alias
+            # SP-110 FIX: For repeat() results, use the expression from the fragment
+            # which contains the property extraction (e.g., json_extract(json_table.value, '$.code'))
+            if metadata.get('from_repeat_result'):
+                projected_column = expression.strip()
+            else:
+                projected_column = result_alias
 
         # SP-110-008 FIX: Always ensure "result" column is available in UNNEST CTE output
         # When projected_column differs from result_alias (e.g., a projection expression),
@@ -1490,6 +1747,7 @@ class CTEManager:
             select_projection = f"{result_alias} AS {result_alias}, {result_alias} AS result"
         else:
             # Complex projection expression (e.g., json_extract_string(given_item, '$.family'))
+            # or for repeat() results: json_extract(json_table.value, '$.code')
             # Output: "json_extract_string(...) AS given_item, json_extract_string(...) AS result"
             select_projection = f"{projected_column} AS {result_alias}, {projected_column} AS result"
 
@@ -1602,6 +1860,14 @@ class CTEManager:
         # When we have UNNEST operations followed by aggregate functions,
         # we need to aggregate the unnested rows into a single result
         final_cte = ordered_ctes[-1]
+
+        # SP-110-fix-004: For self-contained fragments (like exists(criteria)),
+        # clear ordering_columns from previous CTEs since they're not accessible
+        is_self_contained = final_cte.metadata.get("self_contained", False)
+        if is_self_contained:
+            logger.debug(f"SP-110-fix-004: Clearing ordering_columns for self-contained final CTE {final_cte.name}")
+            ordering_columns = []
+
         needs_aggregation = self._needs_collection_aggregation(
             final_cte, has_unnest, ordering_columns
         )
@@ -1651,7 +1917,15 @@ class CTEManager:
 
         # Check if final CTE is an aggregate function
         function_name = final_cte.metadata.get("function", "")
-        aggregate_functions = {"count", "empty", "exists"}
+        # SP-110-AGGREGATE-FIX: Include sum, avg, min, max as aggregate functions
+        aggregate_functions = {"count", "empty", "exists", "sum", "avg", "min", "max"}
+
+        # SP-110-fix-004: Check if aggregation should be skipped
+        # For exists(criteria), the result is already aggregated in the EXISTS subquery
+        skip_aggregation = final_cte.metadata.get("skip_aggregation", False)
+        if skip_aggregation:
+            logger.debug(f"SP-110-fix-004: Skipping aggregation for {final_cte.name} due to skip_aggregation flag")
+            return False
 
         # SP-108-001: Check if final CTE is a comparison involving an aggregate function
         # For example, count() > 5 should trigger aggregation
@@ -1739,7 +2013,34 @@ class CTEManager:
 
         # Generate aggregation expression based on function type
         if function_name == "count":
-            base_agg = "COUNT(*)"
+            # SP-110-012: Check if this is a custom count expression (e.g., from select().count())
+            # Custom count expressions are marked with custom_count_expr=True metadata
+            is_custom_count_expr = final_cte.metadata.get("custom_count_expr", False)
+
+            if is_custom_count_expr:
+                # Use the custom expression but replace "result" with "{source_cte.name}.result"
+                # The expression uses unqualified "result" column, we need to add the table qualifier
+                import re
+                # Find the source CTE (the one before the aggregate function CTE)
+                if len(ctes) >= 2:
+                    source_cte = ctes[-2]  # CTE before the aggregate function CTE
+                else:
+                    source_cte = final_cte
+
+                # Replace "result" references with "{source_cte.name}.result"
+                # But be careful not to replace words that contain "result" like "result_column"
+                custom_expr = source_expr
+                # Replace standalone "result" references (not already qualified)
+                # Match: result, result), result IS NULL, json_type(result), etc.
+                # Don't match: something.result, result_something, etc.
+                custom_expr = re.sub(r'\bresult\b', f'{source_cte.name}.result', custom_expr)
+
+                base_agg = custom_expr
+                logger.debug(f"SP-110-012: Using custom count expression with source_cte qualifier: {base_agg[:100]}")
+            else:
+                # Standard count: use COUNT(*)
+                base_agg = "COUNT(*)"
+
             # SP-108-001: Apply unary operator if present
             if unary_operator:
                 base_agg = f"({unary_operator} {base_agg})"
@@ -1769,11 +2070,53 @@ class CTEManager:
                 agg_expr = f"({base_result} {comparison_op} {comparison_val})"
             else:
                 agg_expr = base_result
+        elif function_name == "sum":
+            # SP-110-AGGREGATE-FIX: Handle sum() aggregation
+            # sum() operates on the result column from previous CTE
+            base_agg = f"COALESCE(SUM(CAST({source_cte.name}.result AS DECIMAL)), 0)"
+            if unary_operator:
+                base_agg = f"({unary_operator} {base_agg})"
+            if comparison_op:
+                agg_expr = f"({base_agg} {comparison_op} {comparison_val})"
+            else:
+                agg_expr = base_agg
+        elif function_name == "avg":
+            # SP-110-AGGREGATE-FIX: Handle avg() aggregation
+            # avg() operates on the result column from previous CTE
+            base_agg = f"COALESCE(AVG(CAST({source_cte.name}.result AS DECIMAL)), 0)"
+            if unary_operator:
+                base_agg = f"({unary_operator} {base_agg})"
+            if comparison_op:
+                agg_expr = f"({base_agg} {comparison_op} {comparison_val})"
+            else:
+                agg_expr = base_agg
+        elif function_name == "min":
+            # SP-110-AGGREGATE-FIX: Handle min() aggregation
+            # min() operates on the result column from previous CTE
+            base_agg = f"MIN({source_cte.name}.result)"
+            if unary_operator:
+                base_agg = f"({unary_operator} {base_agg})"
+            if comparison_op:
+                agg_expr = f"({base_agg} {comparison_op} {comparison_val})"
+            else:
+                agg_expr = base_agg
+        elif function_name == "max":
+            # SP-110-AGGREGATE-FIX: Handle max() aggregation
+            # max() operates on the result column from previous CTE
+            base_agg = f"MAX({source_cte.name}.result)"
+            if unary_operator:
+                base_agg = f"({unary_operator} {base_agg})"
+            if comparison_op:
+                agg_expr = f"({base_agg} {comparison_op} {comparison_val})"
+            else:
+                agg_expr = base_agg
         else:
             agg_expr = "COUNT(*)"
 
         # Find the CTE before the final one (the one with actual unnested data)
         # We need to aggregate from the CTE that has the unnested rows
+        # SP-110-AGGREGATE-FIX: Move this before aggregation expression generation
+        # so sum/avg/min/max can reference source_cte.name
         if len(ctes) >= 2:
             source_cte = ctes[-2]  # CTE before the aggregate function CTE
         else:
@@ -1786,22 +2129,34 @@ class CTEManager:
         agg_cte_name = f"cte_{len(ctes) + 1}_agg"
 
         # Check if function_name is empty() or exists() to determine if we need LEFT JOIN
+        # SP-110-AGGREGATE-FIX: Also handle sum/avg/min/max with LEFT JOIN for empty collections
         # Both functions need to return a boolean result even when the collection is empty
-        if function_name in ("empty", "exists"):
+        requires_left_join = function_name in ("empty", "exists", "sum", "avg", "min", "max")
+        if requires_left_join:
             # Use LEFT JOIN to handle empty collections (0 rows in source_cte)
             # When source_cte is empty, LEFT JOIN produces 1 row with NULL values for all source_cte columns
-            # COUNT(source_cte.id) only counts non-null values, so it returns 0 correctly
-            # Note: We use COUNT({source_cte.name}.id) instead of COUNT(*) because COUNT(*) counts rows
-            # For empty(): agg_expr is "(COUNT(*) = 0)", for exists(): "(COUNT(*) > 0)"
-            # We replace COUNT(*) with COUNT(source_cte.id) to count only non-null values
-            count_expr = agg_expr.replace("COUNT(*)", f"COUNT({source_cte.name}.id)")
-            agg_query = (
-                f"SELECT resource.id, resource.resource, "
-                f"{count_expr} AS result\n"
-                f"FROM resource\n"
-                f"LEFT JOIN {source_cte.name} ON resource.id = {source_cte.name}.id\n"
-                f"GROUP BY resource.id, resource.resource"
-            )
+            # For empty()/exists(): replace COUNT(*) with COUNT(source_cte.id)
+            # For sum/avg/min/max: agg_expr already references {source_cte.name}.result, which is NULL for empty collections
+            # So the aggregates will naturally return NULL/0, and we use COALESCE to provide defaults
+            if function_name in ("empty", "exists"):
+                count_expr = agg_expr.replace("COUNT(*)", f"COUNT({source_cte.name}.id)")
+                agg_query = (
+                    f"SELECT resource.id, resource.resource, "
+                    f"{count_expr} AS result\n"
+                    f"FROM resource\n"
+                    f"LEFT JOIN {source_cte.name} ON resource.id = {source_cte.name}.id\n"
+                    f"GROUP BY resource.id, resource.resource"
+                )
+            else:
+                # For sum/avg/min/max, the agg_expr already references {source_cte.name}.result
+                # Use LEFT JOIN to ensure we get 1 row per resource even for empty collections
+                agg_query = (
+                    f"SELECT resource.id, resource.resource, "
+                    f"{agg_expr} AS result\n"
+                    f"FROM resource\n"
+                    f"LEFT JOIN {source_cte.name} ON resource.id = {source_cte.name}.id\n"
+                    f"GROUP BY resource.id, resource.resource"
+                )
         else:
             # Original behavior for other aggregate functions
             agg_query = (
