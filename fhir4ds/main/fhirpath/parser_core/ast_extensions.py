@@ -808,7 +808,15 @@ class EnhancedASTNode:
                         # Check direct children first for ParamList/FuncParamList
                         for child in node.children:
                             if child.node_type in ('ParamList', 'FuncParamList'):
-                                return child.children
+                                # SP-110-SET-OPS: Detect literal collection and wrap as single argument
+                                # A literal collection like {'John', 'Jane'} parses as multiple
+                                # TermExpression nodes. We need to wrap them into a single argument.
+                                # Only applies to specific functions like subsetOf, supersetOf, etc.
+                                children = child.children
+                                if self._is_literal_collection(children, self.function_name):
+                                    # Wrap as a single LiteralCollection argument
+                                    return [self._wrap_literal_collection(children)]
+                                return children
 
                         # Look for Functn -> ParamList/FuncParamList pattern (legacy structure)
                         for child in node.children:
@@ -817,13 +825,90 @@ class EnhancedASTNode:
                                 for grandchild in child.children:
                                     # SP-109-003: Handle both ParamList and FuncParamList node types
                                     if grandchild.node_type in ('ParamList', 'FuncParamList'):
-                                        return grandchild.children
+                                        children = grandchild.children
+                                        # SP-110-SET-OPS: Detect literal collection
+                                        if self._is_literal_collection(children, self.function_name):
+                                            return [self._wrap_literal_collection(children)]
+                                        return children
                                 # If Functn found but no ParamList/FuncParamList, it means empty arguments
                                 return []
 
                         # If no Functn found, fallback to filtering children
                         # This handles cases where arguments might be direct children (unlikely in this parser)
                         return [c for c in node.children if c.node_type != 'Identifier' and c.text != self.function_name]
+
+                    def _is_literal_collection(self, children, function_name=''):
+                        """Check if children form a literal collection like {'a', 'b', 'c'}.
+
+                        A literal collection is characterized by:
+                        - Multiple TermExpression nodes
+                        - Each TermExpression contains a literal child
+                        - Only applies to specific functions (subsetOf, supersetOf, etc.)
+
+                        Args:
+                            children: List of AST nodes to check
+                            function_name: Name of the function being called
+
+                        Returns:
+                            True if children form a literal collection, False otherwise
+                        """
+                        if not children or len(children) < 2:
+                            return False
+
+                        # SP-110-IIF: Only wrap as literal collection for specific functions
+                        # Functions like iif(), select(), where() legitimately take multiple
+                        # separate arguments and should NOT have them wrapped as a collection.
+                        literal_collection_functions = {
+                            'subsetof', 'supersetof', 'union', 'intersect', 'exclude'
+                        }
+
+                        if function_name.lower() not in literal_collection_functions:
+                            return False
+
+                        # All children must be TermExpression with literal content
+                        for child in children:
+                            if child.node_type != 'TermExpression':
+                                return False
+                            # Check if it has a literal child or is itself a literal
+                            has_literal = (
+                                child.text.startswith('{') or
+                                child.text.startswith("'") or
+                                child.text.startswith('"') or
+                                any(gc.node_type == 'literal' for gc in child.children if hasattr(gc, 'node_type'))
+                            )
+                            if not has_literal:
+                                return False
+
+                        return True
+
+                    def _wrap_literal_collection(self, children):
+                        """Wrap literal collection elements into a single collection node.
+
+                        Creates a wrapper node that represents the entire literal collection
+                        so it's treated as a single argument to functions like subsetOf().
+
+                        Args:
+                            children: List of TermExpression nodes forming the collection
+
+                        Returns:
+                            EnhancedASTNode representing the literal collection
+                        """
+                        # Create a collection wrapper node
+                        from .metadata_types import MetadataBuilder
+
+                        collection_node = EnhancedASTNode(
+                            node_type='LiteralCollection',
+                            text='{' + ', '.join(c.text for c in children) + '}',
+                            children=children,
+                            metadata=MetadataBuilder().build()
+                        )
+                        # Mark it as a collection for downstream processing
+                        if hasattr(collection_node.metadata, 'custom_attributes'):
+                            collection_node.metadata.custom_attributes['is_literal_collection'] = True
+                        else:
+                            collection_node.metadata.custom_attributes = {'is_literal_collection': True}
+
+                        return collection_node
 
                     def accept(self, v):
                         return v.visit_function_call(self)
@@ -884,6 +969,13 @@ class EnhancedASTNode:
                         def accept(self, v):
                             return v.visit_function_call(self)
                     return MembershipExpressionAdapter(self).accept(visitor)
+
+                # SP-110-INDEXER: Handle IndexerExpression for array indexing
+                # The expression 'name[0]' should be routed to visit_generic for proper handling
+                # by the translator's _translate_indexer_expression method.
+                if self.node_type == "IndexerExpression":
+                    # Route to visit_generic which will dispatch to _translate_indexer_expression
+                    return visitor.visit_generic(self)
 
                 # Special case: If this is a wrapper node (like TermExpression) with a single
                 # child, unwrap it and visit the child directly. This prevents wrapper nodes
@@ -1468,10 +1560,20 @@ class ASTNodeFactory:
     def _extract_quantity_info(fhirpath_node: Union[Dict[str, Any], Any]) -> tuple[Optional[str], Optional[str]]:
         """Extract quantity value and unit from a QuantityLiteral node.
 
+        SP-110-FIX-013: Add unit alias mapping for temporal units to support
+        abbreviated UCUM codes like 'mo' (month) and 'a' (year).
+
         Returns:
             Tuple of (value_str, unit_str) where value_str is the numeric value as string
             and unit_str is the unit (e.g., 'days', 'wk'). Returns (None, None) if not found.
         """
+        # SP-110-FIX-013: Temporal unit alias mappings per UCUM specification
+        # These map common abbreviations to their canonical unit names
+        UNIT_ALIASES = {
+            'mo': 'month',
+            'a': 'year',
+        }
+
         if isinstance(fhirpath_node, dict):
             children = fhirpath_node.get('children', [])
             terminal_node_text = fhirpath_node.get('terminalNodeText', [])
@@ -1523,6 +1625,10 @@ class ASTNodeFactory:
                             # Remove quotes from string literal
                             unit_str = gc_terminal[0].strip().strip('\'"')
                             break
+
+        # SP-110-FIX-013: Apply unit alias mapping to normalize abbreviated units
+        if unit_str and unit_str.lower() in UNIT_ALIASES:
+            unit_str = UNIT_ALIASES[unit_str.lower()]
 
         return value_str, unit_str
 

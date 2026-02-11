@@ -1242,13 +1242,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # SP-110-002: Check if it's already a QuantityLiteralMarker (from quantity literals like "5 'mg'")
         if hasattr(value, 'value') and hasattr(value, 'unit'):
             # It's already a quantity literal marker
+            # SP-110-FIX-013: Normalize unit before building quantity JSON
             from ..types.quantity_builder import build_quantity_json_string
-            return build_quantity_json_string(value.value, value.unit)
+            normalized_unit = self._normalize_quantity_unit(value.unit) if value.unit else value.unit
+            unit_to_use = normalized_unit if normalized_unit else (value.unit or '1')
+            return build_quantity_json_string(value.value, unit_to_use)
 
         # SP-110-002: Check for NegatedQuantityMarker (from negated quantity literals like "-5 'mg'")
         if hasattr(value, 'is_negated_quantity') and value.is_negated_quantity:
             from ..types.quantity_builder import build_quantity_json_string
-            return build_quantity_json_string(value.value, value.unit)
+            # SP-110-FIX-013: Normalize unit before building quantity JSON
+            normalized_unit = self._normalize_quantity_unit(value.unit) if value.unit else value.unit
+            unit_to_use = normalized_unit if normalized_unit else (value.unit or '1')
+            return build_quantity_json_string(value.value, unit_to_use)
 
         # Boolean -> Quantity: true -> 1.0 '1', false -> 0.0 '1'
         if isinstance(value, bool):
@@ -1291,6 +1297,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                             unit = unit_part[1:-1]
                         else:
                             unit = unit_part
+                        # SP-110-FIX-013: Normalize unit to canonical form
+                        normalized_unit = self._normalize_quantity_unit(unit)
+                        unit = normalized_unit if normalized_unit else unit
                     else:
                         # No unit specified, use '1' as default (FHIR convention)
                         unit = '1'
@@ -5179,6 +5188,67 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         return False
 
+    def _is_decimal_operand(self, ast_node: FHIRPathASTNode) -> bool:
+        """Check if an AST node represents a decimal/numeric type operand.
+
+        SP-110-FIX-013: Used to determine whether to apply tolerance-based
+        comparison for equivalence operators (~, !~) on decimal/quantity types.
+
+        Args:
+            ast_node: The AST node to check
+
+        Returns:
+            True if the operand is a decimal/numeric type, False otherwise
+        """
+        # SP-110-FIX-013: Check metadata for quantity literal type
+        # This handles quantities that have been converted to JSON literals
+        if hasattr(ast_node, 'metadata') and ast_node.metadata:
+            literal_type = ast_node.metadata.custom_attributes.get('literal_type') if ast_node.metadata.custom_attributes else None
+            if literal_type == 'quantity':
+                return True
+
+        # Check for EnhancedASTNode with text attribute (handles decimal literals and functions)
+        if hasattr(ast_node, 'text') and ast_node.text:
+            text = ast_node.text.strip()
+            # Check if it's a decimal literal (contains '.')
+            if '.' in text and text.replace('.', '').replace('-', '').isdigit():
+                return True
+            # SP-110-FIX-013: Check for function calls that produce decimals
+            # This handles EnhancedASTNode which stores function names in text
+            # Do this BEFORE checking children, to catch wrapper nodes like "toQuantity()"
+            if text.endswith('()'):
+                function_name = text[:-2].lower()  # Remove "()" and lowercase
+                decimal_functions = {"toquantity", "abs", "ceiling", "floor", "truncate",
+                                     "exp", "log", "ln", "power", "sqrt"}
+                if function_name in decimal_functions:
+                    return True
+
+        # Check children for decimal literals (handles wrapper nodes)
+        if hasattr(ast_node, 'children') and ast_node.children:
+            for child in ast_node.children:
+                if self._is_decimal_operand(child):
+                    return True
+
+        # Check if it's a LiteralNode (for backwards compatibility)
+        if isinstance(ast_node, LiteralNode):
+            literal_type = getattr(ast_node, "literal_type", None)
+            return literal_type in ("decimal", "integer", "quantity")
+
+        # Check for operator nodes that produce decimal results (arithmetic operators)
+        if hasattr(ast_node, 'operator'):
+            # Arithmetic operators: +, -, *, /, div, mod
+            arithmetic_ops = {'+', '-', '*', '/', 'div', 'mod'}
+            if ast_node.operator in arithmetic_ops:
+                return True
+
+        # Functions that produce decimals/quantities (for FunctionCallNode)
+        if isinstance(ast_node, FunctionCallNode):
+            decimal_functions = {"toquantity", "abs", "ceiling", "floor", "truncate",
+                                 "exp", "log", "ln", "power", "sqrt"}
+            return ast_node.function_name.lower() in decimal_functions
+
+        return False
+
     def _generate_equivalence_sql(
         self,
         left_expr: str,
@@ -5206,18 +5276,55 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         operator = "!=" if is_negated else "="
 
-        # Check if either operand is a string type
+        # SP-110-FIX-013: Check if either operand is a decimal/numeric type for tolerance
+        # Check this BEFORE string check, since quantities should use tolerance-based comparison
+        left_is_decimal = self._is_decimal_operand(left_node)
+        right_is_decimal = self._is_decimal_operand(right_node)
+
+        # Check if either operand is a string type (used if not decimal)
         left_is_string = self._is_string_operand(left_node)
         right_is_string = self._is_string_operand(right_node)
 
-        if left_is_string or right_is_string:
+        # SP-110-FIX-013: Decimal/Quantity equivalence takes precedence over string equivalence
+        # This handles cases like '1.0'.toQuantity() which might be detected as string due to quotes
+        if left_is_decimal or right_is_decimal:
+            # SP-110-FIX-013: Decimal/Quantity equivalence: tolerance-based comparison
+            # For decimals and quantities, use tolerance to handle floating-point precision
+            # FHIRPath specification defines equivalence for decimals as approximately equal
+            # Tolerance of 0.01 (2 decimal places) is commonly used for UCUM comparisons
+
+            # SP-110-FIX-013: Check if operands are quantity JSON strings
+            # If so, extract the value field for comparison
+            def extract_value_if_quantity(expr: str, node: FHIRPathASTNode) -> str:
+                """Extract quantity value from JSON string if it's a quantity."""
+                # Check if the expression looks like a quantity JSON string
+                # Pattern: '{"value": ..., "unit": ..., ...}' (SQL string literal with JSON inside)
+                expr_stripped = expr.strip()
+                # The expression is a SQL string literal: '{"value": 1.0, ...}'
+                # It starts with single quote, then open brace
+                starts_with_pattern = expr_stripped.startswith("'{") and '"value"' in expr_stripped[:20]
+                has_unit = '"unit"' in expr_stripped
+                if starts_with_pattern and has_unit:
+                    # This is a quantity JSON string - extract the value
+                    return f"CAST(JSON_EXTRACT({expr}, '$.value') AS DECIMAL(18,10))"
+                return expr
+
+            left_value_expr = extract_value_if_quantity(left_expr, left_node)
+            right_value_expr = extract_value_if_quantity(right_expr, right_node)
+
+            tolerance_expr = f"ABS(({left_value_expr} - {right_value_expr}))"
+            if is_negated:
+                comparison = f"({tolerance_expr} >= 0.01)"
+            else:
+                comparison = f"({tolerance_expr} < 0.01)"
+        elif left_is_string or right_is_string:
             # String equivalence: case-insensitive comparison
             # Use LOWER() on both operands, casting to string if needed
             left_lower = f"LOWER(CAST({left_expr} AS VARCHAR))"
             right_lower = f"LOWER(CAST({right_expr} AS VARCHAR))"
             comparison = f"({left_lower} {operator} {right_lower})"
         else:
-            # Non-string equivalence: same as equality
+            # Non-string, non-decimal equivalence: same as equality
             comparison = f"({left_expr} {operator} {right_expr})"
 
         # Handle null semantics for equivalence:
