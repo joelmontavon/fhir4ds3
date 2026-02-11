@@ -416,7 +416,7 @@ class ResultsetComparator:
                 total_comparisons += 1
                 continue
 
-            # Compare the row
+            # Compare row
             row_result = self._compare_rows(left_row, right_row,
                                            left_dialect, right_dialect, i)
             total_comparisons += 1
@@ -424,7 +424,7 @@ class ResultsetComparator:
             if row_result.equal:
                 equal_comparisons += 1
             else:
-                # Parse the reason to create structured differences
+                # Parse reason to create structured differences
                 diff = self._create_difference_from_row_result(row_result, i)
                 differences.append(diff)
 
@@ -562,3 +562,24 @@ def normalize_for_comparison(value: Any,
     """
     normalizer = ResultNormalizer(float_tolerance)
     return normalizer.normalize(value, dialect)
+
+
+# Export default tolerance at module level for convenience
+DEFAULT_FLOAT_TOLERANCE = ResultNormalizer.DEFAULT_FLOAT_TOLERANCE
+
+
+__all__ = [
+    'ComparisonResult',
+    'ResultDifference',
+    'ComparisonSummary',
+    'ResultNormalizer',
+    'ValueComparator',
+    'ResultsetComparator',
+    'DiffFormatter',
+    'ComparisonResult',
+    'ComparisonSummary',
+    'ResultDifference',
+    'compare_database_results',
+    'normalize_for_comparison',
+    'DEFAULT_FLOAT_TOLERANCE',
+]

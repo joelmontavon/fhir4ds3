@@ -957,7 +957,10 @@ class CTEManager:
                 # Verify substitution was successful
                 if "<<SOURCE_TABLE>>" in expression:
                     raise ValueError(f"Failed to substitute <<SOURCE_TABLE>> placeholder in expression: {original_expression[:200]}")
-            return expression
+            # CRITICAL FIX: Return as tuple to ensure proper unpacking
+            # When returning a bare string, Python will iterate over characters during unpacking
+            # Return (expression, None) for early return - second value will be added later if needed
+            return (expression, None)
 
         # SP-110-003: General substitution for <<SOURCE_TABLE>> in non-SELECT expressions
         # This handles cases like allTrue() where the expression is COALESCE((SELECT...))

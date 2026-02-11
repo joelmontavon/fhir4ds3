@@ -8927,7 +8927,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         f"Unsupported chained operation '{component}' after {node.function_name}()"
                     )
 
-                if current_metadata.get("is_collection", False):
+                if current_metadata.get("is_collection"):
                     array_expr = current_metadata.get("array_column", current_expr)
                     projected = self.dialect.project_json_array(array_expr, path_components)
                     current_expr = projected
