@@ -165,6 +165,10 @@ class SemanticValidator:
                 masked_expression,
                 snippet_state
             )
+            self._validate_string_function_arguments(
+                raw_expression,
+                parsed_expression.ast
+            )
             self._validate_element_access(
                 raw_expression,
                 parsed_expression,
@@ -1034,6 +1038,100 @@ class SemanticValidator:
                 f"literal '{literal}' with method call '{method}()'. "
                 f"Use '{operator}{literal}' as a literal value or wrap in parentheses."
             )
+
+    def _validate_string_function_arguments(
+        self,
+        expression: str,
+        parsed_ast: EnhancedASTNode
+    ) -> None:
+        """
+        SP-110-FIX-014: Validate that string functions contain/startsWith/endsWith
+        only accept string arguments, not integer literals.
+
+        According to FHIRPath specification:
+        - string.contains(substring) - substring must be a string
+        - string.startsWith(prefix) - prefix must be a string
+        - string.endsWith(suffix) - suffix must be a string
+
+        Args:
+            expression: Original expression text
+            parsed_ast: Parsed AST node
+
+        Raises:
+            FHIRPathParseError: When integer literal is passed to string functions
+        """
+        # AST-based approach to validate string function arguments
+        # Walk the AST and check function calls to contains/startsWith/endsWith
+        for node in self._iterate_nodes(parsed_ast):
+            if node.node_type != "functionCall":
+                continue
+
+            # Extract function name from node text (e.g., "contains(10)" -> "contains")
+            func_text = node.text.strip()
+            if "(" not in func_text:
+                continue
+
+            func_name = func_text.split("(", 1)[0].strip()
+
+            # Only check contains, startsWith, endsWith functions
+            if func_name.lower() not in {"contains", "startswith", "endswith"}:
+                continue
+
+            # Navigate AST structure to find the argument:
+            # functionCall -> Functn -> ParamList -> TermExpression -> literal
+            arg_node = None
+
+            # The functionCall has one child (Functn) which contains the function structure
+            if not node.children:
+                continue
+            functn_node = node.children[0]
+
+            # Functn has two children: pathExpression (function name) and ParamList
+            if functn_node.node_type not in {"Functn", "FunctionExpression"}:
+                continue
+
+            if len(functn_node.children) < 2:
+                continue
+
+            # Second child of Functn should be ParamList
+            param_list_node = functn_node.children[1]
+            if param_list_node.node_type not in {"ParamList", "paramList"}:
+                continue
+
+            # ParamList should contain the argument (TermExpression)
+            if not param_list_node.children:
+                continue
+
+            term_expr_node = param_list_node.children[0]
+            if term_expr_node.node_type != "TermExpression":
+                continue
+
+            # TermExpression should contain the literal
+            if not term_expr_node.children:
+                continue
+
+            arg_node = term_expr_node.children[0]
+            if arg_node.node_type != "literal":
+                continue
+
+            # Check if the literal text represents an integer
+            arg_text = arg_node.text.strip()
+
+            # A literal is an integer if it's all digits (optionally with +/-)
+            # Check for: 123, +123, -123 (but not 123.45 or '123')
+            if re.fullmatch(r"[+-]?\d+", arg_text):
+                # Found integer literal passed to string function
+                # Find position by searching for the function call in the expression
+                # Use a more specific pattern to avoid false matches
+                search_pattern = func_name + r"\(" + re.escape(arg_text) + r"\)"
+                match = re.search(search_pattern, expression)
+                index = match.start() if match else 0
+                line, column = self._compute_position(expression, index)
+
+                raise FHIRPathParseError(
+                    f"Function {func_name}() requires a string argument, got integer at line {line}, column {column}. "
+                    f"Use {func_name}('{arg_text}') instead of {func_name}({arg_text})."
+                )
 
 
 class FHIRPathExpressionWrapper:

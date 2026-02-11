@@ -67,3 +67,37 @@ def test_escaped_identifier_valid_path(parser):
 def test_escaped_identifier_invalid_path(parser):
     with pytest.raises(FHIRPathParseError, match=r"Unknown element 'givn'.*HumanName"):
         parser.parse("name.`givn`", context={"resourceType": "Patient"})
+
+
+class TestStringFunctionArgumentValidation:
+    """SP-110-FIX-014: Test that string functions reject integer arguments"""
+
+    def test_contains_with_integer_argument_rejected(self, parser):
+        """contains() should reject integer literal arguments"""
+        with pytest.raises(FHIRPathParseError, match=r"Function contains.*requires a string argument, got integer"):
+            parser.parse("name.family.contains(10)")
+
+    def test_contains_with_string_argument_accepted(self, parser):
+        """contains() should accept string literal arguments"""
+        # Should not raise
+        parser.parse("name.family.contains('Smith')")
+
+    def test_startswith_with_integer_argument_rejected(self, parser):
+        """startsWith() should reject integer literal arguments"""
+        with pytest.raises(FHIRPathParseError, match=r"Function startsWith.*requires a string argument, got integer"):
+            parser.parse("name.family.startsWith(123)")
+
+    def test_startswith_with_string_argument_accepted(self, parser):
+        """startsWith() should accept string literal arguments"""
+        # Should not raise
+        parser.parse("name.family.startsWith('Mc')")
+
+    def test_endswith_with_integer_argument_rejected(self, parser):
+        """endsWith() should reject integer literal arguments"""
+        with pytest.raises(FHIRPathParseError, match=r"Function endsWith.*requires a string argument, got integer"):
+            parser.parse("name.family.endsWith(456)")
+
+    def test_endswith_with_string_argument_accepted(self, parser):
+        """endsWith() should accept string literal arguments"""
+        # Should not raise
+        parser.parse("name.family.endsWith('son')")

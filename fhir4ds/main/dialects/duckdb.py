@@ -149,6 +149,25 @@ class DuckDBDialect(DatabaseDialect):
         """
         return f"json_extract({column}, '{path}')::DECIMAL"
 
+    def extract_json_decimal_from_string(self, json_string_expr: str) -> str:
+        """Extract decimal from a JSON string expression.
+
+        Used for extracting the .value field from Quantity JSON strings.
+        The input is a VARCHAR containing JSON, and we parse it as JSON
+        and extract the 'value' field.
+
+        Args:
+            json_string_expr: SQL expression that returns a JSON string (VARCHAR)
+
+        Returns:
+            DuckDB SQL expression: json_extract(CAST(expr AS JSON), '$.value')::DECIMAL
+
+        Example:
+            >>> dialect.extract_json_decimal_from_string("json_extract_string(resource, '$.valueQuantity')")
+            "json_extract(CAST(json_extract_string(resource, '$.valueQuantity') AS JSON), '$.value')::DECIMAL"
+        """
+        return f"json_extract(CAST({json_string_expr} AS JSON), '$.value')::DECIMAL"
+
     def extract_json_boolean(self, column: str, path: str) -> str:
         """Extract JSON field as boolean using DuckDB's json_extract with BOOLEAN cast.
 
@@ -192,6 +211,10 @@ class DuckDBDialect(DatabaseDialect):
         Example:
             >>> dialect.unnest_json_array('resource', '$.name', 'name_item')
             'UNNEST(json_extract(resource, '$.name')) AS name_item(value)'
+
+        Note:
+            The column name is explicitly set to 'value' so that the translator
+            can reference it as {alias}.value in WHERE clauses and other contexts.
         """
         return f"UNNEST(json_extract({column}, '{path}')) AS {alias}(value)"
 
@@ -237,6 +260,19 @@ class DuckDBDialect(DatabaseDialect):
         if args:
             return f"json_array({', '.join(str(arg) for arg in args)})"
         return "json_array()"
+
+    def build_array_literal(self, elements: List[str]) -> str:
+        """Build DuckDB array literal from list of element expressions.
+
+        DuckDB uses list syntax [e1, e2, e3] for array literals.
+
+        Example:
+            >>> dialect.build_array_literal(["'John'", "'Jane'"])
+            "['John', 'Jane']"
+        """
+        if not elements:
+            return "[]"
+        return f"[{', '.join(elements)}]"
 
     def create_json_object(self, *args) -> str:
         """Create JSON object using DuckDB's json_object."""
@@ -611,23 +647,57 @@ class DuckDBDialect(DatabaseDialect):
         else:
             raise ValueError(f"Unknown string function: {function_name}")
 
+    def generate_empty_pattern_replace(self, string_expr: str, replacement_expr: str) -> str:
+        """Generate SQL for replacing empty pattern (inserting between each character).
+
+        FHIRPath spec: 'abc'.replace('', 'x') returns 'xaxbxcx'
+        DuckDB's replace() doesn't handle empty patterns, so we use a different approach:
+        Split string to characters and join with replacement.
+
+        Args:
+            string_expr: SQL expression for the input string
+            replacement_expr: SQL expression for the replacement string
+
+        Returns:
+            SQL expression that produces the correct result
+
+        Example:
+            generate_empty_pattern_replace("'abc'", "'x'")
+            → "'x' || array_to_string(regexp_split_to_array('abc', ''), 'x') || 'x'"
+        """
+        # The approach: split the string into individual characters and join with replacement
+        # regexp_split_to_array('abc', '') returns ['a', 'b', 'c']
+        # array_to_string(['a', 'b', 'c'], 'x') returns 'axbxc'
+        # We need to add replacement at the beginning and end too: 'x' + 'axbxc' + 'x' = 'xaxbxcx'
+
+        # First, handle NULL input
+        return (
+            f"CASE WHEN {string_expr} IS NULL THEN NULL "
+            f"ELSE {replacement_expr} || array_to_string(regexp_split_to_array({string_expr}, ''), {replacement_expr}) || {replacement_expr} END"
+        )
+
     def generate_regex_match(self, string_expr: str, regex_pattern: str) -> str:
         """Generate regex matching SQL for DuckDB.
 
         Uses DuckDB's regexp_matches() function for PCRE-compatible regex matching.
+
+        FHIRPath matches() uses single-line mode (DOTALL): the dot (.) matches any
+        character including newline. This is achieved by prepending (?s) to the pattern.
 
         Args:
             string_expr: SQL expression evaluating to string
             regex_pattern: SQL expression for regex pattern
 
         Returns:
-            SQL expression using DuckDB's regexp_matches() function
+            SQL expression using DuckDB's regexp_matches() function with (?s) flag
 
         Example:
             generate_regex_match("patient_name", "'[A-Z][a-z]+'")
-            → "regexp_matches(patient_name, '[A-Z][a-z]+')"
+            → "regexp_matches(patient_name, '(?s)[A-Z][a-z]+')"
         """
-        return f"regexp_matches({string_expr}, {regex_pattern})"
+        # FHIRPath spec: matches() uses single-line mode where . matches newlines
+        # The (?s) flag enables PCRE_DOTALL mode in DuckDB
+        return f"regexp_matches({string_expr}, '(?s)' || {regex_pattern})"
 
     def generate_regex_replace(self, string_expr: str, regex_pattern: str, substitution: str) -> str:
         """Generate regex replacement SQL for DuckDB.
@@ -635,19 +705,35 @@ class DuckDBDialect(DatabaseDialect):
         Uses DuckDB's regexp_replace() function for PCRE-compatible regex replacement.
         The 'g' flag enables global replacement (all matches replaced).
 
+        FHIRPath replaceMatches() uses single-line mode (DOTALL): the dot (.) matches any
+        character including newline. This is achieved by prepending (?s) to the pattern.
+
         Args:
             string_expr: SQL expression evaluating to string
             regex_pattern: SQL expression for regex pattern
             substitution: SQL expression for replacement string (can include $1, $2, etc.)
 
         Returns:
-            SQL expression using DuckDB's regexp_replace() function
+            SQL expression using DuckDB's regexp_replace() function with (?s) flag
 
         Example:
             generate_regex_replace("patient_name", "'\\d+'", "'XXX'")
-            → "regexp_replace(patient_name, '\\d+', 'XXX', 'g')"
+            → "regexp_replace(patient_name, '(?s)\\d+', 'XXX', 'g')"
+
+        Note:
+            Empty pattern: Per FHIRPath spec, replaceMatches('', 'x') returns original string.
+            This is a special case - empty regex should not match anything.
         """
-        return f"regexp_replace({string_expr}, {regex_pattern}, {substitution}, 'g')"
+        # SP-110-012: Handle empty pattern - per FHIRPath spec, replaceMatches('', 'x')
+        # should return the original string unchanged (not insert 'x' everywhere)
+        # We check if the pattern is an empty string literal or empty braces (after stripping quotes)
+        if regex_pattern.strip() in ("''", '""', "{}"):
+            # Empty pattern: return original string (no replacement)
+            return f"CASE WHEN {string_expr} IS NULL THEN NULL ELSE {string_expr} END"
+
+        # FHIRPath spec: replaceMatches() uses single-line mode where . matches newlines
+        # The (?s) flag enables PCRE_DOTALL mode in DuckDB
+        return f"regexp_replace({string_expr}, '(?s)' || {regex_pattern}, {substitution}, 'g')"
 
     def generate_json_children(self, json_expr: str) -> str:
         """Generate SQL to extract direct children from a JSON object for DuckDB.
@@ -670,6 +756,7 @@ class DuckDBDialect(DatabaseDialect):
             - We use json_transform with json_keys to iterate and extract
             - Returns empty list for null input
             - SP-110-XXX: Fixed scalar subquery error by using list_agg pattern
+            - SP-110-XXX: Use json_extract instead of json_extract_string to preserve JSON structure
         """
         # SP-110-XXX: Fix scalar subquery error when used with skip()
         # The previous implementation used a subquery that returned multiple rows,
@@ -677,7 +764,9 @@ class DuckDBDialect(DatabaseDialect):
         # when skip() tried to enumerate the array using json_each().
         # Solution: Use list() with a properly correlated subquery.
         # We need to ensure the subquery is correlated to the current row context.
-        return f"(SELECT list(json_extract_string({json_expr}, key)) FROM (SELECT unnest(json_keys({json_expr})) AS key))"
+        # SP-110-XXX: Use json_extract instead of json_extract_string to preserve the JSON structure
+        # of child elements, allowing subsequent navigation (e.g., .code) to work correctly.
+        return f"(SELECT list(json_extract({json_expr}, '$.' || key)) FROM (SELECT unnest(json_keys({json_expr})) AS key))"
 
     def generate_substring_check(self, string_expr: str, substring: str) -> str:
         """Generate substring check SQL for DuckDB.
@@ -838,8 +927,12 @@ class DuckDBDialect(DatabaseDialect):
         return "current_date"
 
     def generate_current_time(self) -> str:
-        """Generate current time for DuckDB."""
-        return "current_time"
+        """Generate current time for DuckDB.
+
+        Cast to TIME without timezone to match FHIRPath time literal behavior.
+        This ensures comparisons like timeOfDay() > @T12:00:00 work correctly.
+        """
+        return "CAST(current_time AS TIME)"
 
     def generate_date_diff(self, unit: str, start_date: str, end_date: str) -> str:
         """Generate date difference using DuckDB's DATE_DIFF."""
@@ -1131,6 +1224,11 @@ class DuckDBDialect(DatabaseDialect):
 
         Handles partial precision timestamps by padding to full timestamp format.
 
+        SP-110-FIX: Strip timezone offset for FHIRPath compliance.
+        FHIRPath expects timezone-aware datetime arithmetic to preserve local time.
+        DuckDB converts timezone-aware timestamps to UTC, which breaks FHIRPath semantics.
+        For arithmetic operations, we strip the timezone and treat the datetime as local time.
+
         Args:
             datetime_value: DateTime string in ISO format (YYYY-MM-DDTHH:MM:SS)
                           Supports partial precision: @2015T, @2015-02T, @2015-02-04T14
@@ -1143,6 +1241,7 @@ class DuckDBDialect(DatabaseDialect):
             @2015T → TIMESTAMP '2015-01-01 00:00:00'
             @2015-02T → TIMESTAMP '2015-02-01 00:00:00'
             @2015-02-04T14 → TIMESTAMP '2015-02-04 14:00:00'
+            @2023-12-25T00:00:00.000+10:00 → TIMESTAMP '2023-12-25 00:00:00.000' (timezone stripped)
         """
         # Pad partial timestamps to full TIMESTAMP format
         padded_datetime = self._pad_partial_timestamp(datetime_value)
@@ -1327,8 +1426,15 @@ class DuckDBDialect(DatabaseDialect):
         """Safely cast expression to TIMESTAMP in DuckDB.
 
         Uses TRY_CAST which returns NULL instead of error for invalid input.
+
+        SP-110-FIX-TZ: Strip timezone offset before casting to prevent incorrect
+        UTC conversion. DuckDB parses timezone offsets in strings like '2024-01-01T00:00:00+10:00'
+        and converts to UTC (subtracting 10 hours), which breaks FHIRPath semantics.
+        For FHIRPath compliance, timezone-aware datetimes should preserve local time.
         """
-        return f"TRY_CAST({expression} AS TIMESTAMP)"
+        # Strip timezone suffix (Z or +/-HH:MM) before casting to preserve local time
+        # Note: DuckDB regexp uses [0-9] instead of \d for digit matching
+        return f"TRY_CAST(regexp_replace({expression}, '[+-][0-9]{{2}}:[0-9]{{2}}$|Z$', '') AS TIMESTAMP)"
 
     def safe_cast_to_boolean(self, expression: str) -> str:
         """Safely cast expression to BOOLEAN in DuckDB.
@@ -1920,7 +2026,19 @@ class DuckDBDialect(DatabaseDialect):
         Order matters: escape & first to avoid double-escaping.
         """
         # DuckDB uses regexp_replace for character escaping
-        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '\"', '&quot;'), '''', '&apos;')"
+        # Use single quotes and CTE for safety
+        return f"""
+        (WITH escaped_str AS (SELECT {expression} AS str)
+        SELECT regexp_replace(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(str, '&', '&amp;'),
+                    '<', '&lt;'),
+                '>', '&gt;'),
+            '''', '&apos;'),
+        '"', '&quot;') FROM escaped_str)
+        """
 
     def generate_json_escape(self, expression: str) -> str:
         """Generate SQL for JSON escaping in DuckDB.
@@ -1928,7 +2046,11 @@ class DuckDBDialect(DatabaseDialect):
         Escapes quotes and backslashes.
         """
         # JSON escaping: escape backslash first, then quotes
-        return f"replace(replace({expression}, '\\\\', '\\\\\\\\'), '\"', '\\\\\"')"
+        # Use CTE for safety
+        return f"""
+        (WITH escaped_str AS (SELECT {expression} AS str)
+        SELECT replace(replace(str, '\\\\', '\\\\\\\\'), '\"', '\\\\\"') FROM escaped_str)
+        """
 
     def generate_html_unescape(self, expression: str) -> str:
         """Generate SQL for HTML unescaping in DuckDB.
@@ -1938,7 +2060,11 @@ class DuckDBDialect(DatabaseDialect):
         """
         # DuckDB uses regexp_replace for character unescaping
         # Handle numeric entity &#39; first, then named entities
-        return f"regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace({expression}, '&amp;', '&'), '&lt;', '<'), '&gt;', '>'), '&quot;', '\"'), '&apos;', '''')"
+        # Use simpler approach with global flag
+        return f"""
+        (WITH escaped_str AS (SELECT {expression} AS str)
+        SELECT regexp_replace(regexp_replace(regexp_replace(regexp_replace(str, '&amp;', '&', 'g'), '&lt;', '<', 'g'), '&gt;', '>', 'g'), '&quot;', '\"', 'g') FROM escaped_str)
+        """
 
     def generate_json_unescape(self, expression: str) -> str:
         """Generate SQL for JSON unescaping in DuckDB.
@@ -1947,7 +2073,11 @@ class DuckDBDialect(DatabaseDialect):
         Order: unescape \\\" first, then \\\\.
         """
         # Reverse of JSON escape: unescape quotes first, then backslashes
-        return f"replace(replace({expression}, '\\\\\"', '\"'), '\\\\\\\\', '\\\\')"
+        # Use CTE for safety
+        return f"""
+        (WITH escaped_str AS (SELECT {expression} AS str)
+        SELECT replace(replace(str, '\\\"', '"'), '\\\\', '\\') FROM escaped_str)
+        """
 
     def generate_array_sort(self, array_expr: str, ascending: bool = True, element_type: Optional[str] = None) -> str:
         """Generate SQL for sorting array elements in DuckDB.

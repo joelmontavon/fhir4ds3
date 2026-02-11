@@ -1197,13 +1197,27 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         return None
 
     def _evaluate_literal_to_string(self, value: Any) -> Optional[str]:
-        """Evaluate toString() for literal values."""
+        """Evaluate toString() for literal values.
+
+        SP-110-FIX-014: Handle QuantityLiteralMarker objects for quantity literals.
+        Returns formatted quantity string like "1 'wk'" or "1 week".
+        """
         if value is None:
             return None
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, (int, float)):
             return str(value)
+
+        # SP-110-FIX-014: Handle QuantityLiteralMarker from quantity literals
+        # Check if this is a QuantityLiteralMarker (duck-typed check)
+        if hasattr(value, 'value') and hasattr(value, 'unit') and hasattr(value, 'is_quantity_literal'):
+            # Format quantity as "value 'unit'" matching FHIRPath spec
+            # e.g., 1 'wk', 5 'mg', etc.
+            quantity_value = value.value
+            quantity_unit = value.unit
+            return f"{quantity_value} '{quantity_unit}'"
+
         return str(value)
 
     def _evaluate_literal_to_decimal(self, value: Any) -> Optional[float]:
@@ -9359,19 +9373,30 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             self._restore_context(snapshot)
 
     def _translate_to_string(self, node: FunctionCallNode) -> SQLFragment:
-        """Translate toString() function to SQL conversion."""
+        """Translate toString() function to SQL conversion.
+
+        SP-110-FIX-014: For literal values, ensure proper string casting by using
+        value_expr (the SQL expression) rather than just the literal value.
+        This prevents strings like 'true' from being interpreted as booleans.
+        """
         value_expr, dependencies, literal_value, snapshot, _, _ = self._resolve_function_target(node)
         source_table = snapshot["current_table"]
 
         try:
+            # SP-110-FIX-014: Even for literal values, we need to cast to string type
+            # to ensure SQL returns the value as a string, not as inferred boolean/number
             if literal_value is not None:
+                # Evaluate the literal to get the string value
                 result = self._evaluate_literal_to_string(literal_value)
-                sql_expr = self._to_sql_literal(result, "string")
+                # But use the value_expr (SQL expression) and cast it to ensure proper type
+                # The value_expr already contains the proper SQL literal (e.g., 'true')
+                sql_expr = self.dialect.generate_type_cast(value_expr, "String")
                 return SQLFragment(
                     expression=sql_expr,
                     source_table=source_table,
                     requires_unnest=False,
-                    is_aggregate=False
+                    is_aggregate=False,
+                    dependencies=dependencies
                 )
 
             if not value_expr:
