@@ -690,6 +690,156 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Step 4: Cannot determine from literal - let caller fall back to typeof check
         return None
 
+    def _is_temporal_type_mismatch(self, left_metadata: Dict[str, Any], right_metadata: Dict[str, Any]) -> bool:
+        """Check if two temporal literals have mismatched types or precision.
+
+        SP-110-FIX-012: According to FHIRPath specification, comparisons between
+        different temporal types (date, datetime, time) or different precisions
+        should return empty collection {}.
+
+        Type Mismatch Rules:
+        - date vs datetime → mismatch (e.g., @2012-04-15 vs @2012-04-15T10:00:00)
+        - date vs time → mismatch (e.g., @2012-04-15 vs @T10:30)
+        - datetime vs time → mismatch (e.g., @2012-04-15T10:00:00 vs @T10:30)
+        - Different precision within same type → mismatch (e.g., @T10:30 vs @T10:30:00)
+
+        Valid Comparisons:
+        - Same type, same precision (e.g., @2012-04-15 vs @2012-04-15, @T10:30:00 vs @T10:30:00)
+        - datetime with timezone vs datetime without timezone (both are datetime)
+
+        Args:
+            left_metadata: Metadata from left fragment (contains literal_type, temporal_info)
+            right_metadata: Metadata from right fragment (contains literal_type, temporal_info)
+
+        Returns:
+            True if types/precision mismatch (should return empty collection)
+            False if types are compatible (comparison should proceed)
+        """
+        # Both operands must be temporal literals with temporal_info
+        left_temporal = left_metadata.get("temporal_info")
+        right_temporal = right_metadata.get("temporal_info")
+
+        if not left_temporal or not right_temporal:
+            # At least one is not a temporal literal - no type mismatch
+            return False
+
+        left_kind = left_temporal.get("kind", "")
+        right_kind = right_temporal.get("kind", "")
+
+        # Check for type mismatch (date vs datetime vs time)
+        # These are three distinct types in FHIRPath and cannot be compared
+        if left_kind != right_kind:
+            return True
+
+        # Same kind (date, datetime, or time) - check for precision mismatch
+        left_precision = left_temporal.get("precision", "")
+        right_precision = right_temporal.get("precision", "")
+
+        # For time literals: different precision means mismatch
+        # @T10:30 (minute precision) vs @T10:30:00 (second precision) → mismatch
+        if left_kind == "time":
+            return left_precision != right_precision
+
+        # For datetime literals: different precision means mismatch
+        # @2015T (year precision) vs @2015-02T (month precision) → mismatch
+        # @2012-04-15T15:00:00Z (with timezone) vs @2012-04-15T10:00:00 (without) → mismatch
+        if left_kind == "datetime":
+            # Check if one has timezone and the other doesn't
+            left_has_tz = "timezone" in left_temporal or left_temporal.get("original", "").endswith("Z")
+            right_has_tz = "timezone" in right_temporal or right_temporal.get("original", "").endswith("Z")
+
+            if left_has_tz != right_has_tz:
+                return True
+
+            # Check precision mismatch for datetime
+            # Note: Fractions of seconds are considered same precision as seconds
+            # for comparison purposes (they're both second-level precision)
+            left_prec_normalized = "second" if left_precision in ("second", "fraction") else left_precision
+            right_prec_normalized = "second" if right_precision in ("second", "fraction") else right_precision
+
+            return left_prec_normalized != right_prec_normalized
+
+        # For date literals: different precision means mismatch
+        # @2015 (year precision) vs @2015-02 (month precision) → mismatch
+        if left_kind == "date":
+            return left_precision != right_precision
+
+        # Unknown kind - no mismatch check
+        return False
+
+    def _is_temporal_info_mismatch(self, left_info: Dict[str, Any], right_info: Dict[str, Any]) -> bool:
+        """Check if two temporal info dicts have mismatched types or precision.
+
+        SP-110-FIX-012: Variant of _is_temporal_type_mismatch that works with
+        temporal_info dicts extracted from AST nodes (before translation to fragments).
+
+        Type Mismatch Rules:
+        - date vs datetime → mismatch (e.g., @2012-04-15 vs @2012-04-15T10:00:00)
+        - date vs time → mismatch (e.g., @2012-04-15 vs @T10:30)
+        - datetime vs time → mismatch (e.g., @2012-04-15T10:00:00 vs @T10:30)
+        - Different precision within same type → mismatch (e.g., @T10:30 vs @T10:30:00)
+        - Different timezone presence → mismatch (e.g., @2012-04-15T10:00:00Z vs @2012-04-15T10:00:00)
+
+        Valid Comparisons:
+        - Same type, same precision (e.g., @2012-04-15 vs @2012-04-15, @T10:30:00 vs @T10:30:00)
+
+        Note: Field references (is_field_reference=True) are exempt from strict type checking
+        because database fields can be compared with any compatible temporal literal.
+
+        Args:
+            left_info: Temporal info from left operand
+            right_info: Temporal info from right operand
+
+        Returns:
+            True if types/precision mismatch (should return empty collection)
+            False if types are compatible or one is a field reference
+        """
+        # Field references are exempt from strict type checking
+        # Database temporal fields can be compared with any compatible temporal literal
+        if left_info.get("is_field_reference") or right_info.get("is_field_reference"):
+            return False
+
+        # Temporal functions are exempt from strict type checking
+        # They can be compared with temporal literals of compatible types
+        if left_info.get("is_temporal_function") or right_info.get("is_temporal_function"):
+            return False
+
+        left_kind = left_info.get("kind", "")
+        right_kind = right_info.get("kind", "")
+
+        # Check for type mismatch (date vs datetime vs time)
+        if left_kind != right_kind:
+            return True
+
+        # Same kind - check for precision mismatch
+        left_precision = left_info.get("precision", "")
+        right_precision = right_info.get("precision", "")
+
+        # For time literals: different precision means mismatch
+        if left_kind == "time":
+            return left_precision != right_precision
+
+        # For datetime literals: check timezone and precision
+        if left_kind == "datetime":
+            # Check if one has timezone and the other doesn't
+            left_has_tz = "timezone" in left_info or left_info.get("timezone_offset") is not None
+            right_has_tz = "timezone" in right_info or right_info.get("timezone_offset") is not None
+
+            if left_has_tz != right_has_tz:
+                return True
+
+            # Check precision mismatch for datetime
+            left_prec_normalized = "second" if left_precision in ("second", "fraction") else left_precision
+            right_prec_normalized = "second" if right_precision in ("second", "fraction") else right_precision
+
+            return left_prec_normalized != right_prec_normalized
+
+        # For date literals: different precision means mismatch
+        if left_kind == "date":
+            return left_precision != right_precision
+
+        return False
+
     def _should_accumulate_as_separate_fragment(self, node: FHIRPathASTNode) -> bool:
         """Determine if a node should generate a separate fragment in the chain.
 
@@ -1482,16 +1632,26 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Include temporal_info if available (for date/time literals)
         if hasattr(node, 'temporal_info') and node.temporal_info:
             fragment_metadata["temporal_info"] = node.temporal_info
-        # SP-110-001: Include quantity_value and quantity_unit for temporal quantities
+        # SP-110-001: Include quantity_value and quantity_unit for all quantity literals
         # This enables _generate_quantity_comparison() to detect and normalize quantities
         # (e.g., "7 days" vs "1 'wk'" -> both normalized to days for comparison)
-        if (node.literal_type == "quantity" and
-            hasattr(node, 'temporal_info') and node.temporal_info and
-            node.temporal_info.get('kind') == 'duration'):
-            value = node.temporal_info.get('value', str(node.value))
-            unit = node.temporal_info.get('unit', 'days')
-            fragment_metadata["quantity_value"] = str(value)
-            fragment_metadata["quantity_unit"] = self._normalize_quantity_unit(unit) if unit else unit
+        # Also supports regular Quantity literals like "185 '[lb_av]'"
+        if node.literal_type == "quantity":
+            # Check for temporal quantities (durations) first
+            if (hasattr(node, 'temporal_info') and node.temporal_info and
+                node.temporal_info.get('kind') == 'duration'):
+                value = node.temporal_info.get('value', str(node.value))
+                unit = node.temporal_info.get('unit', 'days')
+                fragment_metadata["quantity_value"] = str(value)
+                fragment_metadata["quantity_unit"] = self._normalize_quantity_unit(unit) if unit else unit
+            # Then check for regular Quantity literals (value/unit in custom_attributes)
+            elif hasattr(node, 'custom_attributes'):
+                quantity_value = node.custom_attributes.get('quantity_value')
+                quantity_unit = node.custom_attributes.get('quantity_unit')
+                if quantity_value is not None:
+                    fragment_metadata["quantity_value"] = quantity_value
+                if quantity_unit is not None:
+                    fragment_metadata["quantity_unit"] = quantity_unit
 
         return SQLFragment(
             expression=sql_expr,
@@ -2731,6 +2891,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_distinct(node)
         elif function_name == "isdistinct":
             return self._translate_is_distinct(node)
+        elif function_name == "union":
+            # SP-110-FIX: union() function call - combines collections like | operator
+            return self._translate_union_function(node)
         elif function_name == "intersect":
             return self._translate_intersect(node)
         elif function_name == "join":
@@ -4046,6 +4209,17 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Return NULL to represent empty collection result
                     # This will be filtered out in the final result
                     sql_expr = "NULL"
+                # SP-110-FIX-012: Handle DateTime Type Strictness in comparisons
+                # According to FHIRPath spec, comparisons between different temporal types
+                # (date, datetime, time) or different precisions should return empty collection.
+                # Examples:
+                #   @2012-04-15 = @2012-04-15T10:00:00 -> {} (date vs datetime)
+                #   @T10:30 >= @T10:30:00 -> {} (time minute vs time second precision)
+                #   @2012-04-15 = @2012-04-15 -> true (same type, same precision)
+                elif self._is_temporal_type_mismatch(left_metadata, right_metadata):
+                    # Return NULL to represent empty collection result
+                    # This will be filtered out in the final result
+                    sql_expr = "NULL"
                 # SP-110-001: Handle quantity unit conversion for comparisons
                 # When comparing quantities with different units (e.g., "7 days = 1 'wk'"),
                 # normalize units to canonical form before comparison
@@ -4053,6 +4227,22 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                       right_metadata.get("literal_type") == "quantity"):
                     sql_expr = self._generate_quantity_comparison(
                         left_fragment, right_fragment, sql_operator, node
+                    )
+                # SP-110-XXX: Handle Quantity literal vs JSON Quantity field comparison
+                # When comparing a Quantity literal (e.g., "185 '[lb_av]'") with a
+                # Quantity field (e.g., Observation.value), extract the numeric .value
+                # from the JSON for comparison.
+                elif (left_metadata.get("literal_type") == "quantity" and
+                      right_metadata.get("is_json_string") is True):
+                    # Left is Quantity literal, right is JSON field - extract .value from JSON
+                    sql_expr = self._generate_quantity_field_comparison(
+                        left_fragment, right_fragment, sql_operator, is_left_literal=True
+                    )
+                elif (right_metadata.get("literal_type") == "quantity" and
+                      left_metadata.get("is_json_string") is True):
+                    # Right is Quantity literal, left is JSON field - extract .value from JSON
+                    sql_expr = self._generate_quantity_field_comparison(
+                        right_fragment, left_fragment, sql_operator, is_left_literal=False
                     )
                 elif operator_lower in {"=", "!="} and (left_is_collection or right_is_collection):
                     sql_expr = self._generate_collection_comparison(
@@ -4665,6 +4855,93 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Fall back to string comparison of the JSON representations
         return f"({left_fragment.expression} {sql_operator} {right_fragment.expression})"
 
+    def _generate_quantity_field_comparison(
+        self,
+        quantity_literal_fragment: SQLFragment,
+        json_field_fragment: SQLFragment,
+        sql_operator: str,
+        is_left_literal: bool,
+    ) -> str:
+        """Generate SQL comparison between a Quantity literal and a JSON Quantity field.
+
+        SP-110-XXX: Handle Quantity literal vs JSON Quantity field comparisons.
+        When comparing a Quantity literal (e.g., "185 '[lb_av]'") with a Quantity field
+        (e.g., Observation.value), extract the numeric .value field from the JSON
+        for numeric comparison.
+
+        Args:
+            quantity_literal_fragment: The Quantity literal fragment (has literal_type='quantity')
+            json_field_fragment: The JSON field fragment (has is_json_string=true)
+            sql_operator: SQL comparison operator (=, !=, <, >, <=, >=)
+            is_left_literal: True if literal is on left, False if literal is on right
+
+        Returns:
+            SQL expression comparing the numeric .value extracted from JSON with the literal value
+        """
+        quantity_metadata = getattr(quantity_literal_fragment, "metadata", {}) or {}
+        json_metadata = getattr(json_field_fragment, "metadata", {}) or {}
+
+        # Extract quantity literal value
+        literal_value = quantity_metadata.get("quantity_value")
+        literal_unit = quantity_metadata.get("quantity_unit")
+
+        if literal_value is None:
+            # Fall back to simple comparison if we can't extract the literal value
+            if is_left_literal:
+                return f"({quantity_literal_fragment.expression} {sql_operator} {json_field_fragment.expression})"
+            else:
+                return f"({json_field_fragment.expression} {sql_operator} {quantity_literal_fragment.expression})"
+
+        # Get the JSON field expression and check if it's a polymorphic property
+        json_expr = json_field_fragment.expression
+        source_path = json_metadata.get("source_path", "")
+
+        # SP-110-FIX: Detect polymorphic properties and use the specific Quantity variant
+        # When the source_path is a polymorphic property like $.value, the COALESCE might
+        # return a non-Quantity variant (e.g., valuePeriod) when valueQuantity is NULL.
+        # We need to directly extract from valueQuantity instead of using the COALESCE result.
+        if source_path and self._is_polymorphic_path(source_path):
+            # Replace the polymorphic base with the Quantity-specific variant
+            # e.g., $.value -> $.valueQuantity
+            quantity_path = source_path.replace('.value', '.valueQuantity')
+
+            # SP-110-FIX-2: Extract the numeric value directly from valueQuantity
+            # Instead of using the COALESCE result, we directly extract from valueQuantity
+            # and then extract the .value field and cast to DECIMAL.
+            # This avoids the polymorphic COALESCE that might return a non-Quantity variant.
+            # SP-110-FIX-3: Use TRY_CAST to handle potential type conversion issues
+            # The JSON value might be stored as a string in some cases, so we use
+            # TRY_CAST to DECIMAL which returns NULL for invalid conversions instead of errors.
+            value_extract = f"TRY_CAST(json_extract(json_extract({self.context.current_table}, '{quantity_path}'), '$.value') AS DECIMAL)"
+
+            # Build the comparison: extracted_value <op> literal_value
+            if is_left_literal:
+                # literal <op> field -> literal_value <op> extracted_value
+                sql_expr = f"({literal_value} {sql_operator} {value_extract})"
+            else:
+                # field <op> literal -> extracted_value <op> literal_value
+                sql_expr = f"({value_extract} {sql_operator} {literal_value})"
+
+            return sql_expr
+
+        # Extract the .value field from the Quantity JSON
+        # Quantity JSON structure: {"value": 185, "unit": "[lb_av]", "system": "...", "code": "..."}
+        # We need to extract the 'value' field and cast it to DECIMAL for comparison
+        # The json_expr is a JSON string (from json_extract_string or COALESCE thereof)
+        # For DuckDB: json_extract(CAST(json_expr AS JSON), '$.value')::DECIMAL
+        # For PostgreSQL: (json_expr::JSON->>'value')::DECIMAL
+        value_extract = self.dialect.extract_json_decimal_from_string(json_expr)
+
+        # Build the comparison: extracted_value <op> literal_value
+        if is_left_literal:
+            # literal <op> field -> literal_value <op> extracted_value
+            sql_expr = f"({literal_value} {sql_operator} {value_extract})"
+        else:
+            # field <op> literal -> extracted_value <op> literal_value
+            sql_expr = f"({value_extract} {sql_operator} {literal_value})"
+
+        return sql_expr
+
     def _apply_safe_cast_for_type(self, expression: str, target_type: str) -> str:
         """Apply safe type casting to an expression based on target literal type.
 
@@ -4788,6 +5065,40 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         # Default to True for ambiguous cases (conservative approach)
         # This handles numeric-specific fields like valueQuantity, valueInteger, etc.
         return True
+
+    def _is_polymorphic_path(self, source_path: str) -> bool:
+        """Check if a source path contains a polymorphic property.
+
+        SP-110-FIX: Detect polymorphic properties like 'value', 'onset', 'deceased', etc.
+        These properties have [x] suffix in FHIR and can be multiple types (e.g.,
+        valueQuantity, valueString, valuePeriod). When comparing with typed literals,
+        we need to use the specific variant instead of the COALESCE of all variants.
+
+        Args:
+            source_path: FHIRPath source path (e.g., "$.value", "Observation.value")
+
+        Returns:
+            True if the path contains a polymorphic property, False otherwise.
+        """
+        if not source_path:
+            return False
+
+        # Normalize the path and extract components
+        # Remove leading "$" if present
+        normalized = source_path.lstrip('$.')
+
+        # Get the last component (the field being accessed)
+        components = normalized.split('.')
+        if not components:
+            return False
+
+        # Check if any component is a known polymorphic property
+        from ..types.fhir_types import POLYMORPHIC_PROPERTIES
+        for component in components:
+            if component in POLYMORPHIC_PROPERTIES:
+                return True
+
+        return False
 
     def _is_json_extraction(self, fragment: SQLFragment) -> bool:
         """Detect if a fragment represents a JSON extraction that yields VARCHAR.
@@ -6052,6 +6363,18 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         if not left_info or not right_info:
             return None
+
+        # SP-110-FIX-012: Check for temporal type mismatch before processing
+        # When comparing different temporal types (date vs datetime vs time) or
+        # different precisions, return NULL (empty collection) per FHIRPath spec.
+        if self._is_temporal_info_mismatch(left_info, right_info):
+            # Return NULL to represent empty collection result
+            return SQLFragment(
+                expression="NULL",
+                source_table=self.context.current_table or "resource",
+                requires_unnest=False,
+                is_aggregate=False
+            )
 
         # SP-110-008: Apply range-based semantics when:
         # 1. At least one operand has reduced precision (is_partial)
@@ -9286,6 +9609,66 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         finally:
             self._restore_context(snapshot)
 
+    def _translate_union_function(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate union() function call to SQL.
+
+        SP-110-FIX: union() function combines two collections, equivalent to the | operator.
+        For example: 1.union(2) is equivalent to 1 | 2.
+
+        The union() function is called as: target.union(argument)
+        The target is stored in pending_fragment_result (set when visiting the target TermExpression)
+        The argument is in node.arguments[0]
+        """
+        if len(node.arguments) != 1:
+            raise ValueError(f"union() requires exactly 1 argument; got {len(node.arguments)}")
+
+        # SP-110-FIX-2: For union() function call, the target is the pending_fragment_result
+        # (the left operand of the dot invocation), not node.target (which is None)
+        # For example: 1.union(2) has target=1 and argument=2
+
+        # Get the target fragment from pending_fragment_result
+        # This was set by visit_generic when it visited the TermExpression child before the functionCall
+        target_fragment = None
+        if hasattr(self.context, 'pending_fragment_result') and self.context.pending_fragment_result:
+            # pending_fragment_result is a tuple: (expression, parent_path, is_multi_item)
+            # We need to reconstruct a SQLFragment from this
+            target_expr, target_path, target_is_multi = self.context.pending_fragment_result
+            target_fragment = SQLFragment(
+                expression=target_expr,
+                source_table=self.context.current_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=[],
+                metadata={"is_multi_item": target_is_multi}
+            )
+        else:
+            raise ValueError("union() function requires a target (e.g., 1.union(2))")
+
+        # Translate the argument (right operand)
+        arg_fragment = self.visit(node.arguments[0])
+
+        # Now build union SQL from the two fragments
+        all_operands = [target_fragment, arg_fragment]
+
+        # Build linear union SQL from all operand fragments
+        union_sql = self._build_linear_union_sql(all_operands)
+
+        # Apply collection remainder processing
+        final_expr, metadata = self._apply_collection_remainder(
+            node,
+            union_sql,
+            {"function": "union", "is_collection": True}
+        )
+
+        return SQLFragment(
+            expression=final_expr,
+            source_table=self.context.current_table,
+            requires_unnest=False,
+            is_aggregate=False,
+            dependencies=[],
+            metadata=metadata
+        )
+
     def _build_to_boolean_expression(self, value_expr: str) -> str:
         """Generate SQL for toBoolean() conversion."""
         string_cast = self.dialect.generate_type_cast(value_expr, "String")
@@ -12091,13 +12474,15 @@ END
         # Construct subquery that returns filtered collection
         # Use a CTE to add row numbering for $index support
         # ROW_NUMBER() - 1 gives zero-based indexing as required by FHIRPath
+        # SP-110 FIX: Include <<SOURCE_TABLE>> marker in FROM clause so UNNEST can reference its columns
+        # The CTE builder will substitute <<SOURCE_TABLE>> with the actual source table name
         sql = f"""(
     SELECT {array_alias}.value
     FROM (
         SELECT
             {array_alias}_unnest.value,
             ROW_NUMBER() OVER () - 1 AS row_index
-        FROM LATERAL {unnest_sql}
+        FROM <<SOURCE_TABLE>>, LATERAL {unnest_sql}
     ) AS {array_alias}
     WHERE {condition_fragment.expression}
 )"""
@@ -12931,6 +13316,9 @@ END"""
             # Generate unique alias for array elements
             array_alias = f"exists_{self.context.cte_counter}_item"
 
+            # Increment counter for next exists() call (SP-110-FIX: nested exists support)
+            self.context.cte_counter += 1
+
             logger.debug(f"Generated array alias: {array_alias}")
 
             # Save current context state for restoration
@@ -12972,8 +13360,11 @@ END"""
             self.context.parent_path = old_path
 
             # Generate database-specific UNNEST SQL using dialect method
+            # SP-110 FIX: Use <<SOURCE_TABLE>> marker instead of old_table so the CTE builder
+            # can substitute it with the actual source table name. This allows the EXISTS subquery
+            # to work correctly when embedded in a CTE that references the previous CTE.
             unnest_sql = self.dialect.unnest_json_array(
-                column=old_table,
+                column="<<SOURCE_TABLE>>",
                 path=array_path,
                 alias=f"{array_alias}_unnest"
             )
@@ -12982,13 +13373,15 @@ END"""
 
             # Construct SQL fragment with EXISTS subquery
             # Use subquery with ROW_NUMBER() for $index support
+            # SP-110 FIX: Include <<SOURCE_TABLE>> marker in FROM clause so UNNEST can reference its columns
+            # The CTE builder will substitute <<SOURCE_TABLE>> with the actual source table name
             sql_expr = f"""CASE WHEN EXISTS (
     SELECT 1
     FROM (
         SELECT
             {array_alias}_unnest.value,
             ROW_NUMBER() OVER () - 1 AS row_index
-        FROM LATERAL {unnest_sql}
+        FROM <<SOURCE_TABLE>>, LATERAL {unnest_sql}
     ) AS {array_alias}
     WHERE {condition_fragment.expression}
 ) THEN TRUE ELSE FALSE END"""
@@ -13004,21 +13397,16 @@ END"""
             # SP-110 Round 8 FIX: Handle nested exists() dependencies correctly
             # When we have nested exists() like: category.exists(coding.exists(...))
             # - The inner exists() will have dependencies like ['exists_0_item'] (the outer lambda's table)
-            # - We should NOT include exists_0_item in our dependencies because it's a table alias
-            #   within the EXISTS subquery, not a CTE
-            # - Only include dependencies that are real CTEs or the base resource table
+            # - We SHOULD include exists_0_item in our dependencies because the inner EXISTS subquery
+            #   needs to reference the outer exists()'s table in its FROM clause
+            # - Only skip the current array_alias (our own temp alias) since it's created within this EXISTS subquery
             if hasattr(condition_fragment, "dependencies") and condition_fragment.dependencies:
                 for dep in condition_fragment.dependencies:
-                    # Skip if this is the current array_alias (exists_1_item) - it's our own temp alias
-                    # Skip if this is any exists_N_item pattern - these are table aliases in EXISTS subqueries,
-                    #   not CTEs. The EXISTS subquery will reference them directly in the SQL.
-                    # Only include the dep if it's the old_table (actual data source) or a real CTE
-                    is_temp_exists_alias = (
-                        dep.endswith("_item") and
-                        "exists" in dep.lower() and
-                        any(c.isdigit() for c in dep)
-                    )
-                    if dep and dep != old_table and not is_temp_exists_alias and dep not in dependencies:
+                    # Skip if this is the current array_alias (our own temp alias within this EXISTS subquery)
+                    # But DO include parent exists_N_item patterns - they are legitimate dependencies
+                    # that need to be available in the FROM clause for nested EXISTS subqueries
+                    is_current_array_alias = (dep == array_alias)
+                    if dep and dep != old_table and not is_current_array_alias and dep not in dependencies:
                         dependencies.append(dep)
 
             return SQLFragment(
@@ -13027,7 +13415,11 @@ END"""
                 requires_unnest=False,  # EXISTS subquery is self-contained
                 is_aggregate=False,
                 dependencies=dependencies,
-                metadata={"function": "exists", "result_type": "boolean"}
+                metadata={
+                    "function": "exists",
+                    "result_type": "boolean",
+                    "skip_aggregation": True  # SP-110 FIX: EXISTS subquery already handles aggregation
+                }
             )
 
     def _translate_empty(self, node: FunctionCallNode) -> SQLFragment:
