@@ -941,8 +941,8 @@ if __name__ == "__main__":
     # Run compliance measurement for demonstration
     print("Running FHIRPath compliance measurement...")
 
-    # Run a limited set for demonstration (first 50 tests)
-    report = run_compliance_measurement(database_type="duckdb", max_tests=50)
+    # Run all tests (no limit)
+    report = run_compliance_measurement(database_type="duckdb", max_tests=None)
 
     # Save report
     runner = EnhancedOfficialTestRunner()
