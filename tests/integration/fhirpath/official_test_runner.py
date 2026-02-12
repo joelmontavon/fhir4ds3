@@ -374,6 +374,10 @@ class EnhancedOfficialTestRunner:
             expected_bool = str(expected).lower() == 'true'
             if isinstance(actual, bool):
                 return actual == expected_bool
+            # DuckDB returns 1/0 for boolean comparisons
+            if isinstance(actual, (int, float)):
+                actual_bool = bool(actual)
+                return actual_bool == expected_bool
             return str(actual).lower() == str(expected).lower()
 
         # Handle numbers
