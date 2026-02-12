@@ -737,8 +737,12 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
 
         # For time literals: different precision means mismatch
         # @T10:30 (minute precision) vs @T10:30:00 (second precision) → mismatch
+        # Note: Fractions of seconds are considered same precision as seconds
+        # for comparison purposes (they're both second-level precision)
         if left_kind == "time":
-            return left_precision != right_precision
+            left_prec_normalized = "second" if left_precision in ("second", "fraction") else left_precision
+            right_prec_normalized = "second" if right_precision in ("second", "fraction") else right_precision
+            return left_prec_normalized != right_prec_normalized
 
         # For datetime literals: different precision means mismatch
         # @2015T (year precision) vs @2015-02T (month precision) → mismatch
@@ -816,8 +820,11 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         right_precision = right_info.get("precision", "")
 
         # For time literals: different precision means mismatch
+        # Note: Fractions of seconds are considered same precision as seconds
         if left_kind == "time":
-            return left_precision != right_precision
+            left_prec_normalized = "second" if left_precision in ("second", "fraction") else left_precision
+            right_prec_normalized = "second" if right_precision in ("second", "fraction") else right_precision
+            return left_prec_normalized != right_prec_normalized
 
         # For datetime literals: check timezone and precision
         if left_kind == "datetime":
