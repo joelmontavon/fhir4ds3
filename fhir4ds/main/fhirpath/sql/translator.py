@@ -803,9 +803,21 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         if left_info.get("is_field_reference") or right_info.get("is_field_reference"):
             return False
 
-        # Temporal functions are exempt from strict type checking
-        # They can be compared with temporal literals of compatible types
-        if left_info.get("is_temporal_function") or right_info.get("is_temporal_function"):
+        # Temporal functions: Only exempt when comparing with a literal
+        # If BOTH are temporal functions, apply strict type/precision checking
+        left_is_func = left_info.get("is_temporal_function")
+        right_is_func = right_info.get("is_temporal_function")
+        left_is_literal = left_info.get("is_temporal_literal")
+        right_is_literal = right_info.get("is_temporal_literal")
+
+        # If both operands are temporal functions, do NOT exempt - check types
+        if left_is_func and right_is_func:
+            pass  # Continue to type checking below
+        # If one is a temporal function and the other is a temporal literal, exempt
+        elif (left_is_func and right_is_literal) or (right_is_func and left_is_literal):
+            return False
+        # If one is a temporal function and the other is neither, exempt (conservative)
+        elif left_is_func or right_is_func:
             return False
 
         left_kind = left_info.get("kind", "")
@@ -6735,7 +6747,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         which return temporal values with specific precision.
 
         Args:
-            node: AST node representing a function call
+            node: AST node representing a function call (or wrapper like TermExpression/InvocationTerm)
 
         Returns:
             Dict with temporal info including kind, precision, is_partial
@@ -6743,11 +6755,66 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
         """
         from ..ast.nodes import FunctionCallNode
 
-        # Check if this is a FunctionCallNode
-        if not isinstance(node, FunctionCallNode):
-            return None
+        # Helper function to extract from functionCall node
+        def extract_from_function_call_node(func_node: FHIRPathASTNode) -> Optional[str]:
+            """Extract function name from a functionCall node."""
+            if isinstance(func_node, FunctionCallNode):
+                return getattr(func_node, 'function_name', '').lower()
 
-        function_name = getattr(node, 'function_name', '').lower()
+            # Handle EnhancedASTNode from parser (SP-110-FIX-018)
+            # EnhancedASTNode uses node_type='functionCall' with nested pathExpression
+            # Structure: functionCall -> Functn -> pathExpression
+            node_type = getattr(func_node, 'node_type', '')
+            if node_type != 'functionCall':
+                return None
+
+            # Extract function name from nested pathExpression child
+            function_name = None
+            if hasattr(func_node, 'children'):
+                # First child is Functn, its child is pathExpression
+                for child in func_node.children:
+                    if hasattr(child, 'node_type') and child.node_type == 'Functn':
+                        # Look for pathExpression in Functn's children
+                        if hasattr(child, 'children'):
+                            for grandchild in child.children:
+                                if hasattr(grandchild, 'node_type') and grandchild.node_type == 'pathExpression':
+                                    function_name = getattr(grandchild, 'text', '').lower()
+                                    break
+                        break
+            return function_name
+
+        # Check if this is a FunctionCallNode (typed node)
+        if isinstance(node, FunctionCallNode):
+            function_name = getattr(node, 'function_name', '').lower()
+        else:
+            # Handle EnhancedASTNode - might be wrapped in TermExpression/InvocationTerm
+            node_type = getattr(node, 'node_type', '')
+
+            # Direct functionCall node
+            if node_type == 'functionCall':
+                function_name = extract_from_function_call_node(node)
+            # Wrapper nodes - traverse to find functionCall
+            elif node_type in ('TermExpression', 'InvocationTerm'):
+                if not hasattr(node, 'children') or not node.children:
+                    return None
+                # Traverse children to find functionCall
+                function_name = None
+                for child in node.children:
+                    child_type = getattr(child, 'node_type', '')
+                    if child_type == 'functionCall':
+                        function_name = extract_from_function_call_node(child)
+                        break
+                    elif child_type == 'InvocationTerm':
+                        # Nested wrapper - go deeper
+                        if hasattr(child, 'children') and child.children:
+                            for grandchild in child.children:
+                                if getattr(grandchild, 'node_type', '') == 'functionCall':
+                                    function_name = extract_from_function_call_node(grandchild)
+                                    break
+                if not function_name:
+                    return None
+            else:
+                return None
 
         # Define temporal functions and their return types
         temporal_functions = {
