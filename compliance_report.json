@@ -1,13 +1,13 @@
 {
   "total_tests": 934,
-  "passed_tests": 674,
-  "failed_tests": 260,
-  "compliance_percentage": 72.1627408993576,
-  "execution_time_total_ms": 341886.92474365234,
-  "execution_time_average_ms": 366.0104563200499,
+  "passed_tests": 675,
+  "failed_tests": 259,
+  "compliance_percentage": 72.26980728051392,
+  "execution_time_total_ms": 349263.3099555969,
+  "execution_time_average_ms": 373.90564391648746,
   "parser_type": "FHIRPathParser",
   "database_type": "duckdb",
-  "timestamp": "2026-02-13T01:13:45.510988",
+  "timestamp": "2026-02-13T01:34:05.248871",
   "test_categories": {
     "comments_syntax": {
       "total": 9,
@@ -36,8 +36,8 @@
     },
     "collection_functions": {
       "total": 141,
-      "passed": 86,
-      "failed": 55
+      "passed": 87,
+      "failed": 54
     },
     "function_calls": {
       "total": 113,
@@ -76,64 +76,17 @@
     }
   },
   "performance_metrics": {
-    "min_execution_time_ms": 0.0133514404296875,
-    "max_execution_time_ms": 719.1967964172363,
-    "median_execution_time_ms": 405.14087677001953,
-    "std_dev_execution_time_ms": 131.59817783779613
+    "min_execution_time_ms": 0.015020370483398438,
+    "max_execution_time_ms": 700.8299827575684,
+    "median_execution_time_ms": 415.16196727752686,
+    "std_dev_execution_time_ms": 135.1945996188883
   },
   "failed_test_analysis": [
-    {
-      "name": "testDollarOrderNotAllowed",
-      "expression": "Patient.children().skip(1)",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 423.7699508666992,
-      "actual_result": {
-        "is_valid": true,
-        "result": [
-          {
-            "unnest": "{\"status\":\"generated\",\"div\":{\"table\":{\"tbody\":{\"tr\":[{\"td\":[\"Name\",{\"b\":\"Chalmers\"}]},{\"td\":[\"Address\",\"534 Erewhon, Pleasantville, Vic, 3999\"]},{\"td\":[\"Contacts\",\"Home: unknown. Work: (03) 5555 6473\"]},{\"td\":[\"Id\",\"MRN: 12345 (Acme Healthcare)\"]}]}}}}"
-          },
-          {
-            "unnest": "[{\"use\":\"usual\",\"type\":{\"coding\":[{\"system\":\"http://terminology.hl7.org/CodeSystem/v2-0203\",\"code\":\"MR\"}]},\"system\":\"urn:oid:1.2.36.146.595.217.0.1\",\"value\":\"12345\",\"period\":{\"start\":\"2001-05-06\"},\"assigner\":{\"display\":\"Acme Healthcare\"}}]"
-          },
-          {
-            "unnest": "\"true\""
-          },
-          {
-            "unnest": "[{\"use\":\"official\",\"family\":\"Chalmers\",\"given\":[\"Peter\",\"James\"]},{\"use\":\"usual\",\"given\":[\"Jim\"]},{\"use\":\"maiden\",\"family\":\"Windsor\",\"given\":[\"Peter\",\"James\"],\"period\":{\"end\":\"2002\"}}]"
-          },
-          {
-            "unnest": "[{\"use\":\"home\"},{\"system\":\"phone\",\"value\":\"(03) 5555 6473\",\"use\":\"work\",\"rank\":\"1\"},{\"system\":\"phone\",\"value\":\"(03) 3410 5613\",\"use\":\"mobile\",\"rank\":\"2\"},{\"system\":\"phone\",\"value\":\"(03) 5555 8834\",\"use\":\"old\",\"period\":{\"end\":\"2014\"}}]"
-          },
-          {
-            "unnest": "\"male\""
-          },
-          {
-            "unnest": "{\"value\":\"1974-12-25\",\"extension\":{\"url\":\"http://hl7.org/fhir/StructureDefinition/patient-birthTime\",\"valueDateTime\":\"1974-12-25T14:35:45-05:00\"}}"
-          },
-          {
-            "unnest": "\"false\""
-          },
-          {
-            "unnest": "[{\"use\":\"home\",\"type\":\"both\",\"text\":\"534 Erewhon St PeasantVille, Rainbow, Vic  3999\",\"line\":[\"534 Erewhon St\"],\"city\":\"PleasantVille\",\"district\":\"Rainbow\",\"state\":\"Vic\",\"postalCode\":\"3999\",\"period\":{\"start\":\"1974-12-25\"}}]"
-          },
-          {
-            "unnest": "[{\"relationship\":{\"coding\":{\"system\":\"http://terminology.hl7.org/CodeSystem/v2-0131\",\"code\":\"N\"}},\"name\":{\"family\":{\"value\":\"du March\u00e9\",\"extension\":[{\"url\":\"http://hl7.org/fhir/StructureDefinition/humanname-own-prefix\",\"valueString\":\"VV\"}]},\"given\":\"B\u00e9n\u00e9dicte\"},\"telecom\":{\"system\":\"phone\",\"value\":\"+33 (237) 998327\"},\"address\":{\"use\":\"home\",\"type\":\"both\",\"line\":\"534 Erewhon St\",\"city\":\"PleasantVille\",\"district\":\"Rainbow\",\"state\":\"Vic\",\"postalCode\":\"3999\",\"period\":{\"start\":\"1974-12-25\"}},\"gender\":\"female\",\"period\":{\"start\":\"2012\"}}]"
-          },
-          {
-            "unnest": "{\"reference\":\"Organization/1\"}"
-          },
-          {
-            "unnest": "\"Patient\""
-          }
-        ]
-      }
-    },
     {
       "name": "testExpressions",
       "expression": "Patient.name.select(given | family).distinct()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 494.78840827941895,
+      "execution_time_ms": 446.0282325744629,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -155,7 +108,7 @@
       "name": "testStringQuantityWeekConvertsToQuantityFalse",
       "expression": "'1 wk'.convertsToQuantity().not()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 438.13395500183105,
+      "execution_time_ms": 414.9320125579834,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -167,7 +120,7 @@
       "name": "testIntegerLiteralToQuantity",
       "expression": "1.toQuantity() = 1 '1'",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 398.6704349517822,
+      "execution_time_ms": 432.5714111328125,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -179,7 +132,7 @@
       "name": "testStringIntegerLiteralToQuantity",
       "expression": "'1'.toQuantity()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 389.0094757080078,
+      "execution_time_ms": 397.92823791503906,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -196,7 +149,7 @@
       "name": "testStringQuantityMonthLiteralToQuantity",
       "expression": "'1 \\'mo\\''.toQuantity() = 1 month",
       "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 367.5568103790283,
+      "execution_time_ms": 405.75599670410156,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -208,7 +161,7 @@
       "name": "testStringQuantityYearLiteralToQuantity",
       "expression": "'1 \\'a\\''.toQuantity() = 1 year",
       "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 482.0287227630615,
+      "execution_time_ms": 393.33486557006836,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -220,7 +173,7 @@
       "name": "testStringDecimalLiteralToQuantity",
       "expression": "'1.0'.toQuantity() ~ 1 '1'",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 384.74392890930176,
+      "execution_time_ms": 496.5636730194092,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -232,7 +185,7 @@
       "name": "testStringLiteralToString",
       "expression": "'true'.toString()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 400.5429744720459,
+      "execution_time_ms": 419.3875789642334,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -244,11 +197,28 @@
       "name": "testBooleanLiteralToString",
       "expression": "true.toString()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 391.77799224853516,
+      "execution_time_ms": 408.9524745941162,
       "actual_result": {
         "is_valid": true,
         "result": [
           true
+        ]
+      }
+    },
+    {
+      "name": "testQuantityLiteralWkToString",
+      "expression": "1 'wk'.toString()",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 411.33928298950195,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          {
+            "value": 1,
+            "unit": "wk",
+            "system": "http://unitsofmeasure.org",
+            "code": "wk"
+          }
         ]
       }
     }

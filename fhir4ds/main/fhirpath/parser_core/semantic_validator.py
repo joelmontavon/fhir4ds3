@@ -28,6 +28,22 @@ _RELATIVE_ROOT_SEGMENT = r"(?:`[^`]+`|[a-z_][A-Za-z0-9_]*)"
 _ABSOLUTE_PATH_REGEX = re.compile(rf"\b({_ABSOLUTE_ROOT_SEGMENT}(?:\.{_ESCAPED_SEGMENT})+)")
 _RELATIVE_PATH_REGEX = re.compile(rf"\b({_RELATIVE_ROOT_SEGMENT}(?:\.{_ESCAPED_SEGMENT})+)")
 
+# Functions that return UNORDERED collections
+_UNORDERED_COLLECTION_FUNCTIONS = frozenset({
+    'children',
+    'descendants',
+})
+
+# Functions that require ORDERED collections as input
+_ORDERED_REQUIRED_FUNCTIONS = frozenset({
+    'skip',
+    'take',
+    'first',
+    'last',
+    'tail',
+    'item',
+})
+
 # Standard FHIRPath built-in functions
 # This list is maintained separately from the SQL translator to support semantic validation
 _FHIRPATH_BUILTIN_FUNCTIONS = {
@@ -182,6 +198,9 @@ class SemanticValidator:
                 masked_expression,
                 masked_with_backticks,
             )
+
+        # Validate collection ordering (checkOrderedFunctions mode)
+        self._validate_collection_ordering(raw_expression)
 
     # ------------------------------------------------------------------ #
     # Individual rule implementations
@@ -1283,6 +1302,35 @@ class SemanticValidator:
         # String literals start and end with quotes
         return (text.startswith("'") and text.endswith("'")) or \
                (text.startswith('"') and text.endswith('"'))
+
+    def _validate_collection_ordering(self, raw_expression: str) -> None:
+        """
+        Validate that functions requiring ordered collections are not used on unordered collections.
+
+        According to FHIRPath specification, children() and descendants() return
+        UNORDERED collections, while functions like skip(), take(), first(), last()
+        require ORDERED collections. This method detects invalid combinations.
+
+        Args:
+            raw_expression: Original FHIRPath expression text.
+
+        Raises:
+            FHIRPathParseError: When ordered-required function is used on unordered collection.
+        """
+        # Check for patterns like: children().skip(), descendants().first()
+        # Use collapsed expression for simpler pattern matching
+        collapsed = re.sub(r"\s+", "", raw_expression or "")
+
+        for unordered_func in _UNORDERED_COLLECTION_FUNCTIONS:
+            for ordered_func in _ORDERED_REQUIRED_FUNCTIONS:
+                # Pattern: unordered_func().ordered_func()
+                # e.g., children().skip(1), descendants().first()
+                pattern = rf'{unordered_func}\(\s*\)\s*\.\s*{ordered_func}\s*\('
+                if re.search(pattern, collapsed, re.IGNORECASE):
+                    raise FHIRPathParseError(
+                        f"Function '{ordered_func}()' can only be used on ordered collections. "
+                        f"The collection from '{unordered_func}()' is unordered."
+                    )
 
 
 class FHIRPathExpressionWrapper:
