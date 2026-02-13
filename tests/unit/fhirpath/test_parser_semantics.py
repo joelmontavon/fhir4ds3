@@ -45,9 +45,19 @@ def test_unknown_function_reports_location(parser):
         parser.parse("Patient.name.foobar()")
 
 
-def test_string_literal_addition_is_rejected(parser):
-    with pytest.raises(FHIRPathParseError, match=r"Operator '\+' does not support string literals"):
-        parser.parse("'abc' + 5")
+def test_string_literal_addition_with_plus(parser):
+    """Test that + operator supports string concatenation per FHIRPath spec."""
+    # String + String should concatenate
+    result = parser.parse("'abc' + 'def'")
+    assert result.is_valid()
+
+    # String + String with spaces
+    result = parser.parse("'hello' + ' ' + 'world'")
+    assert result.is_valid()
+
+    # Multiple string concatenation
+    result = parser.parse("'a' + 'b' + 'c'")
+    assert result.is_valid()
 
 
 def test_absolute_path_typo_suggests_alternative(parser):

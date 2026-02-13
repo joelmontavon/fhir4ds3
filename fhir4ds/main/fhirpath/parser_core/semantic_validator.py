@@ -49,7 +49,7 @@ _ORDERED_REQUIRED_FUNCTIONS = frozenset({
 _FHIRPATH_BUILTIN_FUNCTIONS = {
     # Collection operations
     'where', 'select', 'all', 'any', 'exists', 'empty', 'count', 'distinct',
-    'combine', 'first', 'last', 'tail', 'skip', 'take', 'single', 'iif',
+    'combine', 'union', 'first', 'last', 'tail', 'skip', 'take', 'single', 'iif',
     # Type conversion functions
     'convertsToBoolean', 'toBoolean', 'convertsToInteger', 'toInteger',
     'convertsToDecimal', 'toDecimal', 'convertsToString', 'toString',
@@ -63,6 +63,7 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     'encode', 'decode', 'escape', 'unescape',
     # Math functions
     'abs', 'ceiling', 'exp', 'floor', 'ln', 'log', 'power', 'round', 'sqrt', 'truncate',
+    'lowBoundary', 'highBoundary',
     # Type functions
     'is', 'as', 'ofType', 'conformsTo', 'type',
     # Date/time functions
@@ -558,7 +559,9 @@ class SemanticValidator:
                 continue
 
             operator = node.text.strip()
-            if operator not in {"+", "-", "*", "/"}:
+            # SP-XXX-003: The + operator now supports string concatenation per FHIRPath spec
+            # Only reject -, *, / with string literals
+            if operator not in {"-", "*", "/"}:
                 continue
 
             if len(node.children) < 2:
@@ -581,7 +584,7 @@ class SemanticValidator:
             line, column = self._compute_position(expression, index)
             raise FHIRPathParseError(
                 f"Operator '{operator}' does not support string literals at line {line}, column {column}. "
-                "Use '&' for string concatenation or cast values to numbers."
+                "Use '+' or '&' for string concatenation."
             )
 
     def _validate_element_access(

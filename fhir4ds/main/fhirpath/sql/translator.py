@@ -3972,6 +3972,55 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if temporal_fragment is not None:
                 return temporal_fragment
 
+        # SP-XXX-003: Handle string concatenation with + operator per FHIRPath spec
+        # The + operator concatenates strings when both operands are strings
+        if node.operator == "+":
+            if self._is_string_operand(node.children[0]) and self._is_string_operand(node.children[1]):
+                def _normalize_concat_operand(expr: str) -> str:
+                    """Cast operand to string and ensure NULL/empty collections become empty strings."""
+                    string_expr = self._build_to_string_expression(expr)
+                    return f"COALESCE({string_expr}, '')"
+
+                left_operand = _normalize_concat_operand(left_fragment.expression)
+                right_operand = _normalize_concat_operand(right_fragment.expression)
+                sql_expr = self.dialect.string_concat(left_operand, right_operand)
+
+                # Merge metadata from both operands for string concatenation result
+                metadata = {}
+                left_meta = left_fragment.metadata if isinstance(left_fragment.metadata, dict) else {}
+                right_meta = right_fragment.metadata if isinstance(right_fragment.metadata, dict) else {}
+                for key, value in left_meta.items():
+                    metadata[key] = value
+                for key, value in right_meta.items():
+                    if key not in metadata:
+                        metadata[key] = value
+                # Mark result as string type
+                metadata["result_type"] = "string"
+
+                # Determine source table (prefer non-literal sources)
+                source_table = left_fragment.source_table
+                if source_table is None or source_table == "resource":
+                    source_table = right_fragment.source_table
+
+                # For string concatenation, no unnesting needed
+                requires_unnest = False
+                is_aggregate = left_fragment.is_aggregate or right_fragment.is_aggregate
+
+                # Merge dependencies while preserving order
+                dependencies: List[str] = []
+                for dependency in (*left_fragment.dependencies, *right_fragment.dependencies):
+                    if dependency not in dependencies:
+                        dependencies.append(dependency)
+
+                return SQLFragment(
+                    expression=sql_expr,
+                    source_table=source_table,
+                    requires_unnest=requires_unnest,
+                    is_aggregate=is_aggregate,
+                    dependencies=dependencies,
+                    metadata=metadata
+                )
+
         # Handle string concatenation with thin dialect support
         if node.operator == "&":
             def _normalize_concat_operand(expr: str) -> str:
