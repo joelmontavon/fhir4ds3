@@ -9157,7 +9157,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                 # SP-103-006: Support Date formats (no time component)
                 # Accepts: YYYY, YYYY-MM, YYYY-MM-DD
                 # Pattern: Year required, month/day optional, no 'T' or time allowed
-                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)(?!T)$', stripped))
+                return bool(re.match(r'^\d{4}(-\d{2}(-\d{2})?)?$', stripped))
             return False
 
         if target_type == "DateTime":
