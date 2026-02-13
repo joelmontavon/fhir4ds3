@@ -3,11 +3,11 @@
   "passed_tests": 674,
   "failed_tests": 260,
   "compliance_percentage": 72.1627408993576,
-  "execution_time_total_ms": 336932.7118396759,
-  "execution_time_average_ms": 360.7062422999478,
+  "execution_time_total_ms": 341886.92474365234,
+  "execution_time_average_ms": 366.0104563200499,
   "parser_type": "FHIRPathParser",
   "database_type": "duckdb",
-  "timestamp": "2026-02-13T00:17:52.602814",
+  "timestamp": "2026-02-13T01:13:45.510988",
   "test_categories": {
     "comments_syntax": {
       "total": 9,
@@ -76,17 +76,17 @@
     }
   },
   "performance_metrics": {
-    "min_execution_time_ms": 0.013113021850585938,
-    "max_execution_time_ms": 678.2550811767578,
-    "median_execution_time_ms": 399.27804470062256,
-    "std_dev_execution_time_ms": 130.2199561838122
+    "min_execution_time_ms": 0.0133514404296875,
+    "max_execution_time_ms": 719.1967964172363,
+    "median_execution_time_ms": 405.14087677001953,
+    "std_dev_execution_time_ms": 131.59817783779613
   },
   "failed_test_analysis": [
     {
       "name": "testDollarOrderNotAllowed",
       "expression": "Patient.children().skip(1)",
       "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 436.3272190093994,
+      "execution_time_ms": 423.7699508666992,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -133,7 +133,7 @@
       "name": "testExpressions",
       "expression": "Patient.name.select(given | family).distinct()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 478.88708114624023,
+      "execution_time_ms": 494.78840827941895,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -155,7 +155,7 @@
       "name": "testStringQuantityWeekConvertsToQuantityFalse",
       "expression": "'1 wk'.convertsToQuantity().not()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 398.7436294555664,
+      "execution_time_ms": 438.13395500183105,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -167,7 +167,7 @@
       "name": "testIntegerLiteralToQuantity",
       "expression": "1.toQuantity() = 1 '1'",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 357.4378490447998,
+      "execution_time_ms": 398.6704349517822,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -179,7 +179,7 @@
       "name": "testStringIntegerLiteralToQuantity",
       "expression": "'1'.toQuantity()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 390.95211029052734,
+      "execution_time_ms": 389.0094757080078,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -196,7 +196,7 @@
       "name": "testStringQuantityMonthLiteralToQuantity",
       "expression": "'1 \\'mo\\''.toQuantity() = 1 month",
       "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 384.2158317565918,
+      "execution_time_ms": 367.5568103790283,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -208,7 +208,7 @@
       "name": "testStringQuantityYearLiteralToQuantity",
       "expression": "'1 \\'a\\''.toQuantity() = 1 year",
       "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 454.67543601989746,
+      "execution_time_ms": 482.0287227630615,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -220,7 +220,7 @@
       "name": "testStringDecimalLiteralToQuantity",
       "expression": "'1.0'.toQuantity() ~ 1 '1'",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 377.63285636901855,
+      "execution_time_ms": 384.74392890930176,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -232,7 +232,7 @@
       "name": "testStringLiteralToString",
       "expression": "'true'.toString()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 376.3701915740967,
+      "execution_time_ms": 400.5429744720459,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -244,7 +244,7 @@
       "name": "testBooleanLiteralToString",
       "expression": "true.toString()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 415.510892868042,
+      "execution_time_ms": 391.77799224853516,
       "actual_result": {
         "is_valid": true,
         "result": [
