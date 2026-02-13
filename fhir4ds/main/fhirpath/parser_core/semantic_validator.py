@@ -156,6 +156,9 @@ class SemanticValidator:
             # SP-106-007: Validate temporal comparison type compatibility
             self._validate_temporal_comparison_compatibility(raw_expression, parsed_expression.ast)
 
+            # SP-110-FIX-0XX: Validate numeric field compared with string literal
+            self._validate_numeric_string_comparison(raw_expression, parsed_expression.ast)
+
             self._validate_function_definitions(
                 raw_expression,
                 parsed_expression,
@@ -1135,6 +1138,151 @@ class SemanticValidator:
                     f"Function {func_name}() requires a string argument, got integer at line {line}, column {column}. "
                     f"Use {func_name}('{arg_text}') instead of {func_name}({arg_text})."
                 )
+
+    def _validate_numeric_string_comparison(
+        self,
+        raw_expression: str,
+        parsed_ast: EnhancedASTNode
+    ) -> None:
+        """
+        SP-110-FIX-0XX: Validate that numeric fields are not compared with string literals.
+
+        Detects comparisons between known numeric fields and string literals, which are
+        type mismatches that should fail at parse time rather than execution time.
+
+        This is a targeted check that only validates obvious cases:
+        - One side is a string literal (starts with quote)
+        - Other side is a known numeric field path
+
+        Args:
+            raw_expression: Original expression text
+            parsed_ast: Parsed AST node
+
+        Raises:
+            FHIRPathParseError: When a numeric field is compared with a string literal
+        """
+        # Check for comparison operators in the raw expression
+        # These operators indicate we need to validate the operands
+        comparison_operators = ['<', '>', '<=', '>=']
+        has_comparison = any(
+            f' {op} ' in raw_expression or
+            raw_expression.endswith(f' {op}') or
+            raw_expression.startswith(f'{op} ')
+            for op in comparison_operators
+        )
+
+        if not has_comparison:
+            return  # No comparison, nothing to validate
+
+        # Check for string literals in the expression
+        # Pattern: single or double quoted strings
+        string_literal_pattern = r"(['\"])(?:\\.|(?!\1).)*?\1"
+        string_literals = list(re.finditer(string_literal_pattern, raw_expression))
+
+        if not string_literals:
+            return  # No string literals, nothing to validate
+
+        # Build set of known numeric field paths
+        # These are fields that return decimal/integer types according to FHIR spec
+        known_numeric_fields = {
+            # Observation.value.value (decimal)
+            'Observation.value.value',
+            # Quantity.value (decimal)
+            'value.value',
+            # Common numeric fields
+            'value',
+            'score',
+            'count',
+            'total',
+            'max',
+            'min',
+            'low',
+            'high',
+            'numerator',
+            'denominator',
+            'multipleBirthInteger',
+        }
+
+        # Walk AST to find comparison expressions
+        for node in self._iterate_nodes(parsed_ast):
+            if node.node_type not in {"ComparisonExpression", "InequalityExpression"}:
+                continue
+
+            operator = node.text.strip()
+            if operator not in comparison_operators:
+                continue
+
+            if len(node.children) < 2:
+                continue
+
+            left_child = node.children[0]
+            right_child = node.children[1]
+
+            # Check if either operand is a string literal
+            left_text = left_child.text.strip() if hasattr(left_child, "text") else ""
+            right_text = right_child.text.strip() if hasattr(right_child, "text") else ""
+
+            left_is_string = self._is_string_literal_node(left_child)
+            right_is_string = self._is_string_literal_node(right_child)
+
+            # Only proceed if one side is a string literal
+            if not (left_is_string or right_is_string):
+                continue
+
+            # Determine which side is the potential numeric field
+            field_side = right_child if left_is_string else left_child
+            field_text = field_side.text.strip() if hasattr(field_side, "text") else ""
+
+            # Check if the field text matches a known numeric field
+            for numeric_field in known_numeric_fields:
+                if numeric_field in field_text or field_text.endswith(numeric_field):
+                    # Found numeric field compared with string literal
+                    # Find the operator position for error reporting
+                    op_pos = raw_expression.find(operator)
+                    if op_pos == -1:
+                        op_pos = 0
+                    line, column = self._compute_position(raw_expression, op_pos)
+
+                    raise FHIRPathParseError(
+                        f"Cannot compare numeric field '{field_text}' with string literal "
+                        f"at line {line}, column {column}. "
+                        f"Numeric and string types are incompatible for comparison operators "
+                        f"('{operator}'). Use toNumber() or toString() to convert types."
+                    )
+
+    def _is_string_literal_node(self, node: EnhancedASTNode) -> bool:
+        """
+        Check if an AST node represents a string literal.
+
+        Args:
+            node: AST node to check
+
+        Returns:
+            True if node is a string literal, False otherwise
+        """
+        # If node is a TermExpression, check its children
+        if node.node_type == "TermExpression":
+            if node.children and node.children[0].node_type == "literal":
+                text = node.children[0].text.strip() if hasattr(node.children[0], "text") else ""
+                if not text:
+                    return False
+                # String literals start and end with quotes
+                return (text.startswith("'") and text.endswith("'")) or \
+                       (text.startswith('"') and text.endswith('"'))
+            return False
+
+        # Check if node type is literal
+        if node.node_type != "literal":
+            return False
+
+        # Check node text for string literal patterns
+        text = node.text.strip() if hasattr(node, "text") else ""
+        if not text:
+            return False
+
+        # String literals start and end with quotes
+        return (text.startswith("'") and text.endswith("'")) or \
+               (text.startswith('"') and text.endswith('"'))
 
 
 class FHIRPathExpressionWrapper:
