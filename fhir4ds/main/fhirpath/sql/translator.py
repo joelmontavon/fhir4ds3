@@ -6472,6 +6472,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
     def _normalize_quantity_unit(unit: str) -> Optional[str]:
         """Normalize quantity unit synonyms to canonical form."""
         unit_map = {
+            "1": "1",  # Unitless quantity
             "year": "year", "years": "year", "a": "year",
             "month": "month", "months": "month", "mo": "month",
             "week": "week", "weeks": "week", "wk": "week",
