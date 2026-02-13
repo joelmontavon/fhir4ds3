@@ -189,7 +189,7 @@ class SQLGenerator:
         # Check for common FHIRPath functions that require translation
         fhirpath_functions = ['ofType(', 'where(', 'exists(', 'all(', 'first(', 'last(',
                              'tail(', 'skip(', 'take(', 'select(', 'repeat(', 'empty(',
-                             'distinct(', 'isDistinct(']
+                             'distinct(', 'isDistinct(', 'join(']
         return any(func in path for func in fhirpath_functions)
 
     def _get_fhirpath_components(self, resource_type: str):
@@ -224,11 +224,15 @@ class SQLGenerator:
         Returns:
             SQL expression string
         """
+        # Decode HTML entities that may be present in JSON (e.g., &quot; for ")
+        import html
+        decoded_path = html.unescape(path)
+
         # SP-023-004B: Get parser and translator (no adapter needed)
         parser, translator = self._get_fhirpath_components(resource_type)
 
         # Parse the FHIRPath expression
-        parsed = parser.parse(path, context={"resourceType": resource_type})
+        parsed = parser.parse(decoded_path, context={"resourceType": resource_type})
 
         # SP-023-004B: Use EnhancedASTNode directly - translator handles it via accept()
         ast = parsed.get_ast()

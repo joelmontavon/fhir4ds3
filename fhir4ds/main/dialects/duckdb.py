@@ -305,19 +305,32 @@ class DuckDBDialect(DatabaseDialect):
         return f"string_split(CAST({expression} AS VARCHAR), {delimiter})"
 
     def generate_string_join(self, collection_expr: str, delimiter_expr: str, is_json_collection: bool) -> str:
-        """Generate SQL for joining string collections in DuckDB."""
-        source_expr = (
-            f"from_json({collection_expr}, '[\"VARCHAR\"]')"
-            if is_json_collection
-            else collection_expr
-        )
+        """Generate SQL for joining string collections in DuckDB.
 
-        return (
-            "CASE "
-            f"WHEN {collection_expr} IS NULL THEN NULL "
-            f"ELSE array_to_string({source_expr}, {delimiter_expr}) "
-            "END"
-        )
+        For JSON collections (nested arrays), uses json_each with json_extract_string.
+        For regular collections, uses array_to_string directly.
+        """
+        if is_json_collection:
+            # For JSON collections, we need to use json_extract_string instead of json_extract
+            # because json_extract returns a JSON value, but json_extract_string returns a string
+            # that can be parsed by from_json
+            # collection_expr is like: json_extract(resource, '$.name.given')
+            # We need to convert it to: json_extract_string(resource, '$.name.given')
+            collection_str_expr = collection_expr.replace("json_extract(", "json_extract_string(")
+
+            return (
+                "CASE "
+                f"WHEN {collection_str_expr} IS NULL THEN NULL "
+                f"ELSE array_to_string(from_json({collection_str_expr}, '[\"VARCHAR\"]'), {delimiter_expr}) "
+                "END"
+            )
+        else:
+            return (
+                "CASE "
+                f"WHEN {collection_expr} IS NULL THEN NULL "
+                f"ELSE array_to_string({collection_expr}, {delimiter_expr}) "
+                "END"
+            )
 
     # Type conversion operations
 
