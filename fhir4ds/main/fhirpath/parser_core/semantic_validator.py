@@ -1055,7 +1055,7 @@ class SemanticValidator:
         """
         # Check for patterns like "-1.method()" or "+1.method()"
         # The pattern is: unary operator, number, then method call
-        pattern = r'^\s*([+-])\s*(\d+(?:\.\d+)?)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
+        pattern = r'(?:^|[^\(])\s*([+-])\s*(\d+(?:\.\d+)?)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
 
         match = re.search(pattern, raw_expression)
         if match:
