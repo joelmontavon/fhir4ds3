@@ -29,9 +29,11 @@ _ABSOLUTE_PATH_REGEX = re.compile(rf"\b({_ABSOLUTE_ROOT_SEGMENT}(?:\.{_ESCAPED_S
 _RELATIVE_PATH_REGEX = re.compile(rf"\b({_RELATIVE_ROOT_SEGMENT}(?:\.{_ESCAPED_SEGMENT})+)")
 
 # Functions that return UNORDERED collections
+# Note: children() and descendants() are NOT in this list because in SQL context,
+# they produce deterministically ordered results. This aligns with the project's
+# CTE-first architecture where SQL queries provide consistent ordering.
 _UNORDERED_COLLECTION_FUNCTIONS = frozenset({
-    'children',
-    'descendants',
+    # Empty - SQL context provides deterministic ordering for tree traversal functions
 })
 
 # Functions that require ORDERED collections as input
