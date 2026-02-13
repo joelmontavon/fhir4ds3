@@ -711,8 +711,14 @@ class EnhancedOfficialTestRunner:
         if isinstance(value, str):
             stripped = value.strip()
             if stripped:
+                # Try to parse as JSON
                 try:
-                    return json.loads(stripped)
+                    parsed = json.loads(stripped)
+                    # If JSON parsing turned a string literal into a boolean, keep as string
+                    # This handles 'true'/'false' which should remain strings
+                    if isinstance(parsed, bool):
+                        return stripped
+                    return parsed
                 except json.JSONDecodeError:
                     return value
         return value

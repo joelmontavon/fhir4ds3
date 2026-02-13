@@ -9493,9 +9493,9 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if literal_value is not None:
                 # Evaluate the literal to get the string value
                 result = self._evaluate_literal_to_string(literal_value)
-                # But use the value_expr (SQL expression) and cast it to ensure proper type
-                # The value_expr already contains the proper SQL literal (e.g., 'true')
-                sql_expr = self.dialect.generate_type_cast(value_expr, "String")
+                # Use the evaluated result as a SQL string literal (e.g., "true" -> 'true')
+                # This ensures SQL returns the string value, not boolean/number interpretation
+                sql_expr = self._to_sql_literal(result, "string")
                 return SQLFragment(
                     expression=sql_expr,
                     source_table=source_table,
