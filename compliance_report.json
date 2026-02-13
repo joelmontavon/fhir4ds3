@@ -1,13 +1,13 @@
 {
   "total_tests": 934,
-  "passed_tests": 669,
-  "failed_tests": 265,
-  "compliance_percentage": 71.62740899357601,
-  "execution_time_total_ms": 350566.525220871,
-  "execution_time_average_ms": 375.30385146049156,
+  "passed_tests": 672,
+  "failed_tests": 262,
+  "compliance_percentage": 71.94860813704497,
+  "execution_time_total_ms": 326781.4300060272,
+  "execution_time_average_ms": 349.83996201378375,
   "parser_type": "FHIRPathParser",
   "database_type": "duckdb",
-  "timestamp": "2026-02-12T21:48:51.678171",
+  "timestamp": "2026-02-12T22:03:08.946525",
   "test_categories": {
     "comments_syntax": {
       "total": 9,
@@ -26,8 +26,8 @@
     },
     "error_handling": {
       "total": 5,
-      "passed": 2,
-      "failed": 3
+      "passed": 4,
+      "failed": 1
     },
     "type_functions": {
       "total": 116,
@@ -46,8 +46,8 @@
     },
     "arithmetic_operators": {
       "total": 71,
-      "passed": 33,
-      "failed": 38
+      "passed": 34,
+      "failed": 37
     },
     "comparison_operators": {
       "total": 338,
@@ -77,16 +77,16 @@
   },
   "performance_metrics": {
     "min_execution_time_ms": 0.014543533325195312,
-    "max_execution_time_ms": 853.893518447876,
-    "median_execution_time_ms": 414.5416021347046,
-    "std_dev_execution_time_ms": 132.51196810908138
+    "max_execution_time_ms": 669.7180271148682,
+    "median_execution_time_ms": 389.2446756362915,
+    "std_dev_execution_time_ms": 124.9868567247882
   },
   "failed_test_analysis": [
     {
       "name": "testDollarOrderNotAllowed",
       "expression": "Patient.children().skip(1)",
       "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 491.8937683105469,
+      "execution_time_ms": 381.08348846435547,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -130,34 +130,10 @@
       }
     },
     {
-      "name": "testLiteralIntegerNegative1Invalid",
-      "expression": "-1.convertsToInteger()",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 459.9435329437256,
-      "actual_result": {
-        "is_valid": true,
-        "result": [
-          true
-        ]
-      }
-    },
-    {
-      "name": "testLiteralDecimalNegative01Invalid",
-      "expression": "-0.1.convertsToDecimal()",
-      "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 402.4372100830078,
-      "actual_result": {
-        "is_valid": true,
-        "result": [
-          true
-        ]
-      }
-    },
-    {
       "name": "testLiteralDecimalLessThanInvalid",
       "expression": "Observation.value.value < 'test'",
       "error": "Expected semantic failure but expression was accepted.",
-      "execution_time_ms": 421.7202663421631,
+      "execution_time_ms": 429.47983741760254,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -169,7 +145,7 @@
       "name": "testExpressions",
       "expression": "Patient.name.select(given | family).distinct()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 404.61063385009766,
+      "execution_time_ms": 397.88174629211426,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -191,7 +167,7 @@
       "name": "testStringYearConvertsToDate",
       "expression": "'2015'.convertsToDate()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 377.9921531677246,
+      "execution_time_ms": 352.5547981262207,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -203,7 +179,7 @@
       "name": "testStringQuantityWeekConvertsToQuantityFalse",
       "expression": "'1 wk'.convertsToQuantity().not()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 407.3822498321533,
+      "execution_time_ms": 390.58423042297363,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -215,7 +191,7 @@
       "name": "testIntegerLiteralToQuantity",
       "expression": "1.toQuantity() = 1 '1'",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 429.3649196624756,
+      "execution_time_ms": 403.8126468658447,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -227,7 +203,7 @@
       "name": "testStringIntegerLiteralToQuantity",
       "expression": "'1'.toQuantity()",
       "error": "Unexpected evaluation outcome.",
-      "execution_time_ms": 431.57315254211426,
+      "execution_time_ms": 380.573034286499,
       "actual_result": {
         "is_valid": true,
         "result": [
@@ -244,11 +220,35 @@
       "name": "testStringQuantityMonthLiteralToQuantity",
       "expression": "'1 \\'mo\\''.toQuantity() = 1 month",
       "error": "Expected valid expression with empty result set.",
-      "execution_time_ms": 423.4604835510254,
+      "execution_time_ms": 391.88647270202637,
       "actual_result": {
         "is_valid": true,
         "result": [
           true
+        ]
+      }
+    },
+    {
+      "name": "testStringQuantityYearLiteralToQuantity",
+      "expression": "'1 \\'a\\''.toQuantity() = 1 year",
+      "error": "Expected valid expression with empty result set.",
+      "execution_time_ms": 396.23284339904785,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          true
+        ]
+      }
+    },
+    {
+      "name": "testStringDecimalLiteralToQuantity",
+      "expression": "'1.0'.toQuantity() ~ 1 '1'",
+      "error": "Unexpected evaluation outcome.",
+      "execution_time_ms": 398.1320858001709,
+      "actual_result": {
+        "is_valid": true,
+        "result": [
+          false
         ]
       }
     }

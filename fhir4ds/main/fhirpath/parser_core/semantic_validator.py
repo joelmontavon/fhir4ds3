@@ -150,6 +150,9 @@ class SemanticValidator:
             # SP-102-004: Validate incomplete expressions
             self._validate_incomplete_expressions(raw_expression, parsed_expression.ast)
 
+            # SP-102-004: Validate unary operators on literals
+            self._validate_unary_operators_on_literals(raw_expression, parsed_expression.ast)
+
             # SP-106-007: Validate temporal comparison type compatibility
             self._validate_temporal_comparison_compatibility(raw_expression, parsed_expression.ast)
 
