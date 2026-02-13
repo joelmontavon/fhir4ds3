@@ -1055,10 +1055,20 @@ class SemanticValidator:
         """
         # Check for patterns like "-1.method()" or "+1.method()"
         # The pattern is: unary operator, number, then method call
+        # IMPORTANT: Exclude matches within date/time literals (e.g., @2015-02-04)
+        # by checking that the match doesn't occur after a @ symbol
         pattern = r'(?:^|[^\(])\s*([+-])\s*(\d+(?:\.\d+)?)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
 
         match = re.search(pattern, raw_expression)
         if match:
+            # Check if this match is within a date/time literal (after @)
+            # Find the position of @ before this match
+            match_start = match.start()
+            at_pos = raw_expression.rfind('@', 0, match_start)
+            if at_pos != -1:
+                # This is part of a date/time literal, skip validation
+                return
+
             operator = match.group(1)
             literal = match.group(2)
             method = match.group(3)
