@@ -1099,8 +1099,20 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             self.context.pending_fragment_result = None
             # SP-110-002: Don't clear pending_literal_value here - it might still be needed
             # Only clear it if we actually used pending_fragment_result and the function doesn't need literal value
-            if not needs_literal_value:
+            # SP-110-FIX-019: Also don't clear pending_literal_value if the fragment is a literal
+            # because functions like not() need to convert literals to boolean
+            if not needs_literal_value and self.context.pending_literal_value is None:
+                # Only clear if there's no literal value waiting to be used
                 self.context.pending_literal_value = None
+            elif not needs_literal_value:
+                # Clear pending_literal_value since we're using pending_fragment_result
+                # But preserve it if the result is a literal that needs boolean conversion (SP-110-FIX-019)
+                # Check if target_expression is from a literal by looking at the fragments
+                if self.fragments and self.fragments[-1].metadata.get('is_literal'):
+                    # This is a literal fragment, keep pending_literal_value for functions like not()
+                    pass
+                else:
+                    self.context.pending_literal_value = None
         # SP-022-009: Check for pending literal value from invocation chain
         # This handles expressions like 1.convertsToInteger() where the literal
         # was visited in visit_generic before this function call
@@ -1140,6 +1152,25 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             if self.context.pending_literal_value is not None:
                 literal_value, _ = self.context.pending_literal_value
                 self.context.pending_literal_value = None
+            # SP-110-FIX-019: Extract literal value from fragment metadata if available
+            # This handles cases where a literal expression (like 0) is re-parsed
+            # by _parse_function_target_ast and needs to be recognized as a literal for
+            # functions like not() that perform boolean conversion on literals
+            elif literal_value is None and hasattr(fragment, "metadata") and fragment.metadata.get("is_literal"):
+                # Extract the actual Python value from the fragment
+                literal_type = fragment.metadata.get("literal_type")
+                if literal_type in ("integer", "decimal"):
+                    # Parse the SQL expression back to Python value for boolean conversion
+                    try:
+                        if literal_type == "integer":
+                            literal_value = int(fragment.expression)
+                        else:  # decimal
+                            literal_value = float(fragment.expression)
+                    except (ValueError, TypeError):
+                        # If parsing fails, leave literal_value as None
+                        pass
+                elif literal_type == "boolean":
+                    literal_value = fragment.expression.upper() == "TRUE"
 
         return target_expression, dependencies, literal_value, snapshot, target_ast, target_path
 
@@ -13747,10 +13778,7 @@ END"""
         According to FHIRPath spec, not() on collections:
         - Empty collection → Empty collection (NULL)
         - Single boolean → Negated boolean
-        - Multiple values → Implicitly apply exists() first, then negate (SP-110-011)
-
-        SP-110-011: Multi-item collections use implicit exists() semantics.
-        For example, (1|2).not() is equivalent to (1|2).exists().not().
+        - Multiple values → Raise error (not() expects a singleton value)
 
         Args:
             prev_fragment: The previous SQLFragment to check
@@ -13759,6 +13787,9 @@ END"""
 
         Returns:
             SQLFragment with appropriate expression, None if not a collection case
+
+        Raises:
+            ValueError: If collection has multiple items (e.g., from union operation)
         """
         prev_metadata = prev_fragment.metadata or {}
         is_collection = prev_metadata.get('is_collection') is True
@@ -13778,23 +13809,12 @@ END"""
             )
 
         if is_collection:
-            # SP-110-011: Multi-item collections use implicit exists() semantics
+            # FHIRPath spec: not() expects a singleton value
+            # Multi-item collections (e.g., from union operations) should raise an error
             if operator == 'union':
-                logger.debug("SP-110-011: not() on multi-item collection using implicit exists()")
-                # Apply implicit exists() check: if collection has items, it's true
-                # Then negate: true -> false, false -> true
-                # For (1|2).not(): collection is non-empty -> exists() = true -> not() = false
-                value_expr = prev_fragment.expression
-                exists_sql = f"CASE WHEN {value_expr} IS NOT NULL THEN TRUE ELSE FALSE END"
-                not_sql = self.dialect.generate_boolean_not(exists_sql)
-
-                return SQLFragment(
-                    expression=not_sql,
-                    source_table=source_table,
-                    requires_unnest=prev_fragment.requires_unnest,
-                    is_aggregate=False,
-                    dependencies=list(dict.fromkeys(dependencies)),
-                    metadata={"function": "not", "result_type": "boolean"}
+                from fhir4ds.fhirpath.exceptions import FHIRPathEvaluationError
+                raise FHIRPathEvaluationError(
+                    "not() function requires a singleton value, but received a collection with multiple items"
                 )
 
             # Empty or single-item collection returns NULL
@@ -13820,11 +13840,7 @@ END"""
             - Input true → Returns false
             - Input false → Returns true
             - Input {} (empty) → Returns {} (empty/NULL)
-            - Input collection with multiple values → Implicitly apply exists() first, then negate (SP-110-011)
-
-        SP-110-011: Multi-item collections (e.g., from union operations) use implicit exists()
-        semantics. For example, (1|2).not() is equivalent to (1|2).exists().not(), which evaluates
-        to false (since the collection has items, exists() returns true, then not() negates to false).
+            - Input collection with multiple values → Error (not() expects singleton)
 
         Population-First Design:
             Uses standard SQL NOT operator to negate boolean expressions.
@@ -13839,6 +13855,7 @@ END"""
 
         Raises:
             ValueError: If not() has any arguments (not() takes no arguments)
+            ValueError: If input collection has multiple items (e.g., from union operation)
 
         Example:
             Input: true.not()
@@ -13856,10 +13873,7 @@ END"""
             Output SQL:
                 NOT (json_array_length(json_extract(resource, '$.name')) = 0)
 
-            Input: (1|2).not()  (SP-110-011)
-
-            Output SQL:
-                NOT (CASE WHEN <union_expr> IS NOT NULL THEN TRUE ELSE FALSE END)
+            Input: (1|2).not() raises error (multi-item collection)
         """
         logger.debug(f"Translating not() function with {len(node.arguments)} arguments")
 
@@ -13887,14 +13901,47 @@ END"""
             if collection_result:
                 return collection_result
 
+            # SP-110-FIX-020: FHIRPath not() evaluates collection emptiness, NOT type conversion
+            # A singleton literal (0, 1, 'abc', etc.) is a non-empty collection
+            # Non-empty collection evaluates to true, so not() returns false
+            # Only truly empty collections (NULL/None) return empty from not()
+            # EXCEPTION: Boolean literals (true/false) are negated directly
+            prev_metadata = self.fragments[-1].metadata or {}
+            if prev_metadata.get("is_literal"):
+                literal_type = prev_metadata.get("literal_type")
+                if literal_type == "boolean":
+                    # Boolean literals are negated directly (NOT true, NOT false)
+                    pass  # Fall through to generate_boolean_not below
+                else:
+                    # For non-boolean literals (integer, decimal, string, etc.), the literal is a non-empty collection
+                    # not() on a non-empty collection returns FALSE
+                    not_sql = "FALSE"
+
+                    logger.debug(f"Generated not() SQL for non-boolean literal: {not_sql}")
+
+                    # SP-108-003: Propagate aggregate_function metadata from previous fragment
+                    aggregate_function = prev_metadata.get("function", "")
+                    metadata = {"function": "not", "result_type": "boolean"}
+                    if aggregate_function in {"empty", "exists", "count"}:
+                        metadata["aggregate_function"] = aggregate_function
+                        logger.debug(f"not() propagating aggregate_function={aggregate_function}")
+
+                    return SQLFragment(
+                        expression=not_sql,
+                        source_table=source_table,
+                        requires_unnest=False,
+                        is_aggregate=False,
+                        dependencies=list(dict.fromkeys(dependencies)),
+                        metadata=metadata
+                    )
+
             not_sql = self.dialect.generate_boolean_not(value_expr)
 
             logger.debug(f"Generated not() SQL (from previous fragment): {not_sql}")
 
-            # SP-108-003: Propagate aggregate_function metadata from the previous fragment
+            # SP-108-003: Propagate aggregate_function metadata from previous fragment
             # This ensures that expressions like empty().not() or exists().not() still trigger
             # aggregation when operating on unnested collections
-            prev_metadata = self.fragments[-1].metadata or {}
             aggregate_function = prev_metadata.get("function", "")
             metadata = {"function": "not", "result_type": "boolean"}
             if aggregate_function in {"empty", "exists", "count"}:
@@ -13923,27 +13970,16 @@ END"""
                     return collection_result
 
             if literal_value is not None:
-                # SP-110-010: Handle integer literals (0 and 1)
-                if isinstance(literal_value, (int, float)):
-                    if literal_value == 0:
-                        # 0.not() -> TRUE (0 is falsy, not(0) is truthy)
-                        sql_literal = "TRUE"
-                    elif literal_value == 1:
-                        # 1.not() -> FALSE (1 is truthy, not(1) is falsy)
-                        sql_literal = "FALSE"
-                    else:
-                        # Other integers - evaluate as boolean
-                        bool_value = self._evaluate_literal_to_boolean(literal_value)
-                        if bool_value is None:
-                            sql_literal = "NULL"
-                        else:
-                            sql_literal = "TRUE" if not bool_value else "FALSE"
+                # SP-110-FIX-020: FHIRPath not() evaluates collection emptiness, NOT type conversion
+                # A singleton literal (0, 1, 'abc', etc.) is a non-empty collection
+                # Non-empty collection evaluates to true, so not() returns false
+                # EXCEPTION: Boolean literals are negated directly
+                if isinstance(literal_value, bool):
+                    # Boolean literals: apply NOT directly
+                    sql_literal = "FALSE" if literal_value else "TRUE"
                 else:
-                    bool_value = self._evaluate_literal_to_boolean(literal_value)
-                    if bool_value is None:
-                        sql_literal = "NULL"
-                    else:
-                        sql_literal = "TRUE" if not bool_value else "FALSE"
+                    # Non-boolean literals are non-empty collections, not() returns FALSE
+                    sql_literal = "FALSE"
                 return SQLFragment(
                     expression=sql_literal,
                     source_table=source_table,
