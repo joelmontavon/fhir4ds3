@@ -423,10 +423,12 @@ class DuckDBDialect(DatabaseDialect):
         """
         # Input precision detection: count decimal places
         # Uses REGEXP_REPLACE to extract fractional part, then LENGTH
+        # Note: CAST(... AS VARCHAR) instead of ::VARCHAR to handle negative values
+        # because :: has higher precedence than unary minus
         precision_sql = f"""
             CASE
-                WHEN {base_expr}::VARCHAR LIKE '%.%'
-                THEN LENGTH(REGEXP_REPLACE({base_expr}::VARCHAR, '^[^.]*\\.', ''))
+                WHEN CAST({base_expr} AS VARCHAR) LIKE '%.%'
+                THEN LENGTH(REGEXP_REPLACE(CAST({base_expr} AS VARCHAR), '^[^.]*\\.', ''))
                 ELSE 0
             END
         """
