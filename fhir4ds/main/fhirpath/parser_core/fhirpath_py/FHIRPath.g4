@@ -14,7 +14,7 @@ grammar FHIRPath;
 
 expression
     : termExpression                                                    #termExpressionTerm
-    | expression '.' invocation                                         #invocationTerm
+    | expression '.' invocation                                         #memberInvocationTerm
     | expression '[' expression ']'                                     #indexerTerm
     | expression op=('*' | '/' | 'div' | 'mod') expression             #multiplicativeExpressionTerm
     | expression op=('+' | '-' | '&') expression                       #additiveExpressionTerm
@@ -90,6 +90,8 @@ identifier
     | 'xor'
     | 'implies'
     | 'union'
+    | 'lowBoundary'
+    | 'highBoundary'
     ;
 
 // Literal Rules
@@ -148,7 +150,7 @@ DELIMITEDIDENTIFIER
     ;
 
 STRING
-    : '\'' (ESC | ~[\'\\])* '\''
+    : '\'' (ESC | ~['\\])* '\''
     ;
 
 NUMBER
