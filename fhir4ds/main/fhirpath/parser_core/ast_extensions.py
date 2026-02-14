@@ -1511,7 +1511,23 @@ class ASTNodeFactory:
                 node.metadata.custom_attributes is not None and
                 node.metadata.node_category == NodeCategory.OPERATOR and
                 node.text):
-            node.metadata.custom_attributes['operator'] = node.text.strip()
+            operator_symbol = node.text.strip()
+            node.metadata.custom_attributes['operator'] = operator_symbol
+            # Add operator and operator_type as direct attributes for test access
+            node.operator = operator_symbol
+            # Infer operator_type based on the operator symbol
+            if len(node.children) == 1:
+                node.operator_type = "unary"
+            elif operator_symbol.lower() in ('and', 'or', 'xor', 'implies'):
+                node.operator_type = "logical"
+            elif operator_symbol in ('=', '!=', '<', '>', '<=', '>=', '~', '!~'):
+                node.operator_type = "comparison"
+            elif operator_symbol in ('+', '-', '*', '/', 'div', 'mod'):
+                node.operator_type = "binary"  # arithmetic
+            elif operator_symbol == '|':
+                node.operator_type = "union"
+            else:
+                node.operator_type = "binary"
 
         return node
 
