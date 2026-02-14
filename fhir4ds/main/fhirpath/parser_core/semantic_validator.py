@@ -65,9 +65,9 @@ _FHIRPATH_BUILTIN_FUNCTIONS = {
     'encode', 'decode', 'escape', 'unescape',
     # Math functions
     'abs', 'ceiling', 'exp', 'floor', 'ln', 'log', 'power', 'round', 'sqrt', 'truncate',
-    'lowBoundary', 'highBoundary',
+    'lowBoundary', 'highBoundary', 'precision',
     # Type functions
-    'is', 'as', 'ofType', 'conformsTo', 'type',
+    'is', 'as', 'ofType', 'conformsTo', 'type', 'comparable', 'hasValue',
     # Date/time functions
     'now', 'today', 'timeofday',
     # Additional functions not in base FunctionLibrary
