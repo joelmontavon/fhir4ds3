@@ -47,7 +47,10 @@ class FHIRPathExpression:
                 for node in func_nodes + agg_nodes + conditional_nodes:
                     if node.text and '(' in node.text and '.' not in node.text:
                         # This is a function call like "first()", not a path like "Patient.telecom.first()"
-                        self.functions.append(node.text)
+                        # SP-FIX-009: Extract only function name, not full text with arguments
+                        # Store just the function name (text before opening paren)
+                        func_name = node.text.split('(')[0].strip()
+                        self.functions.append(func_name)
 
                 # Extract function names (without parentheses) to filter from path components
                 function_names = set()
