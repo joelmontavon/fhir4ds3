@@ -1614,3 +1614,40 @@ class DatabaseDialect(ABC):
             PostgreSQL: Uses jsonb_array_elements recursively
         """
         pass
+
+    @abstractmethod
+    def generate_decimal_precision(self, decimal_expr: str) -> str:
+        """Generate SQL to count decimal places in a decimal number.
+
+        Returns the number of digits after the decimal point.
+        For integers, returns 0.
+
+        Args:
+            decimal_expr: SQL expression evaluating to a decimal number
+
+        Returns:
+            SQL expression that counts decimal places (integer)
+
+        Example:
+            DuckDB: LENGTH(REGEXP_EXTRACT(decimal_expr::VARCHAR, '\\.([0-9]+)$'))
+            PostgreSQL: LENGTH(SUBSTRING(quant_expr::VARCHAR, STRPOS(quant_expr::VARCHAR, '.') + 1))
+        """
+        pass
+
+    @abstractmethod
+    def generate_comparable_check(self, base_expr: str, arg_expr: str) -> str:
+        """Generate SQL to check if two quantities are comparable.
+
+        Returns true if quantities have compatible units (same dimension).
+
+        Args:
+            base_expr: SQL expression for base quantity
+            arg_expr: SQL expression for argument quantity
+
+        Returns:
+            SQL expression returning boolean (true if comparable)
+
+        Example:
+            Simplified: checks if both have unit property and units are compatible
+        """
+        pass

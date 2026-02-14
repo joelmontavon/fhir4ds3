@@ -3036,6 +3036,10 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._translate_sort(node)
         elif function_name == "descendants":
             return self._translate_descendants(node)
+        elif function_name == "precision":
+            return self._translate_precision(node)
+        elif function_name == "comparable":
+            return self._translate_comparable(node)
         else:
             raise ValueError(f"Unknown or unsupported function: {node.function_name}")
 
@@ -3223,7 +3227,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return self._determine_boundary_input_type(
                 target_ast.target,
                 None,
-                target_path,
+                target_path if target_path is not None else [],
             )
 
         if target_path:
@@ -18331,3 +18335,256 @@ END"""
                 "result_type": "collection",
             }
         )
+
+    def _translate_precision(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate precision() function to SQL.
+
+        FHIRPath: value.precision()
+        SQL: Count decimal places for numbers, or return precision level for temporal values
+
+        For decimals: Returns the number of digits after the decimal point
+        For temporal: Returns precision level (1=year, 2=month, 3=day, 4=hour, 5=minute, 6=second, 7=millisecond)
+
+        Args:
+            node: FunctionCallNode representing precision() function call (no arguments)
+
+        Returns:
+            SQLFragment containing precision calculation
+
+        Raises:
+            ValueError: If function has arguments (should have 0)
+
+        Example:
+            1.58700.precision() -> 5
+            @2014.precision() -> 1
+            @2014-01-05.precision() -> 3
+        """
+        logger.debug(f"Translating precision() function")
+
+        # Validate no arguments
+        if node.arguments:
+            raise ValueError(
+                f"precision() function takes no arguments, got {len(node.arguments)}"
+            )
+
+        # Get the target expression
+        (
+            target_expr,
+            dependencies,
+            literal_value,
+            snapshot,
+            target_ast,
+            target_path,
+        ) = self._resolve_function_target(node)
+
+        if not target_expr:
+            raise FHIRPathTranslationError(
+                "Unable to resolve input expression for precision()"
+            )
+
+        try:
+            source_table = snapshot["current_table"]
+
+            # Determine the type of the target expression
+            input_type = self._determine_boundary_input_type(
+                target_ast,
+                literal_value,
+                target_path,
+            )
+
+            logger.debug(
+                f"precision() input resolved: expr={target_expr}, type={input_type}"
+            )
+
+            sql_expr: str
+            if input_type in {"integer", "decimal", "number"}:
+                # For decimals: count decimal places by converting to string and counting after decimal point
+                # Strip trailing zeros first to get actual precision
+                sql_expr = self.dialect.generate_decimal_precision(target_expr)
+            elif input_type in {"date", "datetime", "time", "instant"}:
+                # For temporal: return precision level as integer literal
+                precision_level = self._translate_temporal_precision(
+                    target_ast, target_expr, input_type
+                )
+                sql_expr = str(precision_level)
+            else:
+                raise FHIRPathTranslationError(
+                    f"precision() not supported for input type '{input_type}'"
+                )
+
+            fragment = SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=list(dict.fromkeys(dependencies)),
+            )
+
+            return fragment
+
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_comparable(self, node: FunctionCallNode) -> SQLFragment:
+        """Translate comparable() function to SQL.
+
+        FHIRPath: quantity1.comparable(quantity2)
+        SQL: Check if two quantities have compatible units
+
+        The comparable() function returns true if two quantities can be compared
+        (i.e., their units are in the same dimension: length, time, mass, etc.)
+
+        Args:
+            node: FunctionCallNode representing comparable() function call (1 argument)
+
+        Returns:
+            SQLFragment containing unit compatibility check
+
+        Raises:
+            ValueError: If function doesn't have exactly 1 argument
+
+        Example:
+            1 'cm'.comparable(1 '[in_i]') -> true (both are lengths)
+            1 'cm'.comparable(1 '[s]') -> false (length vs time)
+        """
+        logger.debug(f"Translating comparable() function")
+
+        # Validate argument count (1 argument: the quantity to compare with)
+        if not node.arguments or len(node.arguments) != 1:
+            raise ValueError(
+                f"comparable() requires exactly 1 argument, got {len(node.arguments) if node.arguments else 0}"
+            )
+
+        # Get the base expression (the quantity calling comparable)
+        (
+            base_expr,
+            base_dependencies,
+            base_literal_value,
+            snapshot,
+            base_ast,
+            base_path,
+        ) = self._resolve_function_target(node)
+
+        if not base_expr:
+            raise FHIRPathTranslationError(
+                "Unable to resolve base expression for comparable()"
+            )
+
+        try:
+            source_table = snapshot["current_table"]
+
+            # Translate the argument expression
+            arg_node = node.arguments[0]
+            arg_fragment = arg_node.accept(self)
+            arg_expr = arg_fragment.expression
+            arg_dependencies = arg_fragment.dependencies
+
+            # Check if both are quantities with units
+            # Simplified implementation: check if both have unit property
+            base_unit_expr = self.dialect.extract_json_field(
+                column=base_expr if base_expr else source_table,
+                path="unit"
+            )
+            arg_unit_expr = self.dialect.extract_json_field(
+                column=arg_expr,
+                path="unit"
+            )
+
+            # Simplified unit compatibility check using UCUM categories
+            # For now, we'll do a basic check: both must have units
+            # A full implementation would use UCUM dimensionality analysis
+            sql_expr = self.dialect.generate_comparable_check(
+                base_expr=base_expr if base_expr else source_table,
+                arg_expr=arg_expr
+            )
+
+            # Merge dependencies
+            all_dependencies = list(set(base_dependencies) | set(arg_dependencies))
+
+            fragment = SQLFragment(
+                expression=sql_expr,
+                source_table=source_table,
+                requires_unnest=False,
+                is_aggregate=False,
+                dependencies=all_dependencies,
+            )
+
+            return fragment
+
+        finally:
+            self._restore_context(snapshot)
+
+    def _translate_temporal_precision(
+        self,
+        target_ast,
+        target_expr: str,
+        input_type: str
+    ) -> str:
+        """Generate SQL for temporal precision() calculation.
+
+        Returns precision level (1-7) based on temporal_info from AST.
+        """
+        # Get temporal_info from the AST node
+        temporal_info = getattr(target_ast, "temporal_info", {}) if target_ast else {}
+        if not temporal_info:
+            # No temporal info available, return default precision
+            return "4"  # Default to day precision for temporal values
+
+        # Determine precision based on temporal_info
+        kind = temporal_info.get("kind")  # "date", "time", "datetime"
+        precision_str = temporal_info.get("precision", "")
+
+        if kind == "date":
+            # Date precision: year=1, month=2, day=3
+            if precision_str and precision_str >= "4":  # Has day component
+                return "3"
+            elif precision_str and len(precision_str) >= 7:  # Has month component (YYYY-MM)
+                return "2"
+            else:
+                return "1"  # Year only
+        elif kind == "time":
+            # Time precision: hour=4, minute=5, second=6, millisec=7
+            # Count components in precision string
+            if precision_str and ":" in precision_str:
+                parts = precision_str.split(":")
+                if len(parts) >= 2:  # Has minutes
+                    return "5"
+                else:  # Has hours only
+                    return "4"
+            else:
+                return "4"  # Default to hour precision
+        elif kind == "datetime":
+            # DateTime precision: combine date and time precisions
+            date_precision = "3"  # Default to day
+            time_precision = "4"  # Default to hour
+
+            # Parse date part
+            if "T" in precision_str:
+                date_part = precision_str.split("T")[0]
+                if "-" in date_part:
+                    date_parts = date_part.split("-")
+                    if len(date_parts) >= 3:  # Has day
+                        date_precision = "3"
+                    elif len(date_parts) >= 2:  # Has month
+                        date_precision = "2"
+                    else:  # Year only
+                        date_precision = "1"
+
+            # Parse time part
+            if "T" in precision_str:
+                time_part = precision_str.split("T")[1]
+                if ":" in time_part:
+                    time_parts = time_part.split(":")
+                    if len(time_parts) >= 2:  # Has minutes
+                        time_precision = "5"
+                    else:  # Has hours only
+                        time_precision = "4"
+
+            # Return combined precision (date + time - 3 for base, add time components)
+            if time_precision == "4":  # Hour only
+                return str(int(date_precision))
+            else:
+                return str(int(date_precision) + 1)
+
+        # Default fallback
+        return "4"

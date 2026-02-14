@@ -2154,3 +2154,34 @@ class PostgreSQLDialect(DatabaseDialect):
             )
             SELECT jsonb_agg(value) FROM descendants)
         """.strip()
+
+    def generate_decimal_precision(self, decimal_expr: str) -> str:
+        """Generate SQL to count decimal places in a decimal number.
+
+        For PostgreSQL, we convert to string and count characters after decimal point.
+        """
+        # Convert to string and count characters after decimal point
+        # Pattern: find position of '.', then calculate length of substring after it
+        return f"""
+            CASE
+                WHEN {decimal_expr}::VARCHAR ~ '^(-?[0-9]+\\.)?[0-9]+$'
+                THEN LENGTH(SUBSTRING({decimal_expr}::VARCHAR, STRPOS({decimal_expr}::VARCHAR, '.') + 1))
+                ELSE 0
+            END
+        """.strip()
+
+    def generate_comparable_check(self, base_expr: str, arg_expr: str) -> str:
+        """Generate SQL to check if two quantities are comparable.
+
+        Simplified implementation: check if both have units and units are equal.
+        A full implementation would use UCUM dimensional analysis.
+        """
+        # Extract units from both quantities using ->> operator for JSONB
+        base_unit = f"{base_expr}->>'unit'"
+        arg_unit = f"{arg_expr}->>'unit'"
+
+        # Both must have units and units must be compatible (simplified: equal)
+        # For now, we just check if units are equal (not full dimensional analysis)
+        return f"""
+            ({base_unit} IS NOT NULL AND {arg_unit} IS NOT NULL AND {base_unit} = {arg_unit})
+        """.strip()
