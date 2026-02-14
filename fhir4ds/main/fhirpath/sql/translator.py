@@ -4342,6 +4342,19 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                     # Return NULL to represent empty collection result
                     # This will be filtered out in the final result
                     sql_expr = "NULL"
+                # SP-109-EQUIV-001: Handle equivalence operators (~, !~) BEFORE quantity comparisons
+                # Equivalence operators need special handling regardless of operand types.
+                # If we check quantity comparisons first, the ~ operator gets passed directly
+                # to SQL, where DuckDB interprets it as a regex operator, causing errors.
+                elif operator_lower in {"~", "!~"}:
+                    # Equivalence operator: use proper equivalence logic
+                    sql_expr = self._generate_equivalence_sql(
+                        left_fragment.expression,
+                        right_fragment.expression,
+                        node.children[0],
+                        node.children[1],
+                        is_negated=(operator_lower == "!~")
+                    )
                 # SP-110-001: Handle quantity unit conversion for comparisons
                 # When comparing quantities with different units (e.g., "7 days = 1 'wk'"),
                 # normalize units to canonical form before comparison
@@ -4371,15 +4384,6 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
                         left_fragment.expression,
                         right_fragment.expression,
                         sql_operator
-                    )
-                elif operator_lower in {"~", "!~"}:
-                    # Equivalence operator: use proper equivalence logic
-                    sql_expr = self._generate_equivalence_sql(
-                        left_fragment.expression,
-                        right_fragment.expression,
-                        node.children[0],
-                        node.children[1],
-                        is_negated=(operator_lower == "!~")
                     )
                 else:
                     # Apply type casting for JSON-extracted strings compared to typed literals
