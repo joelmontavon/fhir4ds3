@@ -3335,7 +3335,7 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             return literal_sql
 
         raise FHIRPathTranslationError(
-            "highBoundary() currently supports quantity literals only; "
+            f"{boundary_type}Boundary() currently supports quantity literals only; "
             "dynamic quantity boundaries require dedicated path handling."
         )
 
