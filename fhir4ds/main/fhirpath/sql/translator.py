@@ -6544,11 +6544,24 @@ class ASTToSQLTranslator(ASTVisitor[SQLFragment]):
             seconds_str = self._decimal_to_sql_str(seconds)
             return f"INTERVAL '{seconds_str} second'"
 
-        if unit in {"year", "month", "week", "day"}:
+        if unit in {"year", "month"}:
+            # Fractional months/years not well-defined (variable lengths)
             if amount % 1 != 0:
                 return None
             amount_str = str(int(amount))
             return f"INTERVAL '{amount_str} {unit}'"
+
+        if unit == "week":
+            # Convert weeks to hours for fractional support
+            hours = amount * Decimal("168")  # 24 * 7 = 168 hours per week
+            hours_str = self._decimal_to_sql_str(hours)
+            return f"INTERVAL '{hours_str} hour'"
+
+        if unit == "day":
+            # Convert days to hours for fractional support
+            hours = amount * Decimal("24")
+            hours_str = self._decimal_to_sql_str(hours)
+            return f"INTERVAL '{hours_str} hour'"
 
         if unit in {"hour", "minute", "second"}:
             amount_str = self._decimal_to_sql_str(amount)
